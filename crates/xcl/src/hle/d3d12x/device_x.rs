@@ -312,57 +312,82 @@ pub(super) unsafe extern "system" fn deserialize_pso_x(_this: *mut c_void, state
     static N: AtomicU64 = AtomicU64::new(0);
     if once(&N, 1) {
         crate::xlog_warn!("D3D12.X: DeserializePipelineStateX – console pipeline caches are not supported");
-        // Dump the blob header so the console serialisation format can be identified:
-        // the official FSR4 upscaler deserialises its native pipelines here
-        // ('FFX_FSR4_PASS_0'...) - see the FFX GPU harness report.
-        if !state.is_null() {
-            let d = std::slice::from_raw_parts(state, 0x100.min(0x1_0000));
-            crate::xlog_warn!("D3D12.X: deserialise blob head: {:02x?}", &d[..0x80.min(d.len())]);
-            if let Some(s) = d.iter().position(|&b| b == 0) {
-                crate::xlog_warn!("D3D12.X: blob string prefix: {:?}", String::from_utf8_lossy(&d[..s.min(64)]));
-            }
-            // the header looks like pointer/size segments - dump what the first qwords
-            // point at so the console serialisation format can be identified
-            let q = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
-            for i in 0..8u32 {
-                let p = q(i as usize * 8);
-                let Some(p) = p else { break };
-                if (0x1_0000_0000..0x8000_0000_0000).contains(&p) {
-                    let seg = std::slice::from_raw_parts(p as *const u8, 0x40);
-                    crate::xlog_warn!("D3D12.X: blob qword[{i}] = {p:#x} -> {:02x?}", seg);
-                } else {
-                    crate::xlog_warn!("D3D12.X: blob qword[{i}] = {p:#x}");
-                }
-            }
-            // pairs of (ptr, size) from qword[1]: dump the larger segments entirely,
-            // including the one in title memory (a console GPU VA) via the UMA resolver
-            for i in 1..6u32 {
-                let Some(ptr) = q(i as usize * 8 + 8) else { break };
-                let Some(sz) = q(i as usize * 8 + 16) else { break };
-                if sz == 0 || sz > 0x1_0000 {
-                    continue;
-                }
-                // console GPU VAs in the UMA equal the host address (XCL's no-copy windows);
-                // anything else in a plausible pointer range is a host allocation
-                let host = crate::gpu::uma::get()
-                    .map(|u| u.window_of(ptr as usize).is_some())
-                    .unwrap_or(false)
-                    .then_some(ptr as usize)
-                    .or_else(|| (0x1_0000_0000..0x8000_0000_0000).contains(&ptr).then_some(ptr as usize));
-                match host {
-                    Some(h) if sz >= 8 => {
-                        let seg = std::slice::from_raw_parts(h as *const u8, sz.min(0x120) as usize);
-                        crate::xlog_warn!("D3D12.X: blob segment {i} (ptr {ptr:#x}, size {sz:#x}): {:02x?}", seg);
-                    }
-                    _ => crate::xlog_warn!("D3D12.X: blob segment {i} (ptr {ptr:#x}, size {sz:#x}) not reachable"),
-                }
-            }
+    }
+    // XCL_FFX_BLOB_DIR=<dir>: dump every deserialise call's blob completely (header qwords,
+    // the sub-table at qword[0], and every (ptr, size) segment) so the console driver-cache
+    // format can be reverse-engineered offline. The official FSR4 upscaler deserialises its
+    // native pipelines here ('FFX_FSR4_PASS_0'...); the sections it passes match the FXCP
+    // blocks embedded in the console DLL (root signature, a 0x1c-byte header, a 0x14-byte
+    // hash, the raw RDNA2 code, a metadata section).
+    if !state.is_null() {
+        if let Some(dir) = std::env::var_os("XCL_FFX_BLOB_DIR") {
+            dump_blob(state, N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize, &dir);
         }
     }
     if !ppv.is_null() {
         *ppv = std::ptr::null_mut();
     }
     E_NOTIMPL
+}
+
+/// Full dump of one deserialise blob. The observed header: qword[0] a sub-table pointer,
+/// then (ptr, size) pairs of sections (heap and title memory / GPU VAs, which XCL's UMA
+/// resolves directly: console address = CPU address).
+unsafe fn dump_blob(state: *const u8, call: usize, dir: &std::ffi::OsStr) {
+    let d = std::slice::from_raw_parts(state, 0x80);
+    let dir = std::path::Path::new(dir).join(format!("call{call}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("header.bin"), d);
+    let q = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let mut manifest = String::new();
+    manifest.push_str(&format!("header @ {state:p} qwords: {}\n", (0..16).map(|i| q(i * 8).map(|v| format!("{v:#x}")).unwrap_or_default()).collect::<Vec<_>>().join(" ")));
+    // the sub-table at qword[0]: dump it and what its pointers lead to
+    if let Some(t) = q(0) {
+        if (0x1_0000..0x8000_0000_0000).contains(&t) {
+            let t = std::slice::from_raw_parts(t as *const u8, 0x100);
+            let _ = std::fs::write(dir.join("subtable.bin"), t);
+            manifest.push_str(&format!("subtable @ {t:p}\n"));
+            for i in 0..16u32 {
+                let p = u64::from_le_bytes(t[i as usize * 8..i as usize * 8 + 8].try_into().unwrap());
+                manifest.push_str(&format!("  subtable qword[{i}] = {p:#x}\n"));
+                if (0x1_0000_0000..0x8000_0000_0000).contains(&p) && p & 7 == 0 {
+                    let s = std::slice::from_raw_parts(p as *const u8, 0x180);
+                    let _ = std::fs::write(dir.join(format!("sub{i}.bin")), s);
+                }
+            }
+        }
+    }
+    // (ptr, size) pairs from qword[1]: A, hash, code, metadata
+    let mut pair = 1usize;
+    let mut i = 1usize;
+    while let (Some(ptr), Some(sz)) = (q(i * 8), q(i * 8 + 8)) {
+        if i > 8 {
+            break;
+        }
+        i += 2;
+        if sz == 0 || sz > 0x4_0000_000 || ptr & 7 != 0 {
+            continue;
+        }
+        // console GPU VAs in the UMA equal the host address (XCL's no-copy windows);
+        // anything else in a plausible pointer range is a host allocation
+        let host = crate::gpu::uma::get()
+            .map(|u| u.window_of(ptr as usize).is_some())
+            .unwrap_or(false)
+            .then_some(ptr as usize)
+            .or_else(|| (0x1_0000_0000..0x8000_0000_0000).contains(&ptr).then_some(ptr as usize));
+        let name = pair;
+        pair += 1;
+        match host {
+            Some(h) => {
+                let s = std::slice::from_raw_parts(h as *const u8, sz as usize);
+                let _ = std::fs::write(dir.join(format!("seg{name}.bin")), s);
+                manifest.push_str(&format!("seg{name} (ptr {ptr:#x}, size {sz:#x}) -> {} bytes\n", s.len()));
+            }
+            None => manifest.push_str(&format!("seg{name} (ptr {ptr:#x}, size {sz:#x}) NOT REACHABLE\n")),
+        }
+    }
+    let _ = std::fs::write(dir.join("manifest.txt"), manifest);
+    crate::xlog_warn!("D3D12.X: deserialise call {call} dumped to {}", dir.display());
 }
 
 /// device #52 SetDebugFlagsX(flags)
