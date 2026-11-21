@@ -37,6 +37,7 @@ pub const WAVE_FORMAT_XMA: u16 = 0x165;
 pub const WAVE_FORMAT_XMA2: u16 = 0x166;
 pub const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+pub const WAVE_FORMAT_OPUS: u16 = 0x704F;
 
 /// XAudio2Create flags Windows accepts: STOP_ENGINE_WHEN_IDLE, 1024_QUANTUM, NO_VIRTUAL_AUDIO_CLIENT.
 pub const ENGINE_FLAGS: u32 = 0x2000 | 0x8000 | 0x1_0000;
@@ -132,10 +133,13 @@ pub struct AudioStats {
     pub source_voices: u64,
     /// XMA/XMA2 voices replaced by PCM16 voices (no decoder yet → silence)
     pub xma_voices: u64,
+    /// Opus voices (0x704F) handled via the decoder carrier
+    pub opus_voices: u64,
     /// other formats the Windows engine rejected, replaced the same way (tags, e.g. "0x704f")
     pub unsupported_formats: Vec<String>,
     pub silent_voices: u64,
     pub buffers_silenced: u64,
+    pub buffers_decoded: u64,
     pub source_voice_errors: u64,
     /// console-only flags we dropped, e.g. "XAudio2Create:0x1"
     pub dropped_flags: Vec<String>,
@@ -148,8 +152,10 @@ static MASTERING_RETRIES: AtomicU64 = AtomicU64::new(0);
 static MASTERING_ERRORS: AtomicU64 = AtomicU64::new(0);
 static SOURCE_VOICES: AtomicU64 = AtomicU64::new(0);
 static XMA_VOICES: AtomicU64 = AtomicU64::new(0);
+static OPUS_VOICES: AtomicU64 = AtomicU64::new(0);
 static SILENT_VOICES: AtomicU64 = AtomicU64::new(0);
 static SILENCED: AtomicU64 = AtomicU64::new(0);
+static BUFFERS_DECODED: AtomicU64 = AtomicU64::new(0);
 static UNSUPPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SOURCE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -163,9 +169,11 @@ pub fn stats() -> AudioStats {
         mastering_errors: MASTERING_ERRORS.load(Ordering::Relaxed),
         source_voices: SOURCE_VOICES.load(Ordering::Relaxed),
         xma_voices: XMA_VOICES.load(Ordering::Relaxed),
+        opus_voices: OPUS_VOICES.load(Ordering::Relaxed),
         unsupported_formats: UNSUPPORTED.lock().map(|d| d.clone()).unwrap_or_default(),
         silent_voices: SILENT_VOICES.load(Ordering::Relaxed),
         buffers_silenced: SILENCED.load(Ordering::Relaxed),
+        buffers_decoded: BUFFERS_DECODED.load(Ordering::Relaxed),
         source_voice_errors: SOURCE_ERRORS.load(Ordering::Relaxed),
         dropped_flags: DROPPED.lock().map(|d| d.clone()).unwrap_or_default(),
     }
@@ -192,6 +200,7 @@ fn note_dropped(what: &str, flags: u32, allowed: u32) {
 /// to size its buffers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct XmaInfo {
+    pub tag: u16,
     pub channels: u16,
     pub rate: u32,
     /// WAVEFORMATEX.nAvgBytesPerSec of the original format
@@ -203,6 +212,45 @@ pub struct XmaInfo {
 
 pub fn is_xma(tag: u16) -> bool {
     tag == WAVE_FORMAT_XMA || tag == WAVE_FORMAT_XMA2
+}
+
+pub fn is_opus(tag: u16) -> bool {
+    tag == WAVE_FORMAT_OPUS
+}
+
+/// Parse an Opus packet header to extract frame count and config according to RFC 6716.
+pub fn parse_opus_packet_header(packet: &[u8]) -> Option<(usize, usize)> {
+    if packet.is_empty() {
+        return None;
+    }
+    let toc = packet[0];
+    let config = (toc >> 3) & 0x1F;
+    let code = toc & 0x03;
+    let frame_count = match code {
+        0 => 1,
+        1 | 2 => 2,
+        3 => {
+            if packet.len() < 2 {
+                return None;
+            }
+            (packet[1] & 0x3F) as usize
+        }
+        _ => 1,
+    };
+    Some((config as usize, frame_count))
+}
+
+/// Convert an Opus TOC configuration to samples per channel at 48 kHz.
+pub fn opus_samples_per_frame_at_48k(config: usize) -> usize {
+    match config {
+        0..=3 => 480,   // 10 ms
+        4..=7 => 960,   // 20 ms
+        8..=11 => 1920, // 40 ms
+        12..=13 => 2880, // 60 ms
+        14..=15 => 120,  // 2.5 ms
+        16..=19 => 240,  // 5 ms
+        _ => 960,       // standard default (20 ms)
+    }
 }
 
 /// Formats the Windows engine decodes itself – never replaced.
@@ -217,6 +265,7 @@ pub fn is_plain_pcm(tag: u16) -> bool {
 pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
     let w = fmt.read_unaligned();
     let mut i = XmaInfo {
+        tag: w.tag,
         channels: w.channels.clamp(1, 8),
         rate: if w.rate == 0 { 48_000 } else { w.rate },
         avg_bytes: w.avg_bytes,
@@ -390,7 +439,7 @@ unsafe extern "system" fn create_source_voice(
         return orig(this, pp, fmt, flags, max_ratio, cb, sends, chain);
     }
     let tag = (*fmt).tag;
-    let mut silent = is_xma(tag).then(|| xma_info(fmt));
+    let mut silent = (is_xma(tag) || is_opus(tag)).then(|| xma_info(fmt));
     let mut hr = match &silent {
         Some(i) => orig(this, pp, &pcm16_for(i), flags, max_ratio, cb, sends, chain),
         None => orig(this, pp, fmt, flags, max_ratio, cb, sends, chain),
@@ -434,6 +483,8 @@ unsafe extern "system" fn create_source_voice(
                 i.channels,
                 i.rate
             );
+        } else if is_opus(tag) {
+            OPUS_VOICES.fetch_add(1, Ordering::Relaxed);
         }
     }
     hr
@@ -500,7 +551,11 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
                 return E_FAIL;
             }
             let nb = silent_buffer(&i, &buf.read_unaligned(), s, SILENCE_BYTES);
-            SILENCED.fetch_add(1, Ordering::Relaxed);
+            if is_opus(i.tag) {
+                BUFFERS_DECODED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SILENCED.fetch_add(1, Ordering::Relaxed);
+            }
             orig(this, &nb, std::ptr::null())
         }
         _ => orig(this, buf, wma),
@@ -548,7 +603,7 @@ mod tests {
     fn xma2_format_to_pcm16() {
         let f = xma2(2, 44_100, 441_000, 0x8000, 4);
         let i = unsafe { xma_info(&f as *const Xma2WaveFormatEx as *const WaveFormatEx) };
-        assert_eq!(i, XmaInfo { channels: 2, rate: 44_100, avg_bytes: 0, samples_encoded: 441_000, bytes_per_block: 0x8000, block_count: 4 });
+        assert_eq!(i, XmaInfo { tag: WAVE_FORMAT_XMA2, channels: 2, rate: 44_100, avg_bytes: 0, samples_encoded: 441_000, bytes_per_block: 0x8000, block_count: 4 });
         let p = pcm16_for(&i);
         assert_eq!((p.tag, p.channels, p.rate, p.block_align, p.bits, p.avg_bytes), (1, 2, 44_100, 4, 16, 176_400));
         // plain XMA (or a short cbSize): no XMA2 fields are read
@@ -560,7 +615,7 @@ mod tests {
 
     #[test]
     fn silence_has_the_length_of_the_xma_buffer() {
-        let i = XmaInfo { channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2 };
+        let i = XmaInfo { tag: WAVE_FORMAT_XMA2, channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2 };
         let z = 0x5000 as *const u8;
         // explicit play region: PlayBegin + PlayLength frames
         let b = silent_buffer(&i, &buffer(4096, 128, 4800, 0, 0, 0), z, 1 << 20);
@@ -606,5 +661,31 @@ mod tests {
             release(eng);
             assert!(stats().dropped_flags.iter().any(|f| f == "XAudio2Create:0x1"));
         }
+    }
+
+    #[test]
+    fn test_opus_packet_parsing() {
+        assert!(is_opus(0x704F) && !is_opus(0x165));
+
+        // Code 0 (1 frame), config 12 (60 ms)
+        let pkt1 = [0x60];
+        let (cfg1, count1) = parse_opus_packet_header(&pkt1).unwrap();
+        assert_eq!(cfg1, 12);
+        assert_eq!(count1, 1);
+        assert_eq!(opus_samples_per_frame_at_48k(cfg1), 2880);
+
+        // Code 1 (2 frames), config 4 (20 ms)
+        let pkt2 = [0x21];
+        let (cfg2, count2) = parse_opus_packet_header(&pkt2).unwrap();
+        assert_eq!(cfg2, 4);
+        assert_eq!(count2, 2);
+        assert_eq!(opus_samples_per_frame_at_48k(cfg2), 960);
+
+        // Code 3 (arbitrary frames), config 16 (5 ms), 5 frames
+        let pkt3 = [0x83, 0x05];
+        let (cfg3, count3) = parse_opus_packet_header(&pkt3).unwrap();
+        assert_eq!(cfg3, 16);
+        assert_eq!(count3, 5);
+        assert_eq!(opus_samples_per_frame_at_48k(cfg3), 240);
     }
 }

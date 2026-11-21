@@ -33,7 +33,7 @@ NOTE:
   and ignores `SizeOfZeroFill` (the whole size goes into "raw data").
 - **C++ exceptions**: hook on `RtlPcToFileHeader` (retour) + `RtlAddFunctionTable` (`eh.rs`).
 - **Resolver** (`resolver.rs`, `hle/mod.rs`): HLE → game DLL → Windows → auto-stub with a log (`stubs.rs`, `data/stubdb.toml`).
-- **kernelx** (`hle/kernelx.rs`), **XGameRuntime offline** (`hle/xgameruntime/`: XTaskQueue, XAsync, XUser, XSystem, XPackage, PLS, save folder).
+- **XGameRuntime offline** (`hle/xgameruntime/`: XTaskQueue, XAsync, XUser, XSystem with XSystemGetDeviceType, XPackage, PLS, save folder).
 - **VFS** (`vfs.rs`, `vfs_hooks.rs`): `G:\`, `GAME:`, `T:\`, copy-on-write, whiteouts, KERNELBASE hooks (they also catch the CRT).
 - **Launcher/host/report** (`launcher.rs`, `host.rs`, `report.rs`, `inspect.rs`): child process with the game's command line;
   does not pick `xcl.exe` itself; warns when the exe does not import console DLLs; `report.json` (called_stubs, shaders, d3d12, vfs…).
@@ -579,8 +579,7 @@ Nothing open.
 - **Safety:** the PC runtime does not validate foreign handles (XGameUiShowPlayerProfileCardAsync with an XCL handle →
   access violation), which is why nothing that takes an XCL XUser/XGameSave handle goes to PC.
 - **Report:** `xgameruntime.apis` (pair → who answered) and `xgameruntime.unimplemented` ("XUser#23" → number of calls).
-- **Not determined (needs the exe):** the PLS class (candidate `7f0fe8b8`, requires an unknown IID) and the XSystemGetDeviceType slot (PC will
-  report "Pc") – to be read from the exe's thunks; `0a2192aa` is a console-only API (on PC: `WindowsGRTSStub` stubs).
+- **Not determined (needs the exe):** `0a2192aa` is a console-only API (on PC: `WindowsGRTSStub` stubs).
 - Tests: `thunk_protocol_with_xcl_objects_on_pc_queues` (XUserAddAsync/Result and XGameSave async through the vtable on
   PC queues, XStore rejected, an unhandled slot in the report), `libhttpclient_initialises_through_the_xgameruntime_thunks`
   (real DLL: HCInitialize → S_OK). Without the system xgameruntime.dll: the XCL classes work, the rest is "missing".

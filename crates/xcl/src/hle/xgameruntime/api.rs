@@ -66,6 +66,8 @@ const XSYSTEM_IID: Guid = g(0x1861cf2e_e18b_4834_a9f5_b4a4e6efb4cf);
 pub const XGAMEUI: Guid = g(0xdfcd4649_4ff8_4043_ba07_35d607df98b0);
 const XGAMEUI_IID: Guid = g(0xeaf669df_5542_4590_99a3_8dc061f837cc);
 const XSTORE: Guid = g(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
+/// XPersistentLocalStorage class candidate from HANDOFF.md
+pub const XPLS: Guid = g(0x7f0fe8b8_0000_0000_0000_000000000000);
 /// XAsync + XTaskQueue + XThread (iid = clsid)
 pub const XASYNC: Guid = g(0x073b7dcb_1fcf_4030_94be_e3c9eb623428);
 
@@ -372,12 +374,28 @@ fn objects() -> &'static [&'static Obj] {
                 name: "XSystem",
                 clsid: XSYSTEM,
                 iids: &[XSYSTEM_IID],
-                slots: vec![(3, XSystemGetConsoleId as usize), (4, XSystemGetXboxLiveSandboxId as usize)],
-                forward: &[5, 6, 7, 8, 9, 10, 11, 12, 13],
+                slots: vec![
+                    (3, XSystemGetConsoleId as usize),
+                    (4, XSystemGetXboxLiveSandboxId as usize),
+                    (5, XSystemGetDeviceType as usize),
+                ],
+                forward: &[6, 7, 8, 9, 10, 11, 12, 13],
                 zero: &[],
             }),
             // dialogs without a user handle go to the PC runtime (message, error, text entry)
             object(Iface { name: "XGameUi", clsid: XGAMEUI, iids: &[XGAMEUI_IID], slots: Vec::new(), forward: &[3, 4, 14, 15, 17, 18, 19], zero: &[] }),
+            object(Iface {
+                name: "XPersistentLocalStorage",
+                clsid: XPLS,
+                iids: &[XPLS],
+                slots: vec![
+                    (3, XPersistentLocalStorageGetPathSize as usize),
+                    (4, XPersistentLocalStorageGetPath as usize),
+                    (5, XPersistentLocalStorageGetSpaceInfo as usize),
+                ],
+                forward: &[],
+                zero: &[],
+            }),
         ]
     })
 }
@@ -656,6 +674,21 @@ mod tests {
             let token: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(u, 23);
             assert_eq!(token(u), E_NOTIMPL);
             assert!(stats().unimplemented.contains_key("XUser#23"));
+
+            // Test XSystem slot 5 (XSystemGetDeviceType)
+            let (_, sys) = query(XSYSTEM, XSYSTEM_IID);
+            assert!(!sys.is_null());
+            let get_device_type: unsafe extern "system" fn(*mut c_void) -> u32 = slot(sys, 5);
+            assert_eq!(get_device_type(sys), crate::hle::xgameruntime::DEVICE_XBOX_SCARLETT_ANACONDA);
+
+            // Test XPersistentLocalStorage thunk provider (0x7f0fe8b8)
+            let (hr_pls, pls) = query(XPLS, XPLS);
+            assert_eq!(hr_pls, S_OK);
+            assert!(!pls.is_null());
+            let get_path_size: unsafe extern "system" fn(*mut c_void, *mut usize) -> HRESULT = slot(pls, 3);
+            let mut pls_size = 0usize;
+            assert_eq!(get_path_size(pls, &mut pls_size), S_OK);
+            assert!(pls_size > 0);
 
             // XGameSave: provider (async), container, write a blob, read it back (async)
             let (_, s) = query(XGAMESAVE, XGAMESAVE_IIDS[0]);
