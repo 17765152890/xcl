@@ -149,6 +149,14 @@ fn build(config: &Config) -> Registry {
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));
     }
+    // PIX instrumentation (PIXEvt.dll) is a console OS component: it always exists there,
+    // so route it to stubs - a runtime LoadLibrary from title code must succeed, and
+    // GetProcAddress must answer for every export (see resolver::get_proc_address). The
+    // events functions return block pointers / BOOLs, so the stub default must stay 0
+    // ("not capturing") - never E_NOTIMPL, which would be a bogus non-null pointer. The
+    // officially distributed console FidelityFX upscaler (Xbox-GDK-Samples
+    // Kits/FidelityFX/signedbin) imports PIXEventsReplaceBlock.
+    routes.push(("pixevt.dll".into(), Route::Stub));
     Registry { modules, routes }
 }
 
@@ -223,5 +231,20 @@ mod tests {
     fn cross_module_lookup_finds_xmem() {
         let r = build(&Config::default());
         assert_eq!(r.find_any("XMemAlloc").map(|(m, _)| m.name), Some(KERNELX));
+    }
+
+    /// PIXEvt.dll (console PIX instrumentation) is an OS component on the console: a
+    /// runtime LoadLibrary from title code must succeed, and GetProcAddress must answer
+    /// for every export - with a 0-returning stub, because the events functions return
+    /// block pointers / BOOLs (0 = "not capturing"; E_NOTIMPL would be a bogus pointer).
+    /// The officially distributed console FidelityFX upscaler (Xbox-GDK-Samples
+    /// Kits/FidelityFX/signedbin) imports PIXEventsReplaceBlock.
+    #[test]
+    fn pixevt_stub_module_answers_loadlibrary_and_getprocaddress() {
+        let h = crate::resolver::load_library("PIXEvt.dll").expect("console has PIXEvt.dll");
+        let what = crate::pe::ImportName::Name { hint: 0, name: "PIXEventsReplaceBlock".to_string() };
+        let f = crate::resolver::get_proc_address(h, &what).expect("PIXEventsReplaceBlock");
+        let call: extern "system" fn() -> u64 = unsafe { std::mem::transmute(f) };
+        assert_eq!(call(), 0, "no capture block - never a bogus non-null pointer");
     }
 }

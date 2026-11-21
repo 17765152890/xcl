@@ -328,6 +328,12 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
             None => None,
         };
         if r.is_none() {
+            // A DLL routed to stubs exists on the console with all of its exports: answer
+            // GetProcAddress for any name with a stub (default return value from the db).
+            // Unknown DLLs still get NULL so optional-API probing keeps working.
+            if matches!(reg.route(&name), Some(Route::Stub)) {
+                return Some(stub_for(&name, what).0);
+            }
             crate::xlog_warn!("GetProcAddress({name}, {what}) → NULL (not implemented)");
         }
         return r;

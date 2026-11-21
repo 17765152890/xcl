@@ -17,6 +17,10 @@
 "xcrdapi.dll" = "E_NOTIMPL"
 "xg_x.dll" = "E_NOTIMPL"
 "gameinput.dll" = "E_NOTIMPL"
+# PIX instrumentation, a console OS component (PIXEvt.dll). Its event functions return
+# block pointers / BOOLs: 0 means "not capturing", the value instrumented code expects
+# when PIX is off - E_NOTIMPL would be a bogus non-null pointer.
+"pixevt.dll" = "0"
 
 [functions]
 # GDK / Xbox Live APIs that return HRESULT even when called through other modules
