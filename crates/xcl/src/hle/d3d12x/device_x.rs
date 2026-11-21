@@ -308,10 +308,56 @@ pub(super) unsafe extern "system" fn serialize_pso_x(_this: *mut c_void, _pso: *
 
 /// device #57 / #67 Deserialize{Graphics,Compute}PipelineStateX(state, riid, pipeline): the
 /// serialised form is the console driver's; the title creates the pipeline from its desc
-pub(super) unsafe extern "system" fn deserialize_pso_x(_this: *mut c_void, _state: *const u8, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+pub(super) unsafe extern "system" fn deserialize_pso_x(_this: *mut c_void, state: *const u8, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static N: AtomicU64 = AtomicU64::new(0);
     if once(&N, 1) {
         crate::xlog_warn!("D3D12.X: DeserializePipelineStateX – console pipeline caches are not supported");
+        // Dump the blob header so the console serialisation format can be identified:
+        // the official FSR4 upscaler deserialises its native pipelines here
+        // ('FFX_FSR4_PASS_0'...) - see the FFX GPU harness report.
+        if !state.is_null() {
+            let d = std::slice::from_raw_parts(state, 0x100.min(0x1_0000));
+            crate::xlog_warn!("D3D12.X: deserialise blob head: {:02x?}", &d[..0x80.min(d.len())]);
+            if let Some(s) = d.iter().position(|&b| b == 0) {
+                crate::xlog_warn!("D3D12.X: blob string prefix: {:?}", String::from_utf8_lossy(&d[..s.min(64)]));
+            }
+            // the header looks like pointer/size segments - dump what the first qwords
+            // point at so the console serialisation format can be identified
+            let q = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+            for i in 0..8u32 {
+                let p = q(i as usize * 8);
+                let Some(p) = p else { break };
+                if (0x1_0000_0000..0x8000_0000_0000).contains(&p) {
+                    let seg = std::slice::from_raw_parts(p as *const u8, 0x40);
+                    crate::xlog_warn!("D3D12.X: blob qword[{i}] = {p:#x} -> {:02x?}", seg);
+                } else {
+                    crate::xlog_warn!("D3D12.X: blob qword[{i}] = {p:#x}");
+                }
+            }
+            // pairs of (ptr, size) from qword[1]: dump the larger segments entirely,
+            // including the one in title memory (a console GPU VA) via the UMA resolver
+            for i in 1..6u32 {
+                let Some(ptr) = q(i as usize * 8 + 8) else { break };
+                let Some(sz) = q(i as usize * 8 + 16) else { break };
+                if sz == 0 || sz > 0x1_0000 {
+                    continue;
+                }
+                // console GPU VAs in the UMA equal the host address (XCL's no-copy windows);
+                // anything else in a plausible pointer range is a host allocation
+                let host = crate::gpu::uma::get()
+                    .map(|u| u.window_of(ptr as usize).is_some())
+                    .unwrap_or(false)
+                    .then_some(ptr as usize)
+                    .or_else(|| (0x1_0000_0000..0x8000_0000_0000).contains(&ptr).then_some(ptr as usize));
+                match host {
+                    Some(h) if sz >= 8 => {
+                        let seg = std::slice::from_raw_parts(h as *const u8, sz.min(0x120) as usize);
+                        crate::xlog_warn!("D3D12.X: blob segment {i} (ptr {ptr:#x}, size {sz:#x}): {:02x?}", seg);
+                    }
+                    _ => crate::xlog_warn!("D3D12.X: blob segment {i} (ptr {ptr:#x}, size {sz:#x}) not reachable"),
+                }
+            }
+        }
     }
     if !ppv.is_null() {
         *ppv = std::ptr::null_mut();
