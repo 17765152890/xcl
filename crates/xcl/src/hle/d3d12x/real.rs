@@ -1336,6 +1336,8 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let mut pc_desc = [0u8; 56];
     let console_desc = desc;
     let mut desc = desc;
+    let mut flags = flags;
+    let mut flags_dropped = false;
     if desc != 0 {
         std::ptr::copy_nonoverlapping(desc as *const u8, pc_desc.as_mut_ptr(), 56);
         let layout = u32::from_le_bytes(pc_desc[44..48].try_into().unwrap());
@@ -1344,12 +1346,41 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             pc_desc[52..56].copy_from_slice(&0u32.to_le_bytes());
             desc = pc_desc.as_ptr() as usize;
         }
+        // Console RDNA2 supports typed UAV access on formats the PC typed-UAV set lacks:
+        // the officially distributed FSR4 upscaler creates its neural-input texture as
+        // 1920x1080 R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS and initial state
+        // UAV (console HW packs 9-9-9-E5 in image stores; CheckFormatSupport on the PC
+        // reports no typed UAV for DXGI 67), so the PC driver rejects both the flag and
+        // a UAV initial state for this format with E_INVALIDARG. Translate at this
+        // boundary (the same point as the Layout fix): keep the format - SRVs of
+        // R9G9B9E5 are PC-legal - and drop the GPU-write flags with their matching
+        // initial state. Verified end-to-end with the official console binaries: the
+        // upscaler's ffxCreateContext then completes (heaps + 4 textures + views) and
+        // ffxDestroyContext returns OK. Known open risk, to be observed at dispatch:
+        // if a console pipeline binds a UAV view of such a texture, the view creation
+        // is void and the failure would surface at execution.
+        let format = u32::from_le_bytes(pc_desc[32..36].try_into().unwrap());
+        let fl = u32::from_le_bytes(pc_desc[48..52].try_into().unwrap());
+        if format == 67 && fl & 0x6 != 0 {
+            pc_desc[48..52].copy_from_slice(&(fl & !0x6).to_le_bytes());
+            desc = pc_desc.as_ptr() as usize;
+            flags &= !0x6;
+            flags_dropped = true;
+            crate::xlog_warn!(
+                "CreateCommittedResource (console): DXGI 67 (R9G9B9E5) + GPU-write flags has no PC typed UAV - flags {fl:#x} -> {:#x}, matching UAV initial state -> COMMON",
+                fl & !0x6
+            );
+        }
     }
     // console resource states carry console-only qualifier bits above the 32-bit PC enum
     // (observed from the officially distributed FSR4 upscaler: InitialState 0x400000008 for
     // a 1920x1080 UAV texture - a console bit OR the PC UAV state 0x8); the PC driver
     // rejects them with E_INVALIDARG. Mask to the PC state range.
     let state = state & 0xFFFF_FFFF;
+    // PROBE continuation -> final rule: a state that references the dropped UAV
+    // capability is invalid for the same reason (the format has no PC typed UAV);
+    // start such resources in COMMON instead.
+    let state = if flags_dropped && state == 0x8 { 0 } else { state };
     if desc != 0 {
         if let Some(hr) = place_console_buffer(this, desc, state, clear, riid, ppv) {
             return hr;
