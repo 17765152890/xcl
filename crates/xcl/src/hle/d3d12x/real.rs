@@ -1345,6 +1345,11 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             desc = pc_desc.as_ptr() as usize;
         }
     }
+    // console resource states carry console-only qualifier bits above the 32-bit PC enum
+    // (observed from the officially distributed FSR4 upscaler: InitialState 0x400000008 for
+    // a 1920x1080 UAV texture - a console bit OR the PC UAV state 0x8); the PC driver
+    // rejects them with E_INVALIDARG. Mask to the PC state range.
+    let state = state & 0xFFFF_FFFF;
     if desc != 0 {
         if let Some(hr) = place_console_buffer(this, desc, state, clear, riid, ppv) {
             return hr;
