@@ -326,7 +326,27 @@ pub fn init() -> Result<String, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
-        if !cfg.d3d12_adapter.eq_ignore_ascii_case("warp") {
+        // XCL_ADAPTER=<substring>: pick a specific adapter (the Track-4 hardware matrix -
+        // e.g. running a workload the high-performance GPU's driver refuses on the iGPU);
+        // no match falls through to the normal selection.
+        if let Ok(want) = std::env::var("XCL_ADAPTER") {
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else { continue };
+                let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                let dname = String::from_utf16_lossy(&desc.Description[..n]);
+                if !dname.to_ascii_lowercase().contains(&want.to_ascii_lowercase()) {
+                    continue;
+                }
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                    name = format!("{} ({} MiB VRAM) [XCL_ADAPTER]", adapter_name(&desc), desc.DedicatedVideoMemory >> 20);
+                    crate::xlog_info!("D3D12: adapter matched by XCL_ADAPTER={want:?}");
+                    break;
+                }
+            }
+        }
+        if device.is_none() && !cfg.d3d12_adapter.eq_ignore_ascii_case("warp") {
             let mut i = 0;
             while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
                 i += 1;
