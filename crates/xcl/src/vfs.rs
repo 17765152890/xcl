@@ -56,6 +56,8 @@ const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 pub struct Vfs {
     game_root: String,
     game_root_lc: String,
+    /// the XCL data folder (host territory: TLS carriers, caches, logs)
+    data_root_lc: String,
     overlay: String,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
@@ -131,6 +133,7 @@ fn logical_drives() -> u32 {
 impl Vfs {
     pub fn new(game_root: &Path, data_dir: &Path, mounts: Vec<(String, String)>) -> Vfs {
         let game_root = trim_sep(&norm(&game_root.to_string_lossy()));
+        let data_root = trim_sep(&norm(&data_dir.to_string_lossy()));
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
@@ -145,6 +148,7 @@ impl Vfs {
         Vfs {
             game_root_lc: game_root.to_lowercase(),
             game_root,
+            data_root_lc: data_root.to_lowercase(),
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
             mounts,
             whiteouts: Mutex::new(whiteouts),
@@ -159,11 +163,27 @@ impl Vfs {
         &self.game_root
     }
 
+    /// Whether the lowercased path `l` is `root` itself or under it.
+    fn under(l: &str, root: &str) -> bool {
+        l == root || (l.starts_with(root) && l.as_bytes().get(root.len()) == Some(&b'\\'))
+    }
+
     fn apply_mounts(&self, p: &str) -> Option<String> {
         // to_ascii_lowercase keeps byte offsets, so slicing `p` with prefix.len() is safe
         let l = p.to_ascii_lowercase();
         for (prefix, target) in &self.mounts {
             if !l.starts_with(prefix.as_str()) {
+                continue;
+            }
+            // A path already under a host root - the mount target (the game folder) or
+            // the XCL data folder - is a real host path, not a console one: the default
+            // configuration mounts a drive letter to the game folder ("D:" = "{game}"),
+            // and a workspace on that drive has its own paths there (the game exe, the
+            // TLS carriers, the shader cache) which would otherwise translate to
+            // doubled, nonexistent paths. Console paths never include the host-side
+            // game folder path (the game folder IS the drive root for them).
+            let tl = target.to_ascii_lowercase();
+            if Self::under(&l, &tl) || Self::under(&l, &self.data_root_lc) {
                 continue;
             }
             let rest = &p[prefix.len()..];
@@ -230,20 +250,27 @@ impl Vfs {
         }
         let Some(abs) = full(&p) else { return Target::Pass };
         let abs = trim_sep(&strip_verbatim(&norm(&abs)));
-        let lc = abs.to_lowercase();
-        if lc == self.game_root_lc {
-            return Target::Game { rel: String::new() };
-        }
-        if let Some(rest) = lc.strip_prefix(&self.game_root_lc) {
-            if rest.starts_with('\\') {
-                return Target::Game { rel: abs[self.game_root.len() + 1..].to_string() };
-            }
+        if let Some(t) = self.game_target(&abs) {
+            return t;
         }
         if translated {
             Target::Translated(abs)
         } else {
             Target::Pass
         }
+    }
+
+    /// Game target of an absolute path: the root itself, `rel` when under it (None otherwise).
+    fn game_target(&self, abs: &str) -> Option<Target> {
+        let lc = abs.to_lowercase();
+        if lc == self.game_root_lc {
+            return Some(Target::Game { rel: String::new() });
+        }
+        let rest = lc.strip_prefix(&self.game_root_lc)?;
+        if !rest.starts_with('\\') {
+            return None;
+        }
+        Some(Target::Game { rel: abs[self.game_root.len() + 1..].to_string() })
     }
 
     pub fn classify(&self, path: &str) -> Target {
@@ -553,6 +580,32 @@ mod tests {
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
+    }
+
+    #[test]
+    fn a_drive_letter_mount_never_hides_real_game_paths() {
+        // The default title configuration mounts a drive letter to the game folder
+        // ("D:" = "{game}"); when the workspace itself is on that drive, the host's own
+        // real paths under the game root (the game exe, for one) must stay game paths
+        // instead of being mount-translated to doubled, nonexistent paths.
+        let f = Fixture::new("mnt");
+        let game = f.game();
+        let drive = game
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .trim_end_matches('\\')
+            .to_string();
+        let vfs = Vfs::new(&game, &f.dir.join("data2"), vec![(drive.clone(), game.to_string_lossy().into_owned())]);
+        let exe = game.join("the_title.exe");
+        assert_eq!(vfs.classify(&exe.to_string_lossy()), Target::Game { rel: "the_title.exe".into() });
+        // a host path under the XCL data folder (TLS carriers, shader caches) stays real
+        let carrier = f.dir.join("data2").join("cache").join("xcl_tls_carrier.dll");
+        assert!(matches!(vfs.classify(&carrier.to_string_lossy()), Target::Pass));
+        // the mount still maps the rest of that drive into the game folder
+        assert_eq!(vfs.classify(&format!("{drive}\\elsewhere\\x.bin")), Target::Game { rel: "elsewhere\\x.bin".into() });
     }
 
     #[test]
