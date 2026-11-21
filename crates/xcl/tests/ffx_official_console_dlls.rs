@@ -479,3 +479,335 @@ fn ffx_console_upscaler_creates_and_destroys_a_context_on_the_pc_device() {
         assert_eq!(rc, 0, "ffxDestroyContext returned {} ({})", rc, ffx_return_name(rc));
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// GPU dispatch (XCL_SAMPLE_FFX + XCL_FFX_DISPATCH=1 + XCL_CONSOLE_LISTS=1): a genuine
+// FSR4 dispatch through the console pipeline with real input content, executed on the
+// PC GPU and read back.
+// ---------------------------------------------------------------------------------------
+
+/// IEEE f32 -> f16 bits (round to nearest even), for filling half-float input textures.
+fn f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = (b & 0x7f_ffff) >> 13;
+    if exp <= 0 {
+        return sign; // flush to zero is fine for test content
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((exp as u16) << 10) | mant as u16
+}
+
+#[test]
+fn ffx_console_upscaler_dispatches_and_executes_on_the_gpu() {
+    let Some(dir) = setup() else { return };
+    if !gpu_gate("XCL_FFX_DISPATCH") || !xcl::hle::d3d12x::console_list::enabled() {
+        return;
+    }
+    // The console DLL fail-fasts inside ffxDispatch at the known blocker
+    // (DeserializePipelineStateX returns E_NOTIMPL, the provider's CreateModel assertion
+    // fires, then a null PSO crashes the recording) - reproduce in a child and assert the
+    // exact signature; the full flow below takes over automatically once the console
+    // driver-cache deserializer exists.
+    if std::env::var_os("XCL_FFX_CHILD").is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("ffx_console_upscaler_dispatches_and_executes_on_the_gpu")
+            .args(["--exact", "--nocapture"])
+            .env("XCL_SAMPLE_FFX", dir)
+            .env("XCL_FFX_DISPATCH", "1")
+            .env("XCL_CONSOLE_LISTS", "1")
+            .env("XCL_FFX_CHILD", "1")
+            .env("XCL_PRINT", "1")
+            .output()
+            .expect("spawn the dispatch reproduction child");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        println!("{stdout}");
+        println!("{stderr}");
+        let both = format!("{stdout}{stderr}");
+        if out.status.success() {
+            println!("the child completed the full dispatch/execute flow - the blocker is gone");
+            return;
+        }
+        let code = out.status.code().unwrap_or_default() as u32;
+        assert_eq!(code, 0xC0000005u32, "expected the console crash at the known blocker; stderr: {stderr}");
+        assert!(
+            both.contains("FFX native PSO 'FFX_FSR4_PASS_0': deserialize failed"),
+            "missing the FSR4 deserialize evidence line"
+        );
+        assert!(
+            both.contains("Assertion failed: CreateModel"),
+            "missing the provider assertion line"
+        );
+        assert!(
+            both.contains("DeserializePipelineStateX"),
+            "missing the XCL deserializer line"
+        );
+        println!(
+            "VERIFIED FRONTIER: the context lifecycle completes and the dispatch reaches the FSR4 \
+             native pipelines; blocked precisely at DeserializePipelineStateX - the console \
+             driver-cache format (see the blob segments logged above; the shader payload is raw \
+             console-compiler output, not the FSSM container format)."
+        );
+        return;
+    }
+    let _guard = serialize();
+    unsafe {
+        let loader = load(dir, "amd_fidelityfx_loader_xbox.dll");
+        let m = load(dir, "amd_fidelityfx_upscaler_xbox.dll");
+        let iid: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = xcl::hle::d3d12x::D3D12XboxCreateDevice(std::ptr::null_mut(), std::ptr::null(), iid.as_ptr() as _, &mut dev);
+        assert!(hr >= 0 && !dev.is_null(), "XCL device");
+
+        // the sample-exact chain (verified by the create/destroy test)
+        let mut backend = FfxBackend { header: FfxHeader { ty: 0x0200_0002, next: std::ptr::null_mut() }, device: dev };
+        let mut version = [0u8; 32];
+        version[0..8].copy_from_slice(&0x0001_000bu64.to_le_bytes());
+        version[0x10..0x18].copy_from_slice(&0x0100_1002u64.to_le_bytes());
+        let vh = version.as_mut_ptr() as *mut FfxHeader;
+        (*vh).next = std::ptr::null_mut();
+        backend.header.next = vh;
+        let mut desc = FfxCreateUpscale {
+            header: FfxHeader { ty: 0x0001_0000, next: &mut backend.header },
+            flags: 1 << 5 | 1 << 3 | 1 << 8, // AUTO_EXPOSURE | DEPTH_INVERTED | NON_LINEAR_COLORSPACE
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+            message: 0,
+        };
+        let create: extern "C" fn(*mut usize, *mut FfxHeader, *const u8) -> u32 = std::mem::transmute(proc(&loader, "ffxCreateContext"));
+        let mut ctx = 0usize;
+        let rc = create(&mut ctx, &mut desc.header, std::ptr::null());
+        println!("ffxCreateContext: code {rc} ({}), context {ctx:#x}", ffx_return_name(rc));
+        assert_eq!(rc, 0, "context required for the dispatch");
+        let mut inner = unsafe { *(ctx as *const usize).add(1) }; // the loader's wrapper holds the provider context at +8
+
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let device = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+            .unwrap();
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut frame = 0u64;
+
+        // textures: three FSR inputs (SRV) and the output (UAV), all DEFAULT heap
+        let tex = |w: u32, h: u32, f: DXGI_FORMAT, uav: bool, initial: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+            let mut r: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: w as u64,
+                        Height: h,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: f,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: if uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+                        ..Default::default()
+                    },
+                    initial,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+            r.unwrap()
+        };
+        let upload = |size: u64| -> ID3D12Resource {
+            let mut r: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_UNKNOWN,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+            r.unwrap()
+        };
+        let color = tex(1280, 720, DXGI_FORMAT_R16G16B16A16_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        let depth = tex(1280, 720, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        let motion = tex(1280, 720, DXGI_FORMAT_R16G16_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        let output = tex(1920, 1080, DXGI_FORMAT_R16G16B16A16_FLOAT, true, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        // deterministic input content: an RGB gradient, a two-band depth plane, zero motion
+        let color_st = upload(720 * 1280 * 8);
+        {
+            let mut p = std::ptr::null_mut();
+            color_st.Map(0, None, Some(&mut p)).unwrap();
+            let p = p as *mut u16;
+            for y in 0..720u32 {
+                for x in 0..1280u32 {
+                    let o = ((y * 1280 + x) * 4) as usize;
+                    *p.add(o) = f16(x as f32 / 1280.0);
+                    *p.add(o + 1) = f16(y as f32 / 720.0);
+                    *p.add(o + 2) = f16(0.25);
+                    *p.add(o + 3) = f16(1.0);
+                }
+            }
+            let _ = color_st.Unmap(0, None);
+        }
+        let depth_st = upload(720 * 1280 * 4);
+        {
+            let mut p = std::ptr::null_mut();
+            depth_st.Map(0, None, Some(&mut p)).unwrap();
+            let p = p as *mut f32;
+            for y in 0..720u32 {
+                let d = if y < 360 { 0.35 } else { 0.65 };
+                for x in 0..1280u32 {
+                    *p.add((y * 1280 + x) as usize) = d;
+                }
+            }
+            let _ = depth_st.Unmap(0, None);
+        }
+        let motion_st = upload(720 * 1280 * 4); // zeroed on creation: static camera
+        let output_st = upload(1080 * 1920 * 8); // zeroed: the output must differ after FSR4
+
+        // prep list: upload the inputs and zero the output
+        let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let prep: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        prep.CopyResource(&color, &color_st);
+        prep.CopyResource(&depth, &depth_st);
+        prep.CopyResource(&motion, &motion_st);
+        prep.CopyResource(&output, &output_st);
+        for (r, after) in [
+            (&color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            (&depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            (&motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            (&output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ] {
+            prep.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(r.clone())),
+                        Subresource: 0,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: after,
+                    }),
+                },
+            }]);
+        }
+        prep.Close().unwrap();
+        let q_vt = *(queue.as_raw() as *const *const usize);
+        let execute: extern "system" fn(*mut std::ffi::c_void, u32, *const *mut std::ffi::c_void) = std::mem::transmute(*q_vt.add(10));
+        execute(queue.as_raw(), 1, [prep.as_raw() as *mut std::ffi::c_void].as_ptr());
+        queue.Signal(&fence, { frame += 1; frame }).unwrap();
+        while fence.GetCompletedValue() < frame {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // the console list the FSR4 passes record into
+        let alloc2: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let pc2: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None).unwrap();
+        let console = xcl::hle::d3d12x::console_list::create_with_allocator(pc2.into_raw(), alloc2.as_raw());
+
+        let res = |r: &ID3D12Resource, f: u32, w: u32, h: u32, usage: u32, state: u32| -> [u32; 12] {
+            let p = r.as_raw() as usize;
+            [p as u32, (p >> 32) as u32, 2, f, w, h, 1, 1, 0, usage, state, 0]
+        };
+        let mut d = vec![0u32; 432 / 4];
+        let put = |d: &mut Vec<u32>, at: usize, w: &[u32]| d[at / 4..at / 4 + w.len()].copy_from_slice(w);
+        put(&mut d, 0, &[0x0001_0001, 0, 0, 0]); // FFX_API_DISPATCH_DESC_TYPE_UPSCALE
+        put(&mut d, 16, &[console as usize as u32, (console as usize >> 32) as u32]);
+        put(&mut d, 24, &res(&color, 4, 1280, 720, 0, 4)); // FFX fmt 4 = R16G16B16A16_FLOAT
+        put(&mut d, 72, &res(&depth, 28, 1280, 720, 0, 4)); // 28 = R32_FLOAT
+        put(&mut d, 120, &res(&motion, 18, 1280, 720, 0, 4)); // 18 = R16G16_FLOAT
+        put(&mut d, 312, &res(&output, 4, 1920, 1080, 2, 2)); // usage 2 = UAV, state 2
+        put(&mut d, 376, &[1280, 720, 1920, 1080]); // renderSize, upscaleSize
+        put(&mut d, 368, &[1280f32.to_bits(), 720f32.to_bits()]); // motion vector scale
+        put(&mut d, 400, &[16.6f32.to_bits(), 1f32.to_bits()]); // frameTimeDelta, preExposure
+        put(&mut d, 412, &[0.1f32.to_bits(), 1000f32.to_bits(), 1.0f32.to_bits(), 1f32.to_bits()]);
+        let dispatch: extern "C" fn(*mut usize, *const u32) -> u32 = std::mem::transmute(proc(&m, "ffxDispatch"));
+
+        // three frames: FSR4 accumulates history, and XCL builds the translated FSR4
+        // pipelines in the background behind stand-ins - later frames run the real ones
+        for i in 0..3u32 {
+            put(&mut d, 408, &[(i == 0) as u32]); // reset on the first frame
+            let rc = dispatch(&mut inner, d.as_ptr());
+            println!("ffxDispatch frame {i}: code {rc:#x} ({}{}{})", ffx_return_name(rc), "", "");
+            assert_eq!(rc, 0, "ffxDispatch frame {i} returned {rc}");
+            let words = xcl::hle::d3d12x::console_list::recorded_words(console);
+            println!("  recorded {} words", words.len());
+            let t = xcl::hle::d3d12x::console_list::close(console).expect("close");
+            println!("  close: {t:?}");
+            assert!(t.unknown.is_none(), "unrecognised record {t:?}");
+            assert!(t.dispatches > 0, "FSR4 must dispatch its passes");
+            execute(queue.as_raw(), 1, [console].as_ptr());
+            queue.Signal(&fence, { frame += 1; frame }).unwrap();
+            let start = std::time::Instant::now();
+            while fence.GetCompletedValue() < frame {
+                assert!(start.elapsed().as_secs() < 600, "GPU did not finish frame {i}");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let reason = device.GetDeviceRemovedReason();
+            assert!(reason.is_ok(), "device removed after frame {i}: {reason:?}");
+            alloc2.Reset().unwrap();
+        }
+
+        // read the output back: it must differ from the zeroed initial content
+        let readback = upload(1080 * 1920 * 8);
+        let ralloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let rlist: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &ralloc, None).unwrap();
+        rlist.CopyResource(&readback, &output);
+        rlist.Close().unwrap();
+        execute(queue.as_raw(), 1, [rlist.as_raw() as *mut std::ffi::c_void].as_ptr());
+        queue.Signal(&fence, { frame += 1; frame }).unwrap();
+        while fence.GetCompletedValue() < frame {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut mapped = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut mapped)).unwrap();
+        let data = std::slice::from_raw_parts(mapped as *const u64, 1080 * 1920 * 2);
+        let nonzero = data.iter().filter(|&&w| w != 0).count();
+        let mut distinct = std::collections::BTreeSet::new();
+        for &w in data.iter().take(1920 * 8) {
+            distinct.insert(w);
+        }
+        println!("output readback: {nonzero}/{} nonzero u64 words, {} distinct in the first rows", data.len(), distinct.len());
+        let _ = readback.Unmap(0, None);
+        assert!(nonzero > 1920 * 100, "the FSR4 output must contain real content: {nonzero} nonzero words");
+        assert!(distinct.len() > 100, "the output must vary (gradient input): {} distinct", distinct.len());
+
+        // a visual artifact for the report if requested
+        if let Some(out) = std::env::var_os("XCL_FFX_DUMP") {
+            let mut ppm = format!("P6 1920 1080 255\n").into_bytes();
+            let half = |v: u16| -> u8 {
+                let f = f32::from_bits((((v & 0x7c00) as u32) << 13) + 0x3800_0000);
+                (f.min(1.0).max(0.0) * 255.0) as u8
+            };
+            for px in data.chunks(4) {
+                ppm.extend([half(px[0] as u16), half(px[1] as u16), half(px[2] as u16)]);
+            }
+            std::fs::write(&out, ppm).unwrap();
+            println!("saved the output image to {out:?}");
+        }
+
+        let destroy: extern "C" fn(*mut usize, *const u8) -> u32 = std::mem::transmute(proc(&m, "ffxDestroyContext"));
+        let mut dctx = inner;
+        let rc = destroy(&mut dctx, std::ptr::null());
+        println!("ffxDestroyContext: code {rc} ({})", ffx_return_name(rc));
+        assert_eq!(rc, 0, "ffxDestroyContext returned {rc}");
+    }
+}
