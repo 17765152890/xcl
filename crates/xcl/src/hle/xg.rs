@@ -75,6 +75,7 @@ pub struct Surface {
     pub width: u32,
     pub height: u32,
     pub array: u32,
+    pub samples: u32,
     pub first_tail: usize,
 }
 
@@ -137,9 +138,12 @@ impl Texture {
         let w16 = |o: usize| u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as u32;
         let (dim, width, height, array, mips, format, samples, layout, flags) =
             (u(0), u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), u(0x18), w16(0x1C), w16(0x1E), u(0x20), u(0x24), u(0x2C), u(0x30));
-        // 1D / 3D / buffers and MSAA are not modelled
-        if dim != 3 || samples > 1 {
+        // 1D / 3D / buffers are not modelled; samples must be 1, 2, 4, or 8
+        if dim != 3 || !matches!(samples, 1 | 2 | 4 | 8) {
             return Err(E_NOTIMPL);
+        }
+        if samples > 1 && mips > 1 {
+            return Err(E_INVALIDARG);
         }
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
@@ -159,7 +163,7 @@ impl Texture {
         if mips as usize > MAX_MIPS {
             return Err(E_INVALIDARG);
         }
-        let surface = |e: u32, side: u32| Surface::new(mode, e, side, width as u32, height, array, mips, pipes);
+        let surface = |e: u32, side: u32| Surface::new(mode, e, side, width as u32, height, array, samples, mips, pipes);
         let (rt, ds) = (flags & 1 != 0, flags & 2 != 0);
         if planar && layout == 2 {
             return Err(E_INVALIDARG); // a stencil format with the 64KB_D choice
@@ -243,9 +247,9 @@ impl Texture {
         self.plane_surface(self.main as u32).map_or(0, |(s, at)| at + s.mip_offset(i))
     }
 
-    /// byte offset of element (x, y) of level `i` in slice `slice` of the texels
-    pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize) -> u64 {
-        self.plane_surface(self.main as u32).map_or(0, |(s, at)| at + s.element_offset(i, x, y, slice))
+    /// byte offset of element (x, y) of level `i` in slice `slice` and sample `sample` of the texels
+    pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize, sample: usize) -> u64 {
+        self.plane_surface(self.main as u32).map_or(0, |(s, at)| at + s.element_offset(i, x, y, slice, sample))
     }
 
     /// XG_RESOURCE_LAYOUT
@@ -298,7 +302,7 @@ impl Surface {
     /// `width` × `height` pixels, `array` slices, `mips` levels of `1 << e`-byte elements in
     /// swizzle mode `mode`.
     #[allow(clippy::too_many_arguments)]
-    fn new(mode: u32, e: u32, side: u32, width: u32, height: u32, array: u32, mips: u32, pipes: crate::gpu::tiling::PipeConfig) -> Result<Surface, HRESULT> {
+    fn new(mode: u32, e: u32, side: u32, width: u32, height: u32, array: u32, samples: u32, mips: u32, pipes: crate::gpu::tiling::PipeConfig) -> Result<Surface, HRESULT> {
         // the modes the console's library takes for a 2D texture (VAR 28 / 31: not modelled)
         let bc = side > 1;
         match mode {
@@ -310,11 +314,11 @@ impl Surface {
         let l = Layout::new(mode, e, pipes).ok_or(E_INVALIDARG)?;
         let chain = Chain::new(l, width, height, side, mips);
         let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
-        Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, first_tail })
+        Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, samples: samples.max(1), first_tail })
     }
 
     pub fn size(&self) -> u64 {
-        (self.chain.slice_bytes * self.array as usize) as u64
+        (self.chain.slice_bytes * self.array as usize * self.samples as usize) as u64
     }
 
     pub fn alignment(&self) -> u64 {
@@ -340,11 +344,12 @@ impl Surface {
         m.tail.unwrap_or(m.offset) as u64
     }
 
-    /// byte offset of element (x, y) of level `i` in slice `slice`; the slice is z of the 2D
+    /// byte offset of element (x, y) of level `i` in slice `slice` and sample `sample`; the slice is z of the 2D
     /// patterns (the XOR modes take pipe bits from it)
-    pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize) -> u64 {
+    pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize, sample: usize) -> u64 {
         let m = &self.chain.levels[i];
-        (slice * self.chain.slice_bytes + m.offset + self.chain.layout.offset_z(x + m.origin.0, y + m.origin.1, slice, m.pitch)) as u64
+        let slice_idx = slice * self.samples as usize + sample;
+        (slice_idx * self.chain.slice_bytes + m.offset + self.chain.layout.offset_z(x + m.origin.0, y + m.origin.1, slice, m.pitch)) as u64
     }
 
     /// this surface's plane of XG_RESOURCE_LAYOUT (its header at `pb`)
@@ -379,7 +384,7 @@ impl Surface {
             w(b, r + 0x38, (self.width >> i).max(1));
             w(b, r + 0x3C, (self.height >> i).max(1));
             w(b, r + 0x40, self.array);
-            w(b, r + 0x44, 1);
+            w(b, r + 0x44, self.samples);
             // the tail is in 256-byte tiles of the same kind (S 1, D 2, R 3; Z keeps its mode)
             w(b, r + 0x48, if tail && !self.mode.is_multiple_of(4) { self.mode % 4 } else { self.mode });
             if !tail && (24..=27).contains(&self.mode) {
@@ -487,12 +492,12 @@ unsafe extern "system" fn get_mip_offset(p: *mut c_void, plane: u32, mip: u32) -
     }
 }
 
-unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32, x: u64, y: u32, slice: u32, _sample: u32, bit: *mut u32) -> u64 {
+unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32, x: u64, y: u32, slice: u32, sample: u32, bit: *mut u32) -> u64 {
     if !bit.is_null() {
         *bit = 0;
     }
     match tex(p).plane_surface(plane) {
-        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.array => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
+        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.array && sample < s.samples => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize, sample as usize),
         _ => 0,
     }
 }
