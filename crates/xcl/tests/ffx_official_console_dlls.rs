@@ -842,7 +842,15 @@ fn ffx_console_upscaler_dispatches_and_executes_on_the_gpu() {
 
 #[test]
 fn deserialized_fs_dxil_driver_acceptance() {
-    let Some(path) = std::env::var_os("XCL_FFX_BISECT_DXIL") else { return };
+    let path: std::path::PathBuf = match std::env::var_os("XCL_FFX_BISECT_DXIL") {
+        Some(p) => p.into(),
+        // XCL_FFX_BISECT_EMPTY=1: the empty-shader control (no resources at all)
+        None if std::env::var_os("XCL_FFX_BISECT_EMPTY").is_some() => {
+            std::path::PathBuf::from(r"C:\Users\alexa\AppData\Local\Temp\fsr4_bisect\empty.cso")
+        }
+        None => return,
+    };
+    let no_rs = std::env::var_os("XCL_FFX_BISECT_NO_RS").is_some();
     let dxil = std::fs::read(&path).expect("read XCL_FFX_BISECT_DXIL");
     println!("bisect: {} B DXIL from {path:?}", dxil.len());
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -889,13 +897,116 @@ fn deserialized_fs_dxil_driver_acceptance() {
             }
         }
         println!("bisect: adapter in use: {desc}");
-        let rs = xcl::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+        // the adapter's wave-lane range decides whether [WaveSize(64)] shaders are legal
+        {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let ok = dev
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mut options as *mut _ as _, std::mem::size_of_val(&options) as u32)
+                .is_ok();
+            println!(
+                "bisect: WaveLaneCountMin={} Max={} (options1 ok: {ok})",
+                options.WaveLaneCountMin, options.WaveLaneCountMax
+            );
+        }
+        // DBWIN listener: the debug layer reports its rejection reasons via OutputDebugString,
+        // which only a debugger sees - capture the protocol here so the actual reason
+        // (if any) is printed instead of being lost.
+        let (dbwin_tx, dbwin_rx) = std::sync::mpsc::channel::<String>();
+        let dbwin = std::thread::spawn(move || unsafe {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Memory::*;
+            use windows_sys::Win32::System::Threading::*;
+            const PAGE_READWRITE: u32 = 0x04;
+            const FILE_MAP_READ: u32 = 0x04; // FILE_MAP_READ
+            let name: Vec<u16> = "DBWIN_BUFFER\0".encode_utf16().collect();
+            let mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 4096, name.as_ptr());
+            if mapping.is_null() {
+                return;
+            }
+            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 4096);
+            let view = view.Value as *const u8;
+            if view.is_null() {
+                CloseHandle(mapping);
+                return;
+            }
+            let n: Vec<u16> = "DBWIN_DATA_READY\0".encode_utf16().collect();
+            let c: Vec<u16> = "DBWIN_BUFFER_READY\0".encode_utf16().collect();
+            let ready = CreateEventW(std::ptr::null(), 1, 0, n.as_ptr());
+            let consumed = CreateEventW(std::ptr::null(), 1, 0, c.as_ptr());
+            if ready.is_null() || consumed.is_null() {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+                CloseHandle(mapping);
+                return;
+            }
+            // only one DBWIN consumer can exist per session; if another (a debugger) is
+            // active, CreateEvent finds ours set already and sends may be lost - fine
+            SetEvent(consumed);
+            loop {
+                if WaitForSingleObject(ready, 500) != 0 {
+                    if dbwin_tx.send(String::new()).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let buf = view as *const u8;
+                let pid = u32::from_le_bytes([*buf.add(0), *buf.add(1), *buf.add(2), *buf.add(3)]);
+                let mut end = 4;
+                while end < 4096 && *buf.add(end) != 0 {
+                    end += 1;
+                }
+                let msg = String::from_utf8_lossy(std::slice::from_raw_parts(buf.add(4), end - 4)).into_owned();
+                if dbwin_tx.send(format!("[pid {pid}] {msg}")).is_err() {
+                    break;
+                }
+                ResetEvent(ready);
+                SetEvent(consumed);
+            }
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            CloseHandle(mapping);
+            CloseHandle(ready);
+            CloseHandle(consumed);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // prove the listener is live before trusting a "silent" verdict
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA(b"bisect: DBWIN self-test\0".as_ptr());
+        }
+        // XCL_FFX_BISECT_NO_RS=1: create the PSO without any root signature, isolating
+        // shader-content rejection from root-signature interaction
+        let rs = (!no_rs).then(|| xcl::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature"));
         let d = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            pRootSignature: std::mem::ManuallyDrop::new(rs),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
         };
+        println!("bisect: root signature: {}", if no_rs { "NONE" } else { "XCL ABI" });
         let created: windows::core::Result<ID3D12PipelineState> = dev.CreateComputePipelineState(&d);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut seen = 0;
+        loop {
+            match dbwin_rx.try_recv() {
+                Ok(msg) if !msg.is_empty() => {
+                    println!("bisect: debug-layer message: {msg}");
+                    seen += 1;
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if seen > 0 {
+                        break;
+                    }
+                    // messages may still arrive shortly after the call
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    if let Err(std::sync::mpsc::TryRecvError::Empty) = dbwin_rx.try_recv() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        if seen == 0 {
+            println!("bisect: no debug-layer message captured (the rejection is silent)");
+        }
+        drop(dbwin_rx);
         let hr: i32 = match &created {
             Ok(_) => 0,
             Err(e) => e.code().0,
