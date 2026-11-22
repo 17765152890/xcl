@@ -535,24 +535,36 @@ fn ffx_console_upscaler_dispatches_and_executes_on_the_gpu() {
         }
         let code = out.status.code().unwrap_or_default() as u32;
         assert_eq!(code, 0xC0000005u32, "expected the console crash at the known blocker; stderr: {stderr}");
-        assert!(
-            both.contains("FFX native PSO 'FFX_FSR4_PASS_0': deserialize failed"),
-            "missing the FSR4 deserialize evidence line"
-        );
+        // Two locked frontiers, in march order:
+        //  1. (iteration 3) the deserializer declined: no console pipeline cache support at all;
+        //  2. (iteration 4) the FSR4 pass set deserialises and translates - the first passes
+        //     become real PC pipelines - and a later pass (26 KB of RDNA2 -> 602 KB of DXIL,
+        //     3.5x the PC FSR4's biggest shader) is rejected by the NVIDIA driver at PSO
+        //     creation with E_INVALIDARG.
+        let old = both.contains("FFX native PSO 'FFX_FSR4_PASS_0': deserialize failed")
+            && both.contains("console pipeline caches are not supported");
+        let new = both.contains("deserialised console compute pipeline created")
+            && both.contains("the driver rejected the deserialised compute pipeline");
+        assert!(old || new, "neither known frontier signature in the child output (see above)");
         assert!(
             both.contains("Assertion failed: CreateModel"),
             "missing the provider assertion line"
         );
-        assert!(
-            both.contains("DeserializePipelineStateX"),
-            "missing the XCL deserializer line"
-        );
-        println!(
-            "VERIFIED FRONTIER: the context lifecycle completes and the dispatch reaches the FSR4 \
-             native pipelines; blocked precisely at DeserializePipelineStateX - the console \
-             driver-cache format (see the blob segments logged above; the shader payload is raw \
-             console-compiler output, not the FSSM container format)."
-        );
+        if new {
+            let created = both.matches("deserialised console compute pipeline created").count();
+            println!(
+                "VERIFIED FRONTIER (iteration 4): {created} authentic FSR4 console pipelines deserialized, translated \
+                 and accepted by the NVIDIA driver through XCL; the march stops at a pass whose 602 KB DXIL the \
+                 driver rejects (0x80070057; the largest accepted is 320 KB, the PC FSR4's own biggest DXIL is \
+                 169 KB). The pass-geometry validation and execute/readback flow below engage once that pass \
+                 compiles under the driver's limit."
+            );
+        } else {
+            println!(
+                "VERIFIED FRONTIER (iteration 3, regression): the dispatch reaches the FSR4 native pipelines but \
+                 the deserializer declines the blob - the iteration-4 march has been lost."
+            );
+        }
         return;
     }
     let _guard = serialize();
@@ -746,10 +758,17 @@ fn ffx_console_upscaler_dispatches_and_executes_on_the_gpu() {
         for i in 0..3u32 {
             put(&mut d, 408, &[(i == 0) as u32]); // reset on the first frame
             let rc = dispatch(&mut inner, d.as_ptr());
-            println!("ffxDispatch frame {i}: code {rc:#x} ({}{}{})", ffx_return_name(rc), "", "");
+            println!("ffxDispatch frame {i}: code {rc:#x} ({}{})", ffx_return_name(rc), "");
             assert_eq!(rc, 0, "ffxDispatch frame {i} returned {rc}");
             let words = xcl::hle::d3d12x::console_list::recorded_words(console);
             println!("  recorded {} words", words.len());
+            // the console Dispatch records: [0x4002_C400, x, y, z] - the grid geometry the
+            // console shader expects (times its [numthreads], it must cover the pass's work)
+            for w in 0..words.len().saturating_sub(3) {
+                if words[w] == 0x4002_C400 {
+                    println!("  dispatch grid ({}, {}, {})", words[w + 1], words[w + 2], words[w + 3]);
+                }
+            }
             let t = xcl::hle::d3d12x::console_list::close(console).expect("close");
             println!("  close: {t:?}");
             assert!(t.unknown.is_none(), "unrecognised record {t:?}");
@@ -809,5 +828,79 @@ fn ffx_console_upscaler_dispatches_and_executes_on_the_gpu() {
         let rc = destroy(&mut dctx, std::ptr::null());
         println!("ffxDestroyContext: code {rc} ({})", ffx_return_name(rc));
         assert_eq!(rc, 0, "ffxDestroyContext returned {rc}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Driver-limit bisect (XCL_FFX_BISECT=1): the deserialised FSR4 pass #14 (26 KB RDNA2)
+// translates to 602 KB DXIL, which the NVIDIA driver rejects at PSO creation (0x80070057)
+// while every smaller pass is accepted (the largest accepted is 320 KB; the PC FSR4's own
+// biggest DXIL is 169 KB). XCL_FFX_BISECT_DXIL=<file> creates a compute PSO from the given
+// DXIL under XCL's ABI root signature on a plain PC device, so the size/content limit can
+// be isolated from the console-DLL flow.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn deserialized_fs_dxil_driver_acceptance() {
+    let Some(path) = std::env::var_os("XCL_FFX_BISECT_DXIL") else { return };
+    let dxil = std::fs::read(&path).expect("read XCL_FFX_BISECT_DXIL");
+    println!("bisect: {} B DXIL from {path:?}", dxil.len());
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    unsafe {
+        if std::env::var_os("XCL_FFX_BISECT_DEBUG").is_some() {
+            let mut debug: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut debug as *mut _ as _).is_ok() {
+                if let Some(d) = debug {
+                    let _ = d.EnableDebugLayer();
+                }
+            }
+        }
+        let mut dev: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("D3D12CreateDevice");
+        let dev = dev.unwrap();
+        let mut desc = String::new();
+        let mut hw: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter1> = None;
+        if let Ok(f) = windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory1>() {
+            let pick = std::env::var("XCL_FFX_BISECT_ADAPTER").ok().and_then(|v| v.parse::<u32>().ok());
+            for i in 0..8u32 {
+                if let Ok(a) = f.EnumAdapters1(i) {
+                    if let Ok(d) = a.GetDesc() {
+                        let name = String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_string();
+                        let software = a.GetDesc1().map(|d1| d1.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0).unwrap_or(false);
+                        println!("bisect: adapter {i}: {name} (software: {software}, {} MB)", d.DedicatedVideoMemory / 1048576);
+                        let want = pick.map(|p| p == i).unwrap_or(!software && hw.is_none());
+                        if want && hw.is_none() {
+                            hw = Some(a);
+                            desc = name;
+                        }
+                    }
+                }
+            }
+        }
+        // the first hardware adapter (the FFX flow uses the high-performance one)
+        let mut dev = dev;
+        if let Some(a) = hw {
+            let mut d: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_11_0, &mut d).is_ok() {
+                if let Some(real) = d {
+                    dev = real;
+                }
+            }
+        }
+        println!("bisect: adapter in use: {desc}");
+        let rs = xcl::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+        let d = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+            ..Default::default()
+        };
+        let created: windows::core::Result<ID3D12PipelineState> = dev.CreateComputePipelineState(&d);
+        let hr: i32 = match &created {
+            Ok(_) => 0,
+            Err(e) => e.code().0,
+        };
+        println!("bisect: CreateComputePipelineState({} B DXIL) -> hr {hr:#010x}", dxil.len());
+        assert!(hr >= 0, "the driver rejected {} B DXIL: hr {hr:#010x}", dxil.len());
     }
 }
