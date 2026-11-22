@@ -1266,7 +1266,54 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
+    // the R9G9B9E5 translation (CreateCommittedResource (console)): the texture was
+    // created as R32_TYPELESS, and a format-67 view of a typeless resource is invalid on
+    // the PC - the view becomes R32_UINT while the console t# keeps the console format
+    // (the recompiler's format-132 image path packs/unpacks the 9-9-9-E5 dword)
+    let mut desc = desc;
+    let mut patched: Option<D3D12_SHADER_RESOURCE_VIEW_DESC> = None;
+    // the console's format for the t# words (set by the RGBE translation)
+    let mut console_format: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT> = None;
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+        let rd = r.GetDesc();
+        if rd.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            let want = desc.as_ref().map(|v| v.Format).unwrap_or(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN);
+            if matches!(want, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN) {
+                console_format = Some(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+                let v = match desc.as_ref() {
+                    Some(v) => {
+                        let mut w = *v;
+                        w.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+                        w
+                    }
+                    None => D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: rd.MipLevels as u32, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+                        },
+                    },
+                };
+                patched = Some(v);
+                desc = patched.as_ref().map(|v| v as *const _).unwrap_or(std::ptr::null());
+            }
+        }
+    }
     f(this, res, desc, slot.pc_srv);
+    if console_format.is_some() {
+        // the console's t# descriptors are read-write, so console code never creates a
+        // UAV view of this texture - but the recompiler's image stores index the PC UAV
+        // slot at +1, and the resource has the flag now: create it here, as R32_UINT
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 } },
+        };
+        let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) =
+            std::mem::transmute(orig_fn(this, 19));
+        g(this, res, std::ptr::null_mut(), &uav, slot.pc_uav);
+    }
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
@@ -1288,11 +1335,11 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
                 9 => (6, a.TextureCube.MipLevels),
                 _ => (1, 1),
             };
-            (v.Format, v.ViewDimension.0, array, mips)
+            (console_format.unwrap_or(v.Format), v.ViewDimension.0, array, mips)
         }
         None => {
             let d = r.GetDesc();
-            (d.Format, resource_dim_to_view(&d), d.DepthOrArraySize as u32, d.MipLevels as u32)
+            (console_format.unwrap_or(d.Format), resource_dim_to_view(&d), d.DepthOrArraySize as u32, d.MipLevels as u32)
         }
     };
     match view_shape(r, format, dim, array, mips) {
@@ -1307,13 +1354,34 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
-    // console code may ask a UAV view of a texture the flag-drop translation created
-    // without the UAV capability (e.g. the FSR4 neural-input R9G9B9E5 texture): the PC
-    // call then fails and the slot stays garbage - the fault surfaces at execution
+    // the R9G9B9E5 translation (CreateCommittedResource (console)): the texture was
+    // created as R32_TYPELESS + the UAV flag; a format-67 view is invalid on the PC -
+    // the UAV view becomes R32_UINT while the console t# keeps the console format (the
+    // recompiler's format-132 image path packs/unpacks the 9-9-9-E5 dword)
+    let mut desc = desc;
+    let mut patched: Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> = None;
+    let mut console_format: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT> = None;
     if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
-        let flags = r.GetDesc().Flags;
-        if !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
-            crate::xlog_warn!("D3D12.X: console UAV view of a resource without the UAV flag (format {:?}) - the PC descriptor is garbage", r.GetDesc().Format);
+        let rd = r.GetDesc();
+        if rd.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            let want = desc.as_ref().map(|v| v.Format).unwrap_or(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN);
+            if matches!(want, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN) {
+                console_format = Some(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+                let v = match desc.as_ref() {
+                    Some(v) => {
+                        let mut w = *v;
+                        w.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+                        w
+                    }
+                    None => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 } },
+                    },
+                };
+                patched = Some(v);
+                desc = patched.as_ref().map(|v| v as *const _).unwrap_or(std::ptr::null());
+            }
         }
     }
     f(this, res, counter, desc, slot.pc_uav);
@@ -1338,9 +1406,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
                 8 => (a.Texture3D.WSize, a.Texture3D.MipSlice),
                 _ => (1, 0),
             };
-            (v.Format, v.ViewDimension.0, array, mip)
+            (console_format.unwrap_or(v.Format), v.ViewDimension.0, array, mip)
         }
-        None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
+        None => (console_format.unwrap_or(rd.Format), resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
@@ -1349,7 +1417,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
     if dim == 4 {
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
+            Format: if console_format.is_some() { windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT } else if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
@@ -1383,7 +1451,6 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let console_desc = desc;
     let mut desc = desc;
     let mut flags = flags;
-    let mut flags_dropped = false;
     if desc != 0 {
         std::ptr::copy_nonoverlapping(desc as *const u8, pc_desc.as_mut_ptr(), 56);
         let layout = u32::from_le_bytes(pc_desc[44..48].try_into().unwrap());
@@ -1394,27 +1461,26 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         }
         // Console RDNA2 supports typed UAV access on formats the PC typed-UAV set lacks:
         // the officially distributed FSR4 upscaler creates its neural-input texture as
-        // 1920x1080 R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS and initial state
-        // UAV (console HW packs 9-9-9-E5 in image stores; CheckFormatSupport on the PC
-        // reports no typed UAV for DXGI 67), so the PC driver rejects both the flag and
-        // a UAV initial state for this format with E_INVALIDARG. Translate at this
-        // boundary (the same point as the Layout fix): keep the format - SRVs of
-        // R9G9B9E5 are PC-legal - and drop the GPU-write flags with their matching
-        // initial state. Verified end-to-end with the official console binaries: the
-        // upscaler's ffxCreateContext then completes (heaps + 4 textures + views) and
-        // ffxDestroyContext returns OK. Known open risk, to be observed at dispatch:
-        // if a console pipeline binds a UAV view of such a texture, the view creation
-        // is void and the failure would surface at execution.
+        // 1920x1080 R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS (console HW packs
+        // 9-9-9-E5 in image stores; CheckFormatSupport on the PC reports no typed UAV
+        // for DXGI 67), so the PC driver rejects the flag for that format. Iteration 3
+        // dropped the flags - which made the PC UAV view of the texture impossible, and
+        // at dispatch the console pass's t#-routed image store then went through the
+        // never-initialised UAV heap slot (on the console, t# descriptors are
+        // read-write; the console never creates a UAV view) - the device faulted.
+        // Translate the *format* instead: keep the UAV flags, create the texture as
+        // R32_TYPELESS (the 9-9-9-E5 dword is opaque to the PC), and translate the
+        // console's R9G9B9E5 views to R32_UINT - the recompiler's format-132 image
+        // path packs/decodes the 9-9-9-E5 dword in the shader.
+        let mut rgbe_translated = false;
         let format = u32::from_le_bytes(pc_desc[32..36].try_into().unwrap());
         let fl = u32::from_le_bytes(pc_desc[48..52].try_into().unwrap());
         if format == 67 && fl & 0x6 != 0 {
-            pc_desc[48..52].copy_from_slice(&(fl & !0x6).to_le_bytes());
+            pc_desc[32..36].copy_from_slice(&65u32.to_le_bytes()); // R32_TYPELESS
             desc = pc_desc.as_ptr() as usize;
-            flags &= !0x6;
-            flags_dropped = true;
+            rgbe_translated = true;
             crate::xlog_warn!(
-                "CreateCommittedResource (console): DXGI 67 (R9G9B9E5) + GPU-write flags has no PC typed UAV - flags {fl:#x} -> {:#x}, matching UAV initial state -> COMMON",
-                fl & !0x6
+                "CreateCommittedResource (console): DXGI 67 (R9G9B9E5) + GPU-write flags has no PC typed UAV - created as R32_TYPELESS, the console's R9G9B9E5 views translate to R32_UINT and the shader packs/unpacks 9-9-9-E5"
             );
         }
     }
@@ -1423,10 +1489,6 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // a 1920x1080 UAV texture - a console bit OR the PC UAV state 0x8); the PC driver
     // rejects them with E_INVALIDARG. Mask to the PC state range.
     let state = state & 0xFFFF_FFFF;
-    // PROBE continuation -> final rule: a state that references the dropped UAV
-    // capability is invalid for the same reason (the format has no PC typed UAV);
-    // start such resources in COMMON instead.
-    let state = if flags_dropped && state == 0x8 { 0 } else { state };
     if desc != 0 {
         if let Some(hr) = place_console_buffer(this, desc, state, clear, riid, ppv) {
             return hr;

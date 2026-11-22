@@ -1822,13 +1822,15 @@ impl Em {
             return Err("image_load cube");
         }
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
+        self.line(&format!("bool {t}_rgbe = (({tw1} >> 20) & 0x1FFu) == 132u;"));
         match base {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r;"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
                 let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
                 self.line(&format!(
-                    "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
+                    "if ({t}_rgbe) {{ Texture{rty}<uint4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_rw = {t}_T.Load({load_arg}).x; {t}_r = asuint(float4(xcl_rgbe_decode({t}_rw), 1.0f)); }} \
+                     else if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
                     tex("int"),
                     tex("float")
@@ -1856,8 +1858,20 @@ impl Em {
                 }
                 let v4 = format!("uint4({})", vals.join(", "));
                 let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                // R9G9B9E5: pack the shader's float RGB (the console HW packs stores of
+                // this format) into the raw 9-9-9-E5 dword of the R32_UINT view
+                let rgb = (0..3u64)
+                    .map(|c| match comps.iter().position(|&x| x == c) {
+                        Some(k) => {
+                            let v = self.vreg(vdata + k as u64);
+                            format!("asfloat({v})")
+                        }
+                        None => "0.0".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 self.line(&format!(
-                    "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
+                    "if ({act}) {{ if ({t}_rgbe) {{ RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)]; {t}_U[{icoord}] = xcl_rgbe_pack(float3({rgb})); }} else if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
                     uav("int"),
                     uav("float")
@@ -4399,6 +4413,24 @@ uint4 bvh_intersect(uint node, uint base, float tmax, float3 o, float3 d, float3
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
 uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
+// R9G9B9E5 (console format 132): the PC texture is R32_TYPELESS with raw R32_UINT views -
+// the 9-9-9-E5 dword is packed/unpacked here. The console HW packs image stores natively;
+// both the writer and the reader are translated by the same code, so the pair only needs
+// to be each other's inverse (with the format's own 9-bit quantisation).
+uint xcl_rgbe_pack(float3 c) {
+    float mx = max(max(c.x, c.y), max(c.z, 1.2e-38));
+    uint e = min(max(uint(ceil(log2(mx))) + 8u, 1u), 31u);
+    float s = exp2(float(e) - 15.0);
+    uint r = min(uint(round(c.x / s)), 511u);
+    uint g = min(uint(round(c.y / s)), 511u);
+    uint b = min(uint(round(c.z / s)), 511u);
+    return e << 27 | r << 18 | g << 9 | b;
+}
+float3 xcl_rgbe_decode(uint v) {
+    uint e = (v >> 27) & 31u;
+    float s = exp2(float(e) - 15.0);
+    return float3(float((v >> 18) & 511u) * s, float((v >> 9) & 511u) * s, float(v & 511u) * s);
+}
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;

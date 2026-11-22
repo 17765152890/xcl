@@ -528,9 +528,18 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         return E_INVALIDARG;
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    let d = pc_resource_desc(&x);
+    let mut d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
+    if !buffer {
+        // the R9G9B9E5 translation (see dev_create_committed_resource_x): the console
+        // UAV texture of this format has no PC typed UAV - R32_TYPELESS with raw views
+        let fmt = u32::from_le_bytes(d[32..36].try_into().unwrap());
+        let fl = u32::from_le_bytes(d[48..52].try_into().unwrap());
+        if fmt == 67 && fl & 0x6 != 0 {
+            d[32..36].copy_from_slice(&65u32.to_le_bytes());
+        }
+    }
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
