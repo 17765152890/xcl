@@ -308,8 +308,15 @@ pub(super) unsafe extern "system" fn serialize_pso_x(_this: *mut c_void, _pso: *
 
 /// device #57 / #67 Deserialize{Graphics,Compute}PipelineStateX(state, riid, pipeline): the
 /// serialised form is the console driver's; the title creates the pipeline from its desc
-pub(super) unsafe extern "system" fn deserialize_pso_x(_this: *mut c_void, state: *const u8, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+pub(super) unsafe extern "system" fn deserialize_pso_x(this: *mut c_void, state: *const u8, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static N: AtomicU64 = AtomicU64::new(0);
+    // The FSR4 class of blobs: a session object, then sections (pipeline header, hash, raw
+    // RDNA2 code, driver metadata) - reconstruct the pipeline through the recompiler. The
+    // graphics variant and other formats stay unsupported (below).
+    let hr = super::real::deserialize_compute_x(this, state as *const c_void, _riid, ppv);
+    if let Some(hr) = hr {
+        return hr;
+    }
     if once(&N, 1) {
         crate::xlog_warn!("D3D12.X: DeserializePipelineStateX – console pipeline caches are not supported");
     }

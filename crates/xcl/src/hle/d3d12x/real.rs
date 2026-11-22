@@ -1835,6 +1835,198 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// A graphics pipeline whose VS (and PS) are console shaders: recompiled VS/PS + the XCL
 /// shader ABI root signature. None: not console shaders, or not translatable (the caller
 /// goes on with the title's description and the stand-in fallback).
+
+// ---------------------------------------------------------------------------------------
+// DeserializePipelineStateX: the console driver's serialised pipeline (the FSR4 class)
+// ---------------------------------------------------------------------------------------
+
+/// The (ptr, size) sections of a deserialise blob: a 0x1c-byte pipeline header, a
+/// 0x14-byte hash, the raw RDNA2 code and a metadata section. `state` is the blob the
+/// console code passed; qword[0] is a runtime session object, skipped here.
+unsafe fn deserialise_sections(state: *const u8) -> Option<(&'static [u8], &'static [u8], &'static [u8], &'static [u8])> {
+    if !crate::gpu::shader::readable(state as usize, 0x40) {
+        return None;
+    }
+    let q = |i: usize| *(state as *const u64).add(i);
+    let host = |p: u64| -> Option<usize> {
+        crate::gpu::uma::get()
+            .map(|u| u.window_of(p as usize).is_some())
+            .unwrap_or(false)
+            .then_some(p as usize)
+            .or_else(|| (0x1_0000_0000..0x8000_0000_0000).contains(&p).then_some(p as usize))
+    };
+    let mut secs: Vec<&[u8]> = Vec::with_capacity(4);
+    let mut i = 1usize;
+    loop {
+        if i > 8 {
+            break;
+        }
+        let (ptr, size) = (q(i), q(i + 1));
+        i += 2;
+        if size == 0 || size > 0x4_0000_000 || ptr & 7 != 0 {
+            continue;
+        }
+        let Some(h) = host(ptr) else { continue };
+        if !crate::gpu::shader::readable(h, size as usize) {
+            crate::xlog_warn!("D3D12.X: deserialise: section at {ptr:#x} ({size:#x} B) is not readable");
+            return None;
+        }
+        secs.push(std::slice::from_raw_parts(h as *const u8, size as usize));
+    }
+    if secs.len() != 4 {
+        crate::xlog_warn!("D3D12.X: deserialise: {} sections (4 expected), sizes {:?}", secs.len(), secs.iter().map(|s| s.len()).collect::<Vec<_>>());
+        return None;
+    }
+    // identify by size: the 0x1c pipeline header, the 0x14 hash, then the larger of the
+    // remaining two is the code and the smaller the metadata
+    let find = |sz: usize| secs.iter().position(|s| s.len() == sz);
+    let (a, hash) = match (find(0x1c), find(0x14)) {
+        (Some(a), Some(h)) => (a, h),
+        _ => {
+            crate::xlog_warn!("D3D12.X: deserialise: no 0x1c/0x14 sections, sizes {:?}", secs.iter().map(|s| s.len()).collect::<Vec<_>>());
+            return None;
+        }
+    };
+    let mut rest = (0..4).filter(|&k| k != a && k != hash);
+    let (x, y) = (rest.next()?, rest.next()?);
+    let (code, meta) = if secs[x].len() >= secs[y].len() { (x, y) } else { (y, x) };
+    if secs[code].len() <= 0x100 {
+        return None;
+    }
+    let rd = |s: &[u8], o: usize| s.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    // the metadata header: [0x403, meta size - 0x14, code size in dwords, ..]; the code is
+    // s_code_end-padded raw RDNA2 (the last dwords are 0xBF9F_0000 padding)
+    if rd(secs[meta], 0) != Some(0x403) || rd(secs[meta], 8) != Some(secs[code].len() as u32 / 4) {
+        crate::xlog_warn!(
+            "D3D12.X: deserialise: metadata header [{:?} {:?}] does not match the code ({} B) - sections {:?}",
+            rd(secs[meta], 0),
+            rd(secs[meta], 8),
+            secs[code].len(),
+            secs.iter().map(|s| s.len()).collect::<Vec<_>>()
+        );
+        return None;
+    }
+    let last = code_dwords(secs[code]).next_back().unwrap_or(0);
+    if last != 0xBF81_0000 && last != 0xBF9F_0000 {
+        crate::xlog_warn!("D3D12.X: deserialise: the code's last dword is {last:#x}, not RDNA2 padding");
+        return None;
+    }
+    Some((secs[a], secs[hash], secs[code], secs[meta]))
+}
+
+fn code_dwords(code: &[u8]) -> impl DoubleEndedIterator<Item = u32> + '_ {
+    code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+}
+
+/// The code up to and including the final `s_endpgm`, without the `s_code_end` padding the
+/// console driver appends (the FSSM path gets its programs pre-trimmed by the container
+/// parser; the deserialised section carries the padding).
+fn trim_code_padding(code: &[u8]) -> &[u8] {
+    let mut end = code.len();
+    for i in (0..code.len() / 4).rev() {
+        let w = u32::from_le_bytes(code[i * 4..i * 4 + 4].try_into().unwrap());
+        if w == 0xBF81_0000 {
+            end = (i + 1) * 4;
+            break;
+        }
+    }
+    &code[..end.min(code.len())]
+}
+
+/// The compute interface of a deserialized console pipeline. The console driver's
+/// serialised metadata carries the user-data records but not the thread geometry (that is
+/// compiled into the code's lane algebra); the FSR4 passes use the dispatch ABI the retail
+/// probe measured: 14 user SGPRs (s4 = UAV table, s5 = SRV table, s[6:13] root CBVs), then
+/// TGID x/y at s14/s15, one thread-id VGPR (v0), no TG_SIZE - matching this code's prologue
+/// (`v_lshl_or_b32 v6, s14, 4, ..` / `v_lshl_add_u32 v9, s15, 4, ..`).
+/// `XCL_FFX_THREADS=x,y,z` overrides the geometry so it can be validated against the
+/// console's dispatch record (grid * threads must cover the pass's work exactly).
+fn deserialised_cs_interface() -> crate::gpu::recomp::CsInterface {
+    let threads = std::env::var("XCL_FFX_THREADS")
+        .ok()
+        .and_then(|s| {
+            let t: Vec<u32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            (t.len() == 3 && t.iter().all(|&v| v > 0 && v <= 1024) && t.iter().product::<u32>() <= 1024)
+                .then(|| [t[0], t[1], t[2]])
+        })
+        .unwrap_or([256, 1, 1]);
+    crate::gpu::recomp::CsInterface { threads, user_sgprs: 14, tgid: [true, true, false], tg_size: false, tid_components: 1 }
+}
+
+/// Deserialize{Graphics,Compute}PipelineStateX (device #57/#67): reconstruct the pipeline
+/// from the console driver's serialised state. The officially distributed FSR4 upscaler
+/// creates its native passes this way ('FFX_FSR4_PASS_0'...): the blob's code section is
+/// raw RDNA2 (s_code_end-padded, byte-identical to the FXCP blocks embedded in the console
+/// DLL), which the recompiler translates like any console shader. The console driver pairs
+/// the pipeline with the root signature the title sets on the list; XCL does the same: the
+/// translated shader runs under XCL's ABI root signature, and the console root arguments
+/// are mapped onto it at dispatch (see `bind`).
+/// Some(hr) = handled (return hr); None = not the serialised-compute format, caller keeps
+/// its own behaviour.
+pub(super) unsafe fn deserialize_compute_x(this: *mut c_void, state: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    let (a, hash, code, _meta) = deserialise_sections(state as *const u8)?;
+    let code = trim_code_padding(code);
+    let cs = deserialised_cs_interface();
+    crate::xlog_info!(
+        "D3D12.X: deserialising a console compute pipeline: {} B code (header {:02x?}, hash {:02x?}), threads {:?}, {} user SGPRs + TGID x/y",
+        code.len(),
+        &a[..8],
+        &hash[..8],
+        cs.threads,
+        cs.user_sgprs
+    );
+    use crate::gpu::recomp::{detect_wave64, translate, Mode, Options};
+    let t = match translate(code, &Options { mode: Mode::Compute(cs.clone()), wave64: detect_wave64(code), mem_windows: crate::gpu::recomp::pso::mem_windows(), ..Default::default() }) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::xlog_warn!("D3D12.X: deserialised pipeline did not translate: {e}");
+            return None;
+        }
+    };
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        crate::xlog_warn!("D3D12.X: deserialised pipeline translation incomplete, missing: {missing:?}");
+        return None;
+    }
+    if let Some(out) = std::env::var_os("XCL_FFX_HLSL") {
+        let _ = std::fs::write(&out, &t.hlsl);
+        crate::xlog_info!("D3D12.X: deserialised pipeline HLSL written to {out:?} ({} B)", t.hlsl.len());
+    }
+    let dxil = match crate::gpu::recomp::dxc::compile_cached(&t.hlsl, "main", "cs_6_6") {
+        Ok((d, _)) => d,
+        Err(e) => {
+            crate::xlog_warn!("D3D12.X: deserialised pipeline DXC compile failed: {e}");
+            return None;
+        }
+    };
+    let Some(rs) = abi_rs_for(this, &t.static_samplers) else { return None };
+    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs),
+        CS: bytecode(&dxil),
+        ..Default::default()
+    };
+    let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let hr = finish_pso(this, f, &desc as *const _ as *const c_void, riid, ppv);
+    if hr < 0 {
+        crate::xlog_warn!("D3D12.X: the driver rejected the deserialised compute pipeline ({hr:#x})");
+        return Some(hr);
+    }
+    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    note_pso_rs(*ppv, rs);
+    LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+    LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
+    if super::console_list::enabled() && !ppv.is_null() && !(*ppv).is_null() {
+        *ppv = super::console_list::wrap_pso(*ppv, true, LAST_COMPUTE_RS.with(|c| c.replace(0)));
+    }
+    crate::xlog_info!(
+        "D3D12.X: deserialised console compute pipeline created: {} B RDNA2 -> {} B DXIL",
+        code.len(),
+        dxil.len()
+    );
+    Some(hr)
+}
+
+
 /// A compute pipeline with a console CS: `None` = not a console shader, `Some(Err)` = console
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
