@@ -322,38 +322,43 @@ unsafe fn sha1_thumbprint(procs: &CryptoProcs, cert: *const CertContext) -> Vec<
 }
 
 /// Extract leaf-to-root certificate contexts from the primary simple chain in `CERT_CHAIN_CONTEXT`.
+///
+/// The chain structures are read through the SDK's declarations (`windows-sys`), not hand-written
+/// offsets: on x64 `cChain` / `cElement` sit at +12 and `rgpChain` / `rgpElement` at +16.
+///
+/// # Safety
+/// `chain` is null or a chain context returned by `CertGetCertificateChain` and not freed yet.
+/// The returned contexts belong to the chain and are valid only until `CertFreeCertificateChain`.
 unsafe fn extract_chain_certs(chain: *const c_void) -> Vec<*const CertContext> {
+    use windows_sys::Win32::Security::Cryptography::{CERT_CHAIN_CONTEXT, CERT_CHAIN_ELEMENT, CERT_SIMPLE_CHAIN};
+
+    let chain = chain as *const CERT_CHAIN_CONTEXT;
     if chain.is_null() {
         return Vec::new();
     }
-    // CERT_CHAIN_CONTEXT on x64: cChain @ +16 (u32), rgpChain @ +24 (*const *const CERT_SIMPLE_CHAIN)
-    let chain_count = *((chain as *const u8).add(16) as *const u32);
-    let chains_ptr = *((chain as *const u8).add(24) as *const *const *const u8);
-    if chain_count == 0 || chains_ptr.is_null() {
+    // SAFETY: the caller passes a live chain context, laid out by crypt32 as the SDK declares it.
+    let chain = &*chain;
+    if chain.cChain == 0 || chain.rgpChain.is_null() {
         return Vec::new();
     }
-    let first = *chains_ptr;
+    // SAFETY: `rgpChain` holds `cChain` (> 0) pointers; the first one is the primary simple chain.
+    let first = *chain.rgpChain as *const CERT_SIMPLE_CHAIN;
     if first.is_null() {
         return Vec::new();
     }
-    // CERT_SIMPLE_CHAIN on x64: cElement @ +20 (u32), rgpElement @ +24 (*const *const CERT_CHAIN_ELEMENT)
-    let elem_count = *(first.add(20) as *const u32);
-    let elems_ptr = *(first.add(24) as *const *const *const u8);
-    if elems_ptr.is_null() {
+    let first = &*first;
+    if first.cElement == 0 || first.rgpElement.is_null() {
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(elem_count as usize);
-    for i in 0..elem_count as usize {
-        let elem = *elems_ptr.add(i);
-        if !elem.is_null() {
-            // CERT_CHAIN_ELEMENT on x64: pCertContext @ +8
-            let ctx = *(elem.add(8) as *const *const CertContext);
-            if !ctx.is_null() {
-                out.push(ctx);
-            }
-        }
-    }
-    out
+    // SAFETY: `rgpElement` holds `cElement` element pointers, leaf first, owned by the chain.
+    let elems = std::slice::from_raw_parts(first.rgpElement as *const *const CERT_CHAIN_ELEMENT, first.cElement as usize);
+    elems
+        .iter()
+        .filter(|e| !e.is_null())
+        // SAFETY: a non-null element pointer from the chain points at a live CERT_CHAIN_ELEMENT.
+        .map(|&e| (*e).pCertContext as *const CertContext)
+        .filter(|c| !c.is_null())
+        .collect()
 }
 
 /// Verify optional SHA-1 thumbprint pins against the leaf-to-root certificate chain.
@@ -653,5 +658,85 @@ mod tests {
         assert_eq!(url_host_and_is_plain_loopback("https://127.0.0.1:3551/secure"), ("127.0.0.1".into(), false));
         assert_eq!(url_host_and_is_plain_loopback("http://[::1]:8080/test"), ("::1".into(), true));
         assert_eq!(url_host_and_is_plain_loopback("https://social.xboxlive.com/users"), ("social.xboxlive.com".into(), false));
+    }
+
+    #[test]
+    fn cert_context_matches_sdk_layout() {
+        use std::mem::{offset_of, size_of};
+        use windows_sys::Win32::Security::Cryptography::CERT_CONTEXT;
+        assert_eq!(size_of::<CertContext>(), size_of::<CERT_CONTEXT>());
+        assert_eq!(offset_of!(CertContext, encoded), offset_of!(CERT_CONTEXT, pbCertEncoded));
+        assert_eq!(offset_of!(CertContext, encoded_len), offset_of!(CERT_CONTEXT, cbCertEncoded));
+        assert_eq!(offset_of!(CertContext, cert_info), offset_of!(CERT_CONTEXT, pCertInfo));
+        assert_eq!(offset_of!(CertContext, cert_store), offset_of!(CERT_CONTEXT, hCertStore));
+    }
+
+    /// A chain built from the SDK's own declarations: the walk must find both contexts, leaf first.
+    #[test]
+    fn chain_certs_follow_sdk_layout() {
+        use windows_sys::Win32::Security::Cryptography::{CERT_CHAIN_CONTEXT, CERT_CHAIN_ELEMENT, CERT_CONTEXT, CERT_SIMPLE_CHAIN};
+        unsafe {
+            let certs: [CERT_CONTEXT; 2] = std::mem::zeroed();
+            let mut elems: [CERT_CHAIN_ELEMENT; 2] = std::mem::zeroed();
+            for (e, c) in elems.iter_mut().zip(&certs) {
+                e.cbSize = std::mem::size_of::<CERT_CHAIN_ELEMENT>() as u32;
+                e.pCertContext = c;
+            }
+            let mut elem_ptrs = [elems.as_mut_ptr(), elems.as_mut_ptr().add(1)];
+            let mut simple: CERT_SIMPLE_CHAIN = std::mem::zeroed();
+            simple.cbSize = std::mem::size_of::<CERT_SIMPLE_CHAIN>() as u32;
+            simple.cElement = elem_ptrs.len() as u32;
+            simple.rgpElement = elem_ptrs.as_mut_ptr();
+            let mut simple_ptrs = [&mut simple as *mut CERT_SIMPLE_CHAIN];
+            let mut ctx: CERT_CHAIN_CONTEXT = std::mem::zeroed();
+            ctx.cbSize = std::mem::size_of::<CERT_CHAIN_CONTEXT>() as u32;
+            ctx.cChain = 1;
+            ctx.rgpChain = simple_ptrs.as_mut_ptr();
+
+            let got = extract_chain_certs(&ctx as *const CERT_CHAIN_CONTEXT as *const c_void);
+            let want: Vec<*const CertContext> = certs.iter().map(|c| c as *const CERT_CONTEXT as *const CertContext).collect();
+            assert_eq!(got, want);
+
+            ctx.cChain = 0;
+            assert!(extract_chain_certs(&ctx as *const CERT_CHAIN_CONTEXT as *const c_void).is_empty());
+            assert!(extract_chain_certs(std::ptr::null()).is_empty());
+        }
+    }
+
+    /// A real chain from crypt32 (a certificate of the machine's root store): the walk finds the
+    /// leaf, the certificate the chain was built for.
+    #[test]
+    fn chain_certs_from_crypt32() {
+        use windows_sys::Win32::Security::Cryptography::{CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW};
+        unsafe {
+            let procs = crypto_procs().expect("crypt32 / winhttp");
+            let store = CertOpenSystemStoreW(0, wide("ROOT").as_ptr());
+            assert!(!store.is_null());
+            let cert = CertEnumCertificatesInStore(store, std::ptr::null()) as *const CertContext;
+            if cert.is_null() {
+                eprintln!("root store is empty – skipped");
+                CertCloseStore(store, 0);
+                return;
+            }
+            let para = CertChainPara {
+                cb_size: std::mem::size_of::<CertChainPara>() as u32,
+                usage_match_type: 0,
+                usage_identifier_count: 0,
+                usage_identifiers: std::ptr::null(),
+            };
+            let mut chain: *const c_void = std::ptr::null();
+            let ok = (procs.cert_get_chain)(std::ptr::null_mut(), cert, std::ptr::null(), store, &para, 0, std::ptr::null_mut(), &mut chain);
+            assert_ne!(ok, 0);
+
+            let certs = extract_chain_certs(chain);
+            assert!(!certs.is_empty());
+            let leaf = sha1_thumbprint(procs, certs[0]);
+            assert_eq!(leaf.len(), 20);
+            assert_eq!(leaf, sha1_thumbprint(procs, cert));
+
+            (procs.cert_free_chain)(chain);
+            (procs.cert_free_context)(cert);
+            CertCloseStore(store, 0);
+        }
     }
 }
