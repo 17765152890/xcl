@@ -739,6 +739,22 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 4;
                 match pso {
                     Some(p) if (*p).translated => {
+                        // XCL_EXEC_FIRST_DISPATCHES=n (debug): replay only the first n
+                        // dispatches of the frame, so a mid-frame device fault can be
+                        // bisected to the dispatch that causes it
+                        if let Ok(limit) = std::env::var("XCL_EXEC_FIRST_DISPATCHES") {
+                            if out.dispatches >= limit.parse::<u32>().unwrap_or(u32::MAX) {
+                                out.skipped_dispatches += 1;
+                                continue;
+                            }
+                        }
+                        if std::env::var_os("XCL_EXEC_FIRST_DISPATCHES").is_some() {
+                            crate::xlog_info!(
+                                "console dispatch {}: grid ({x},{y},{z}), pso wrapper {:#x}",
+                                out.dispatches + 1,
+                                p as usize
+                            );
+                        }
                         let inline = layout.as_ref().map_or(0, |l| l.inline as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {

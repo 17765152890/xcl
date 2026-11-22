@@ -4453,14 +4453,19 @@ uint2 ballot_x64(bool b) {
     // group-uniform control flow, while the rendezvous runs after the per-lane publish
     // branches. Groupshared atomics are coherent per CTA (all its waves share one SM's
     // LDS), so the seq_cst atomic publish orders the plain word store against the spin's
-    // atomic read without any fence.
+    // atomic read without any fence. The spin is bounded: if a desynchronised pair of
+    // halves ever times out, both still advance their per-thread epoch counters once per
+    // call site, so the *next* rendezvous matches up again - a console wave may compute
+    // one ballot from a stale word, but the shader always terminates (no GPU watchdog
+    // reset), and a working pass never comes near the bound.
     uint4 m = WaveActiveBallot(b);
     if (xcl_hw_lane == 0u) { xcl_bw[xcl_nwave] = m.x; }
     uint xcl_ie;
     if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_be[xcl_nwave], xcl_bep + 1u, xcl_ie); }
     uint o = xcl_nwave ^ 1u;
     uint f;
-    do { InterlockedOr(xcl_be[o], 0u, f); } while (f < xcl_bep + 1u);
+    uint n = 0u;
+    do { InterlockedOr(xcl_be[o], 0u, f); } while (f < xcl_bep + 1u && ++n < 0x10000000u);
     uint2 r = uint2(xcl_bw[xcl_cwave * 2u], xcl_bw[xcl_cwave * 2u + 1u]);
     xcl_bep++;
     return r;
@@ -4476,7 +4481,8 @@ uint rla_x64(uint v, uint l) {
     if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_re[xcl_nwave], xcl_rep + 1u, xcl_ie); }
     uint o = xcl_nwave ^ 1u;
     uint f;
-    do { InterlockedOr(xcl_re[o], 0u, f); } while (f < xcl_rep + 1u);
+    uint n = 0u;
+    do { InterlockedOr(xcl_re[o], 0u, f); } while (f < xcl_rep + 1u && ++n < 0x10000000u);
     uint r = xcl_xv[xcl_cwave * 64u + l];
     xcl_rep++;
     return r;
@@ -4501,7 +4507,8 @@ uint2 ballot_x64(bool b) {
     if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_lds[{BE} + xcl_nwave], xcl_bep + 1u, xcl_ie); }
     uint o = xcl_nwave ^ 1u;
     uint f;
-    do { InterlockedOr(xcl_lds[{BE} + o], 0u, f); } while (f < xcl_bep + 1u);
+    uint n = 0u;
+    do { InterlockedOr(xcl_lds[{BE} + o], 0u, f); } while (f < xcl_bep + 1u && ++n < 0x10000000u);
     uint2 r = uint2(xcl_lds[{BW} + xcl_cwave * 2u], xcl_lds[{BW} + xcl_cwave * 2u + 1u]);
     xcl_bep++;
     return r;
@@ -4517,7 +4524,8 @@ uint rla_x64(uint v, uint l) {
     if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_lds[{RE} + xcl_nwave], xcl_rep + 1u, xcl_ie); }
     uint o = xcl_nwave ^ 1u;
     uint f;
-    do { InterlockedOr(xcl_lds[{RE} + o], 0u, f); } while (f < xcl_rep + 1u);
+    uint n = 0u;
+    do { InterlockedOr(xcl_lds[{RE} + o], 0u, f); } while (f < xcl_rep + 1u && ++n < 0x10000000u);
     uint r = xcl_lds[{XV} + xcl_cwave * 64u + l];
     xcl_rep++;
     return r;

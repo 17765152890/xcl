@@ -317,9 +317,18 @@ pub fn init() -> Result<String, String> {
         if debug {
             let mut dbg: Option<ID3D12Debug> = None;
             if D3D12GetDebugInterface(&mut dbg).is_ok() {
-                if let Some(d) = dbg {
+                if let Some(d) = dbg.as_ref() {
                     d.EnableDebugLayer();
                     crate::xlog_info!("D3D12: debug layer enabled");
+                }
+                // XCL_D3D12_DEBUG=gbv: GPU-based validation - the executed shaders are
+                // instrumented and an invalid resource access is reported with the access
+                // details instead of faulting the device (slow: shaders are recompiled)
+                if std::env::var("XCL_D3D12_DEBUG").as_deref() == Ok("gbv") {
+                    if let Some(d1) = dbg.as_ref().and_then(|d| d.cast::<ID3D12Debug1>().ok()) {
+                        d1.SetEnableGPUBasedValidation(true);
+                        crate::xlog_info!("D3D12: GPU-based validation enabled");
+                    }
                 }
             }
         }
@@ -1298,6 +1307,15 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
+    // console code may ask a UAV view of a texture the flag-drop translation created
+    // without the UAV capability (e.g. the FSR4 neural-input R9G9B9E5 texture): the PC
+    // call then fails and the slot stays garbage - the fault surfaces at execution
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+        let flags = r.GetDesc().Flags;
+        if !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            crate::xlog_warn!("D3D12.X: console UAV view of a resource without the UAV flag (format {:?}) - the PC descriptor is garbage", r.GetDesc().Format);
+        }
+    }
     f(this, res, counter, desc, slot.pc_uav);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
@@ -2031,9 +2049,10 @@ pub(super) unsafe fn deserialize_compute_x(this: *mut c_void, state: *const c_vo
         *ppv = super::console_list::wrap_pso(*ppv, true, LAST_COMPUTE_RS.with(|c| c.replace(0)));
     }
     crate::xlog_info!(
-        "D3D12.X: deserialised console compute pipeline created: {} B RDNA2 -> {} B DXIL",
+        "D3D12.X: deserialised console compute pipeline created: {} B RDNA2 -> {} B DXIL (pso {:#x})",
         code.len(),
-        dxil.len()
+        dxil.len(),
+        *ppv as usize
     );
     Some(hr)
 }
