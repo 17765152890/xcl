@@ -58,8 +58,10 @@ pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
         return Err(format!("cube view {}..{} is not a nonempty whole number of faces", t.base_array, t.depth));
     }
     let is_msaa = matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray);
-    let sample_count = if is_msaa { (1usize << t.last_level).max(1) } else { 1 };
     let mut surface = *t;
+    if is_msaa {
+        surface.last_level = 0; // only mip 0 exists for MSAA
+    }
     if matches!(surface.ty, ImageType::D1 | ImageType::D1Array) {
         // The T# height field is ignored for 1D resources, just as image_d3d12 ignores it.
         surface.height = 1;
@@ -71,7 +73,7 @@ pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
         ImageType::D3 => chain.layers(),
         _ => 1,
     };
-    let slices = array_slices.checked_mul(sample_count).ok_or("tiled texture sample size overflow")?;
+    let slices = array_slices;
     let start = t.address & !(chain.layout.block_bytes as u64 - 1);
     let bytes = chain.slice_bytes.checked_mul(slices).ok_or("tiled texture size overflow")?;
     Ok(Placement { start, bytes, chain, slices })

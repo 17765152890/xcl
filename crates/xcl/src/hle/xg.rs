@@ -142,8 +142,11 @@ impl Texture {
         if dim != 3 || !matches!(samples, 1 | 2 | 4 | 8) {
             return Err(E_NOTIMPL);
         }
-        if samples > 1 && mips > 1 {
-            return Err(E_INVALIDARG);
+        let (rt, ds) = (flags & 1 != 0, flags & 2 != 0);
+        if samples > 1 {
+            if mips > 1 || (!rt && !ds) || (layout != 0 && layout != u32::MAX) {
+                return Err(E_INVALIDARG);
+            }
         }
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
@@ -151,12 +154,16 @@ impl Texture {
         // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
         let planar = matches!(format, 19..=22 | 44..=47);
         let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
-        let mode = match layout {
-            1 => 0,
-            0x100..=0x11F => layout & 0x1F,
-            // the choice goes by the whole format's size (D32_S8X24: 64 bits a pixel)
-            0 | 2 => optimal_mode(layout, flags, if matches!(format, 19..=22) { 64 } else { (8u64 << e) / (side * side) as u64 }, width, height),
-            _ => return Err(E_INVALIDARG),
+        let mode = if samples > 1 {
+            if ds { 24 } else { 27 }
+        } else {
+            match layout {
+                1 => 0,
+                0x100..=0x11F => layout & 0x1F,
+                // the choice goes by the whole format's size (D32_S8X24: 64 bits a pixel)
+                0 | 2 => optimal_mode(layout, flags, if matches!(format, 19..=22) { 64 } else { (8u64 << e) / (side * side) as u64 }, width, height),
+                _ => return Err(E_INVALIDARG),
+            }
         };
         let full = 32 - (width as u32).max(height).leading_zeros();
         let mips = if mips == 0 { full } else { mips };
@@ -164,7 +171,6 @@ impl Texture {
             return Err(E_INVALIDARG);
         }
         let surface = |e: u32, side: u32| Surface::new(mode, e, side, width as u32, height, array, samples, mips, pipes);
-        let (rt, ds) = (flags & 1 != 0, flags & 2 != 0);
         if planar && layout == 2 {
             return Err(E_INVALIDARG); // a stencil format with the 64KB_D choice
         }
@@ -194,6 +200,14 @@ impl Texture {
         planes.push((if ds && !planar && !depth_buffer { 1 } else { main_usage }, main));
         if let Some(s) = stencil {
             planes.push((stencil_usage, PlaneKind::Surface(s)));
+        }
+        // FMASK metadata for MSAA render targets (usage 3, 64KB aligned)
+        if rt && !depth_buffer && !planar && !empty && samples > 1 {
+            let fmask_bpe_log2 = if samples == 8 { 2 } else { 0 };
+            let fmask_layout = Layout::new(24, fmask_bpe_log2, pipes).ok_or(E_INVALIDARG)?;
+            let fmask_chain = Chain::new(fmask_layout, width as u32, height, 1, 1);
+            let fmask_bytes = (fmask_chain.slice_bytes * array as usize) as u64;
+            planes.push((3, PlaneKind::Meta { bytes: fmask_bytes, align: 0x1_0000 }));
         }
         // a render target of one level gets a CMASK (not with the 64KB_D choice or the _T modes)
         if rt && !depth_buffer && !planar && !empty && mips == 1 && layout != 2 && !(0x110..=0x113).contains(&layout) {
@@ -247,8 +261,13 @@ impl Texture {
         self.plane_surface(self.main as u32).map_or(0, |(s, at)| at + s.mip_offset(i))
     }
 
+    /// byte offset of element (x, y) of level `i` in slice `slice` of the texels
+    pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize) -> u64 {
+        self.element_sample_offset(i, x, y, slice, 0)
+    }
+
     /// byte offset of element (x, y) of level `i` in slice `slice` and sample `sample` of the texels
-    pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize, sample: usize) -> u64 {
+    pub fn element_sample_offset(&self, i: usize, x: usize, y: usize, slice: usize, sample: usize) -> u64 {
         self.plane_surface(self.main as u32).map_or(0, |(s, at)| at + s.element_offset(i, x, y, slice, sample))
     }
 
@@ -311,14 +330,18 @@ impl Surface {
             28 | 31 => return Err(E_NOTIMPL),
             _ => return Err(E_INVALIDARG),
         }
-        let l = Layout::new(mode, e, pipes).ok_or(E_INVALIDARG)?;
+        let l = if samples > 1 {
+            Layout::new_msaa(mode, e, samples, pipes).ok_or(E_INVALIDARG)?
+        } else {
+            Layout::new(mode, e, pipes).ok_or(E_INVALIDARG)?
+        };
         let chain = Chain::new(l, width, height, side, mips);
         let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
         Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, samples: samples.max(1), first_tail })
     }
 
     pub fn size(&self) -> u64 {
-        (self.chain.slice_bytes * self.array as usize * self.samples as usize) as u64
+        (self.chain.slice_bytes * self.array as usize) as u64
     }
 
     pub fn alignment(&self) -> u64 {
@@ -348,8 +371,7 @@ impl Surface {
     /// patterns (the XOR modes take pipe bits from it)
     pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize, sample: usize) -> u64 {
         let m = &self.chain.levels[i];
-        let slice_idx = slice * self.samples as usize + sample;
-        (slice_idx * self.chain.slice_bytes + m.offset + self.chain.layout.offset_z(x + m.origin.0, y + m.origin.1, slice, m.pitch)) as u64
+        (slice * self.chain.slice_bytes + m.offset + self.chain.layout.offset_sample(x + m.origin.0, y + m.origin.1, slice, sample, m.pitch)) as u64
     }
 
     /// this surface's plane of XG_RESOURCE_LAYOUT (its header at `pb`)
@@ -368,7 +390,7 @@ impl Surface {
             let r = pb + MIP + i * MIP_BYTES;
             let tail = i >= self.first_tail;
             let (pw, ph) = self.padded(i);
-            let bytes = (pw * ph) as u64 * self.bpe as u64;
+            let bytes = (pw * ph) as u64 * self.bpe as u64 * self.samples as u64;
             let size = bytes;
             q(b, r, size);
             q(b, r + 8, self.mip_offset(i));

@@ -6,7 +6,7 @@
 //! offset is linear over GF(2): `offset(x, y, z) = ox[x] ^ oy[y] ^ oz[z]`, small tables per
 //! layout. Blocks (256 B / 4 KB / 64 KB) are laid out row-major; `Chain` lays out the mips.
 
-use super::tiling_tables::{NIBBLE01, NIBBLE2, NIBBLE3, NIBBLE4, PATTERNS, PATTERNS_3D};
+use super::tiling_tables::{NIBBLE01, NIBBLE2, NIBBLE3, NIBBLE4, PATTERNS, PATTERNS_3D, PATTERNS_MSAA};
 
 /// The part of GB_ADDR_CONFIG the XOR modes depend on (number of pipes and packers, log2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub struct PipeConfig {
 
 impl PipeConfig {
     /// row group in the RB+ tables (addrlib Gfx10Lib::HwlInitGlobalParams, m_colorBaseIndex)
-    fn group(self) -> usize {
+    pub fn group(self) -> usize {
         (self.pipes_log2 + if self.pkrs_log2 >= 2 { 2 * self.pkrs_log2 - 2 } else { 0 }) as usize
     }
 }
@@ -55,6 +55,7 @@ fn pattern_bits(table: &[(u32, &[[u16; 4]])], mode: u32, elem_log2: u32, cfg: Pi
 pub struct Layout {
     pub mode: u32,
     pub elem_log2: u32,
+    pub samples: u32,
     /// block size in elements; `block_d` > 1: a 3D thick block (z-slices tiled together)
     pub block_w: usize,
     pub block_h: usize,
@@ -66,6 +67,7 @@ pub struct Layout {
     ox: Vec<u32>,
     oy: Vec<u32>,
     oz: Vec<u32>,
+    os: Vec<u32>,
     /// the in-block bits the coordinates above the block give (XOR modes with many pipes take
     /// pipe bits from neighbouring blocks' coordinates), by `x >> log2(block_w)` etc.
     hx: Vec<u32>,
@@ -84,14 +86,41 @@ impl Layout {
         if mode == 0 {
             let bw = 256 >> elem_log2;
             let ox = (0..bw as u32).map(|x| x << elem_log2).collect();
-            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0], hx: vec![0], hy: vec![0], hz: vec![0] });
+            return Some(Layout { mode, elem_log2, samples: 1, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0], os: vec![0], hx: vec![0], hy: vec![0], hz: vec![0] });
         }
         let blk = block_log2(mode)?;
         let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
         // block size in elements: 256 B micro block, grown evenly in both directions
         let (w256, h256) = [(4, 4), (4, 3), (3, 3), (3, 2), (2, 2)][elem_log2 as usize];
         let amp = blk - 8;
-        Some(Self::from_bits(mode, elem_log2, blk, &bits, (w256 + amp / 2, h256 + amp - amp / 2, 0)))
+        Some(Self::from_bits(mode, elem_log2, 1, blk, &bits, (w256 + amp / 2, h256 + amp - amp / 2, 0)))
+    }
+
+    /// A 2D MSAA surface: sample count must be 2, 4, or 8.
+    pub fn new_msaa(mode: u32, elem_log2: u32, samples: u32, cfg: PipeConfig) -> Option<Layout> {
+        if samples <= 1 {
+            return Self::new(mode, elem_log2, cfg);
+        }
+        if !matches!(samples, 2 | 4 | 8) || elem_log2 > 4 {
+            return None;
+        }
+        let blk = block_log2(mode)?;
+        let item = PATTERNS_MSAA.iter().find(|p| p.0 == mode && p.1 == samples)?;
+        let row = if is_xor(mode) { cfg.group() * 5 } else { 0 } + elem_log2 as usize;
+        let idx = item.2.get(row)?;
+        let mut bits = [0u64; 20];
+        bits[..8].copy_from_slice(&super::tiling_tables::NIBBLE01[idx[0] as usize]);
+        bits[8..12].copy_from_slice(&super::tiling_tables::NIBBLE2[idx[1] as usize]);
+        bits[12..16].copy_from_slice(&super::tiling_tables::NIBBLE3[idx[2] as usize]);
+        bits[16..20].copy_from_slice(&super::tiling_tables::NIBBLE4[idx[3] as usize]);
+
+        let log2_samples = samples.trailing_zeros();
+        let log2_num_ele = blk - elem_log2 - log2_samples;
+        let width_precedent = (log2_samples & 1) == 0 || (blk & 1) != 0;
+        let log2_w = (log2_num_ele + if width_precedent { 1 } else { 0 }) / 2;
+        let log2_h = log2_num_ele - log2_w;
+
+        Some(Self::from_bits(mode, elem_log2, samples, blk, &bits, (log2_w, log2_h, 0)))
     }
 
     /// A 3D texture: the thick modes (4KB_S, 64KB_S / S_T, 4KB_S_X, 64KB_S_X, 64KB_D_X) tile
@@ -108,14 +137,14 @@ impl Layout {
                 // (Lib::ComputeThickBlockDimension)
                 let (w1k, h1k, d1k) = [(4, 3, 3), (3, 3, 3), (3, 3, 2), (3, 2, 2), (2, 2, 2)][elem_log2 as usize];
                 let (avg, rest) = ((blk - 10) / 3, (blk - 10) % 3);
-                Some(Self::from_bits(mode, elem_log2, blk, &bits, (w1k + avg, h1k + avg + rest / 2, d1k + avg + u32::from(rest != 0))))
+                Some(Self::from_bits(mode, elem_log2, 1, blk, &bits, (w1k + avg, h1k + avg + rest / 2, d1k + avg + u32::from(rest != 0))))
             }
             _ => None,
         }
     }
 
     /// The offset tables of a block `1 << wl` × `1 << hl` × `1 << dl` elements.
-    fn from_bits(mode: u32, elem_log2: u32, blk: u32, bits: &[u64; 20], (wl, hl, dl): (u32, u32, u32)) -> Layout {
+    fn from_bits(mode: u32, elem_log2: u32, samples: u32, blk: u32, bits: &[u64; 20], (wl, hl, dl): (u32, u32, u32)) -> Layout {
         // the in-block offset bits coordinate `c << lo` gives
         let table = |n: usize, shift: u32, lo: u32| -> Vec<u32> {
             (0..n as u32)
@@ -132,9 +161,24 @@ impl Layout {
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
         // the pattern masks are 16 bits: coordinates above them do not matter
         let high = |l: u32, shift: u32| table(1 << (16 - l.min(16)), shift, l);
+        let os = if samples > 1 {
+            (0..samples)
+                .map(|s| {
+                    let mut off = 0u32;
+                    for (i, &b) in bits[..blk as usize].iter().enumerate() {
+                        let mask = ((b >> 48) & 0x7) as u32;
+                        off |= ((mask & s).count_ones() & 1) << i;
+                    }
+                    off
+                })
+                .collect()
+        } else {
+            vec![0]
+        };
         Layout {
             mode,
             elem_log2,
+            samples,
             block_w: bw,
             block_h: bh,
             block_d: bd,
@@ -143,6 +187,7 @@ impl Layout {
             ox: table(bw, 0, 0),
             oy: table(bh, 16, 0),
             oz: table(bd, 32, 0),
+            os,
             hx: high(wl, 0),
             hy: high(hl, 16),
             hz: high(dl, 32),
@@ -162,16 +207,22 @@ impl Layout {
 
     /// byte offset of element (x, y) in a surface `w` elements wide
     pub fn offset(&self, x: usize, y: usize, w: usize) -> usize {
-        self.offset_z(x, y, 0, w)
+        self.offset_sample(x, y, 0, 0, w)
     }
 
     /// `offset` of element (x, y, z) of a thick block row (z < `block_d`; the caller places
     /// the z / `block_d` layers)
     pub fn offset_z(&self, x: usize, y: usize, z: usize, w: usize) -> usize {
+        self.offset_sample(x, y, z, 0, w)
+    }
+
+    /// byte offset of element (x, y, z, sample) in a surface `w` elements wide
+    pub fn offset_sample(&self, x: usize, y: usize, z: usize, sample: usize, w: usize) -> usize {
         let pitch_blocks = w.div_ceil(self.block_w);
         let block = (y / self.block_h) * pitch_blocks + x / self.block_w;
         let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
-        let xor = self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hx, x, self.block_w) ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
+        let s_off = self.os.get(sample).copied().unwrap_or(0);
+        let xor = self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ s_off ^ hi(&self.hx, x, self.block_w) ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
         block * self.block_bytes + (xor as usize ^ self.base_xor)
     }
 
@@ -427,10 +478,19 @@ impl Chain {
 pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
     let (e, side) = element(t.format)?;
     let d3 = matches!(t.ty, super::desc::ImageType::D3);
-    let mut l = if d3 { Layout::new_3d(t.swizzle_mode, e, cfg)? } else { Layout::new(t.swizzle_mode, e, cfg)? };
+    let is_msaa = matches!(t.ty, super::desc::ImageType::D2Msaa | super::desc::ImageType::D2MsaaArray);
+    let sample_count = if is_msaa { (1usize << t.last_level).max(1) as u32 } else { 1 };
+    let mut l = if d3 {
+        Layout::new_3d(t.swizzle_mode, e, cfg)?
+    } else if is_msaa {
+        Layout::new_msaa(t.swizzle_mode, e, sample_count, cfg)?
+    } else {
+        Layout::new(t.swizzle_mode, e, cfg)?
+    };
     l.base_xor = (t.address as usize) & (l.block_bytes - 1);
     let depth = if d3 { t.depth.max(1) } else { 1 };
-    Some(Chain::new_3d(l, t.width, t.height, depth, side, t.max_mip + 1))
+    let mips = if is_msaa { 1 } else { t.max_mip + 1 };
+    Some(Chain::new_3d(l, t.width, t.height, depth, side, mips))
 }
 
 #[cfg(test)]
@@ -540,6 +600,30 @@ mod tests {
         let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
         assert_eq!(Layout::new_3d(24, 2, cfg).unwrap().block_d, 1);
         assert!(Layout::new_3d(10, 2, cfg).is_none() && Layout::new_3d(1, 2, cfg).is_none());
+    }
+
+    /// The 2D MSAA modes: every sample count (2, 4, 8), element size (0..=4), and pipe configuration
+    /// maps a w × h block × samples onto its bytes one to one.
+    #[test]
+    fn every_msaa_pattern_is_a_permutation_of_its_block() {
+        for &(mode, samples, _) in PATTERNS_MSAA.iter() {
+            for e in 0..5 {
+                for cfg in configs() {
+                    let l = Layout::new_msaa(mode, e, samples, cfg).unwrap();
+                    assert_eq!((l.block_w * l.block_h * samples as usize) << e, l.block_bytes, "mode {mode} e {e} samples {samples}");
+                    let mut seen = vec![false; l.block_bytes >> e];
+                    for s in 0..samples as usize {
+                        for y in 0..l.block_h {
+                            for x in 0..l.block_w {
+                                let o = l.offset_sample(x, y, 0, s, l.block_w);
+                                assert_eq!(o & ((1 << e) - 1), 0, "mode {mode} e {e} s {s} {cfg:?}: misaligned");
+                                assert!(!std::mem::replace(&mut seen[o >> e], true), "mode {mode} e {e} s {s} {cfg:?}: ({x},{y},{s}) collides");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The three volume textures of the retail TTPF archive (4 KB tiles, thick): the space each

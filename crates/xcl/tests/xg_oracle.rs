@@ -605,6 +605,38 @@ fn print_volumes_lines_and_samples() {
 }
 
 #[test]
+fn verify_console_msaa_offsets() {
+    let Some(m) = console() else { return };
+    let create = proc(m, "XGCreateTextureComputer");
+    let samples = |mut d: [u8; 0x38], n: u32| {
+        d[0x24..0x28].copy_from_slice(&n.to_le_bytes());
+        d
+    };
+    let d = samples(desc(3, 256, 256, 2, 1, 28, 0, 1), 4);
+    let mut c = std::ptr::null_mut();
+    let hr = unsafe { std::mem::transmute::<usize, CreateFn>(create)(d.as_ptr(), &mut c) };
+    assert!(hr >= 0 && !c.is_null());
+    unsafe {
+        let vt = *(c as *const *const usize);
+        let mut res = [0u8; 0x1B40];
+        let get_layout: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u8) -> i32 = std::mem::transmute(*vt.add(2));
+        get_layout(c, res.as_mut_ptr());
+        let q = |o: usize| u64::from_le_bytes(res[o..o + 8].try_into().unwrap());
+        let w = |o: usize| u32::from_le_bytes(res[o..o + 4].try_into().unwrap());
+        println!("total size: {:#x}, align: {:#x}, planes: {}", q(0), q(8), w(0x14));
+        for p in 0..w(0x14) as usize {
+            let pb = 0x18 + p * 0x6C8;
+            println!("plane {p}: usage {} size {:#x} slice {:#x} align {:#x} bpe {} tail {} {}", w(pb), q(pb + 8), q(pb + 0x10), q(pb + 0x20), w(pb + 0x28), w(pb + 0x2C), w(pb + 0x30));
+            let r = pb + 0x38;
+            let row: Vec<String> = (0..0x70).step_by(4).map(|k| format!("{:x}", w(r + k))).collect();
+            println!("  mip0: {}", row.join(" "));
+        }
+        let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        release(c);
+    }
+}
+
+#[test]
 #[ignore]
 fn print_line_modes() {
     let Some(m) = console() else { return };
