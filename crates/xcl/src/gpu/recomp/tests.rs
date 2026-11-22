@@ -665,7 +665,10 @@ fn wave64_compute_rendezvous_on_32_lane_waves() {
     // exec = (v0 >= 8) & (v0 <= 40); s10 = readfirstlane(v0); mem[s4 + v0*4] = s10
     // (the compare constants are inline ints: code 128 + value)
     // XCL_TEST_W64_RENDEZVOUS=first: only the first rendezvous + the store (isolation)
+    // XCL_TEST_W64_RENDEZVOUS=lds: also read/write the console LDS, exercising the
+    // exchange aliased into the LDS tail (the 32 KB groupshared limit is absolute)
     let isolate = std::env::var("XCL_TEST_W64_RENDEZVOUS").ok().as_deref() == Some("first");
+    let use_lds = std::env::var("XCL_TEST_W64_RENDEZVOUS").ok().as_deref() == Some("lds");
     let mut code = prog(&{
         let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = if isolate {
             vec![
@@ -675,7 +678,7 @@ fn wave64_compute_rendezvous_on_32_lane_waves() {
                 ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 5), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)], None),
             ]
         } else {
-            vec![
+            let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
                 ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 106), ("SRC0", V), ("SRC1", 136)], None),
                 ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 16), ("SSRC0", 106)], None),
                 ("V_CMP_LE_U32", "ENC_VOP3", &[("VDST", 106), ("SRC0", V), ("SRC1", 168)], None),
@@ -684,8 +687,16 @@ fn wave64_compute_rendezvous_on_32_lane_waves() {
                 ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", 132)], None),
                 ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
                 ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 10)], None),
-                ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 5), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)], None),
-            ]
+            ];
+            if use_lds {
+                // the lane's LDS round-trip (LDS[v0*4 bytes] = v0, read back into v9)
+                // becomes the stored value: proves the LDS and the tail exchange coexist
+                list.push(("DS_WRITE_B32", "ENC_DS", &[("ADDR", 256 + 5), ("DATA0", V)], None));
+                list.push(("DS_READ_B32", "ENC_DS", &[("VDST", 9), ("ADDR", 256 + 5)], None));
+                list.push(("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 256 + 9)], None));
+            }
+            list.push(("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 5), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)], None));
+            list
         };
         // the isolated variant's store also addresses through the VADDR offset ("offen")
         list
@@ -886,9 +897,12 @@ fn wave64_compute_rendezvous_on_32_lane_waves() {
     };
 
     // the console semantics: lanes 8..=40 are active, so every active lane stores the
-    // readfirstlane result (v0 of lane 8 = 8) at mem[v0]
+    // readfirstlane result (v0 of lane 8 = 8) at mem[v0]; with the LDS round-trip the
+    // stored value is the lane's own v0 instead (proving LDS + exchange coexist)
     let expected: Box<dyn Fn(usize) -> u32> = if isolate {
         Box::new(|_| 1u32) // no exec masking: every lane stores the constant 1
+    } else if use_lds {
+        Box::new(|i: usize| if (8..=40).contains(&i) { i as u32 } else { 0u32 })
     } else {
         Box::new(|i: usize| if (8..=40).contains(&i) { 8u32 } else { 0u32 })
     };

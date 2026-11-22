@@ -3452,10 +3452,29 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 _ => 32,
             };
             let waves = threads.div_ceil(32) as usize;
-            let prologue = PRELUDE_W64X
-                .replace("{NW}", &waves.to_string())
-                .replace("{THREADS}", &threads.to_string());
-            h.push_str(&prologue);
+            // When the program uses the emulated console LDS the exchange must live inside
+            // its 32 KB block (the D3D12 limit is absolute): the tail dwords - the region
+            // the console's own accesses only reach when they wrap the emitter's & 8191
+            // mask, which is already unsupported - carry the exchange. The tail bases:
+            // [ .. NW | NW | NW | threads .. ] from xcl_lds[8192 - 3*NW - threads].
+            let aliased = self.uses_lds;
+            let (nw, xv) = (waves, threads as usize);
+            let base = 8192usize - 3 * nw - xv;
+            if aliased {
+                // the LDS block must be declared before the exchange helpers that alias it
+                h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); its tail carries the wave64 exchange\n");
+                let prologue = PRELUDE_W64X_LDS
+                    .replace("{BW}", &(base).to_string())
+                    .replace("{BE}", &(base + nw).to_string())
+                    .replace("{RE}", &(base + 2 * nw).to_string())
+                    .replace("{XV}", &(base + 3 * nw).to_string());
+                h.push_str(&prologue);
+            } else {
+                let prologue = PRELUDE_W64X
+                    .replace("{NW}", &waves.to_string())
+                    .replace("{THREADS}", &threads.to_string());
+                h.push_str(&prologue);
+            }
         }
         let prelude = if split_w64 {
             let b = PRELUDE.replace(
@@ -3468,7 +3487,20 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
         };
         h.push_str(&prelude);
         if split_w64 {
-            h.push_str(PRELUDE_W64X_RLA);
+            if self.uses_lds {
+                let threads = match &self.opt.mode {
+                    Mode::Compute(cs) => cs.threads.iter().product::<u32>().max(32),
+                    _ => 32,
+                };
+                let waves = threads.div_ceil(32) as usize;
+                let base = 8192usize - 3 * waves - threads as usize;
+                let rla = PRELUDE_W64X_RLA_LDS
+                    .replace("{RE}", &(base + 2 * waves).to_string())
+                    .replace("{XV}", &(base + 3 * waves).to_string());
+                h.push_str(&rla);
+            } else {
+                h.push_str(PRELUDE_W64X_RLA);
+            }
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
@@ -3554,7 +3586,9 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 // cross-lane operations through the rendezvous (see PRELUDE_W64X)
                 let split = self.opt.wave64 && self.opt.hw_wave == 32;
                 let lanes = if split { 32 } else if self.opt.wave64 { 64 } else { 32 };
-                if self.uses_lds {
+                if self.uses_lds && !split {
+                    // with the split form the LDS block (exchange aliased into its tail)
+                    // is declared before the prelude
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let [x, y, z] = cs.threads;
@@ -4444,6 +4478,47 @@ uint rla_x64(uint v, uint l) {
     uint f;
     do { InterlockedOr(xcl_re[o], 0u, f); } while (f < xcl_rep + 1u);
     uint r = xcl_xv[xcl_cwave * 64u + l];
+    xcl_rep++;
+    return r;
+}
+"#;
+
+/// The rendezvous exchange when the program uses the emulated console LDS: the D3D12
+/// groupshared limit (32 KB) is absolute, so the exchange carries in the LDS block's tail
+/// dwords (the wrap region of the emitter's `& 8191` mask). `{BW}`/`{BE}`/`{RE}` are the
+/// per-native-wave counter bases, `{XV}` the lane-value exchange base (in xcl_lds dwords).
+const PRELUDE_W64X_LDS: &str = r#"
+static bool xcl_xw64 = false;
+static uint xcl_hw_lane = 0u;
+static uint xcl_nwave = 0u;
+static uint xcl_cwave = 0u;
+static uint xcl_bep = 0u;
+static uint xcl_rep = 0u;
+uint2 ballot_x64(bool b) {
+    uint4 m = WaveActiveBallot(b);
+    if (xcl_hw_lane == 0u) { xcl_lds[{BW} + xcl_nwave] = m.x; }
+    uint xcl_ie;
+    if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_lds[{BE} + xcl_nwave], xcl_bep + 1u, xcl_ie); }
+    uint o = xcl_nwave ^ 1u;
+    uint f;
+    do { InterlockedOr(xcl_lds[{BE} + o], 0u, f); } while (f < xcl_bep + 1u);
+    uint2 r = uint2(xcl_lds[{BW} + xcl_cwave * 2u], xcl_lds[{BW} + xcl_cwave * 2u + 1u]);
+    xcl_bep++;
+    return r;
+}
+uint rla_x64(uint v, uint l);
+"#;
+
+/// The cross-half lane read, LDS-tail variant (after the prelude: `lane_id`).
+const PRELUDE_W64X_RLA_LDS: &str = r#"
+uint rla_x64(uint v, uint l) {
+    xcl_lds[{XV} + xcl_cwave * 64u + lane_id] = v;
+    uint xcl_ie;
+    if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_lds[{RE} + xcl_nwave], xcl_rep + 1u, xcl_ie); }
+    uint o = xcl_nwave ^ 1u;
+    uint f;
+    do { InterlockedOr(xcl_lds[{RE} + o], 0u, f); } while (f < xcl_rep + 1u);
+    uint r = xcl_lds[{XV} + xcl_cwave * 64u + l];
     xcl_rep++;
     return r;
 }
