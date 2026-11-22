@@ -647,6 +647,268 @@ fn gpu_bench_really_runs() {
 }
 
 #[test]
+fn wave64_compute_rendezvous_on_32_lane_waves() {
+    // A console wave64 compute program whose readfirstlane crosses the halves (the first
+    // active lane is in the low half while readers sit in the high half) and whose exec
+    // words depend on the other half's ballot. On an adapter whose D3D12 wave range cannot
+    // run 64-lane waves (NVIDIA: 32..32), the rendezvous form ([WaveSize(32)] + groupshared
+    // exchange) must reproduce the console semantics exactly; on a 64-capable adapter the
+    // same translated program also runs natively and the two results must agree.
+    if !gpu_ready_wave32() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::PCWSTR;
+    use windows::core::Interface;
+    // exec = (v0 >= 8) & (v0 <= 40); s10 = readfirstlane(v0); mem[s4 + v0*4] = s10
+    // (the compare constants are inline ints: code 128 + value)
+    // XCL_TEST_W64_RENDEZVOUS=first: only the first rendezvous + the store (isolation)
+    let isolate = std::env::var("XCL_TEST_W64_RENDEZVOUS").ok().as_deref() == Some("first");
+    let mut code = prog(&{
+        let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = if isolate {
+            vec![
+                ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", 132)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 129)], None),
+                ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 5), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)], None),
+            ]
+        } else {
+            vec![
+                ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 106), ("SRC0", V), ("SRC1", 136)], None),
+                ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 16), ("SSRC0", 106)], None),
+                ("V_CMP_LE_U32", "ENC_VOP3", &[("VDST", 106), ("SRC0", V), ("SRC1", 168)], None),
+                ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 18), ("SSRC0", 106)], None),
+                ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+                ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", 132)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 10)], None),
+                ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 5), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)], None),
+            ]
+        };
+        // the isolated variant's store also addresses through the VADDR offset ("offen")
+        list
+    });
+    let listed = crate::gpu::rdna2::disassemble(&code, 0, true).into_iter().map(|l| l.text).collect::<Vec<_>>();
+    println!("program: {}", listed.join(" ; "));
+
+    // a console container for it: one FSSM, the compute stage descriptor carrying the
+    // retail FSR4 interface (14 user SGPRs, TGID x/y, 256 threads)
+    let mut f = crate::gpu::xbox::tests::fssm(&code, &[(6, 3)]);
+    let rsrc2: u32 = (14 << 1) | (1 << 7) | (1 << 8);
+    f[0x100 + 0x38..0x100 + 0x3C].copy_from_slice(&rsrc2.to_le_bytes());
+    f[0x100 + 0x3C..0x100 + 0x40].copy_from_slice(&256u32.to_le_bytes());
+    f[0x100 + 0x40..0x100 + 0x44].copy_from_slice(&1u32.to_le_bytes());
+    f[0x100 + 0x44..0x100 + 0x48].copy_from_slice(&1u32.to_le_bytes());
+    let blob = crate::gpu::xbox::tests::sample(5, &[f]);
+
+    let run = |hw_wave: u32| -> Vec<u32> {
+        super::pso::set_hw_wave(hw_wave);
+        if let Ok((hlsl, _)) = super::pso::console_to_hlsl(&blob, super::pso::Stage::Compute) {
+            let _ = std::fs::write(format!(r"C:\Users\alexa\AppData\Local\Temp\fsr4_bisect\synthetic_{hw_wave}.hlsl"), &hlsl);
+        }
+        let compiled = super::pso::console_to_dxil(&blob, super::pso::Stage::Compute, 0);
+        super::pso::set_hw_wave(0);
+        let compiled = compiled.expect("translate the synthetic wave64 CS");
+        unsafe {
+            let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory6 =
+                windows::Win32::Graphics::Dxgi::CreateDXGIFactory2(windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS(0)).expect("dxgi");
+            let adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter1 = factory
+                .EnumAdapterByGpuPreference(0, windows::Win32::Graphics::Dxgi::DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+                .expect("adapter");
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).expect("device");
+            let dev = dev.unwrap();
+            let rs = super::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+            let rs_copy = rs.clone();
+            // the store target first: the io content points at it
+            let mut mem_r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256 * 4,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut mem_r,
+            )
+            .expect("mem buffer");
+            let mem = mem_r.unwrap();
+            // io (the user SGPRs) as a UAV on the default heap, staged through an upload
+            // buffer and copied in the same list before the dispatch
+            let io_stage: ID3D12Resource = {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 128 * 4,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut r,
+                )
+                .expect("io staging");
+                r.unwrap()
+            };
+            let mut io_r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 128 * 4,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut io_r,
+            )
+            .expect("io buffer");
+            let io = io_r.unwrap();
+            // s4..s7 hold the V# (base = the mem buffer's address, stride 0, a size bound)
+            {
+                let mut p = std::ptr::null_mut();
+                io_stage.Map(0, None, Some(&mut p)).expect("map io staging");
+                let dwords = std::slice::from_raw_parts_mut(p as *mut u32, 128);
+                for d in dwords.iter_mut() {
+                    *d = 0;
+                }
+                dwords[4] = 0; // the V# base: console-space offset 0 of the mem window
+                dwords[5] = 0;
+                dwords[6] = 0x10000; // the bound the translated buffer access checks
+                dwords[7] = 0;
+                let _ = io_stage.Unmap(0, None);
+            }
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: compiled.dxil.as_ptr() as *const _, BytecodeLength: compiled.dxil.len() },
+                    ..Default::default()
+                })
+                .expect("compute PSO");
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .expect("queue");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.CopyBufferRegion(&io, 0, &io_stage, 0, 128 * 4);
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(io.clone())),
+                        Subresource: 0,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    }),
+                },
+            }]);
+            list.SetComputeRootSignature(&rs_copy);
+            list.SetComputeRootUnorderedAccessView(0, io.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(1, io.GetGPUVirtualAddress()); // res unused
+            list.SetComputeRootUnorderedAccessView(2, mem.GetGPUVirtualAddress());
+            list.SetPipelineState(&pso);
+            list.Dispatch(1, 1, 1);
+            list.Close().expect("close");
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let done = windows::Win32::System::Threading::CreateEventW(None, false, false, PCWSTR::null()).expect("event");
+            fence.SetEventOnCompletion(1, done).expect("set event");
+            queue.Signal(&fence, 1).expect("signal");
+            use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+            WaitForSingleObject(done, INFINITE);
+            let _ = windows::Win32::Foundation::CloseHandle(done);
+            // read the mem buffer back
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator2");
+            let mut rb_r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256 * 4,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut rb_r,
+            )
+            .expect("readback");
+            let rb = rb_r.unwrap();
+            let rlist: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None).expect("rlist");
+            let _ = alloc.Reset();
+            // the fence's completed value is >= 1; the allocator can be reused after a wait
+            rlist.CopyBufferRegion(&rb, 0, &mem, 0, 256 * 4);
+            rlist.Close().expect("close rlist");
+            queue.ExecuteCommandLists(&[Some(rlist.cast::<ID3D12CommandList>().unwrap())]);
+            let fence2: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence2");
+            let done2 = windows::Win32::System::Threading::CreateEventW(None, false, false, PCWSTR::null()).expect("event2");
+            fence2.SetEventOnCompletion(1, done2).unwrap();
+            queue.Signal(&fence2, 1).unwrap();
+            WaitForSingleObject(done2, INFINITE);
+            let _ = windows::Win32::Foundation::CloseHandle(done2);
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).expect("map readback");
+            let out = std::slice::from_raw_parts(p as *const u32, 256).to_vec();
+            let _ = rb.Unmap(0, None);
+            out
+        }
+    };
+
+    // the console semantics: lanes 8..=40 are active, so every active lane stores the
+    // readfirstlane result (v0 of lane 8 = 8) at mem[v0]
+    let expected: Box<dyn Fn(usize) -> u32> = if isolate {
+        Box::new(|_| 1u32) // no exec masking: every lane stores the constant 1
+    } else {
+        Box::new(|i: usize| if (8..=40).contains(&i) { 8u32 } else { 0u32 })
+    };
+
+    let native_ok = runner::wave64_supported().unwrap_or(false);
+    let split = run(32);
+    for (i, &v) in split.iter().enumerate() {
+        assert_eq!(v, expected(i), "rendezvous form: mem[{i}] (see the printed program)");
+    }
+    println!("rendezvous form: 4 console waves (8 native), active 8..=40, all stores = 8: OK");
+    if native_ok {
+        let native = run(0);
+        assert_eq!(native, split, "the rendezvous form must match the native wave64 form");
+        println!("and it matches the native [WaveSize(64)] form");
+    } else {
+        println!("(the adapter cannot run the native form - cross-check skipped)");
+    }
+}
+
+#[test]
 fn gpu_scalar_loop_and_scc() {
     if !gpu_ready() {
         return;
@@ -1997,6 +2259,7 @@ fn gpu_memory_windows_above_4_gib() {
 fn gpu_arena_partial_commit_probe() {
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows_sys::Win32::System::Memory::*;
     unsafe {

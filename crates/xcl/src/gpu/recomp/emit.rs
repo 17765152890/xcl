@@ -3439,7 +3439,37 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
+        // A wave64 console program on 32-lane hardware waves (NVIDIA's D3D12 wave range is
+        // 32..32): the console wave's two halves run as co-resident native waves and
+        // rendezvous per cross-lane operation - ballot/rla become groupshared exchanges
+        // with per-thread fences and atomic epoch publishes, never group barriers, so
+        // per-wave control flow may diverge freely (it is uniform per console wave, which
+        // is what makes the rendezvous sites agree between the halves).
+        let split_w64 = matches!(self.opt.mode, Mode::Compute(_)) && self.opt.wave64 && self.opt.hw_wave == 32;
+        if split_w64 {
+            let threads = match &self.opt.mode {
+                Mode::Compute(cs) => cs.threads.iter().product::<u32>().max(32),
+                _ => 32,
+            };
+            let waves = threads.div_ceil(32) as usize;
+            let prologue = PRELUDE_W64X
+                .replace("{NW}", &waves.to_string())
+                .replace("{THREADS}", &threads.to_string());
+            h.push_str(&prologue);
+        }
+        let prelude = if split_w64 {
+            let b = PRELUDE.replace(
+                "uint2 ballot(bool b) {\n    uint4 m = WaveActiveBallot(b);\n    if (xcl_logical_wave64)",
+                "uint2 ballot(bool b) {\n    if (xcl_xw64) return ballot_x64(b);\n    uint4 m = WaveActiveBallot(b);\n    if (xcl_logical_wave64)",
+            );
+            b.replace("uint rla(uint v, uint l) {\n    if (xcl_logical_wave64)", "uint rla(uint v, uint l) {\n    if (xcl_xw64) return rla_x64(v, l);\n    if (xcl_logical_wave64)")
+        } else {
+            PRELUDE.to_string()
+        };
+        h.push_str(&prelude);
+        if split_w64 {
+            h.push_str(PRELUDE_W64X_RLA);
+        }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
@@ -3519,7 +3549,11 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 h.push_str("    return xo;\n}\n");
             }
             Mode::Compute(cs) => {
-                let lanes = if self.opt.wave64 { 64 } else { 32 };
+                // a wave64 program on 32-lane waves (NVIDIA's D3D12 wave range): the same
+                // group, [WaveSize(32)], the console lane id from the group index, and the
+                // cross-lane operations through the rendezvous (see PRELUDE_W64X)
+                let split = self.opt.wave64 && self.opt.hw_wave == 32;
+                let lanes = if split { 32 } else if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
@@ -3528,7 +3562,13 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     h,
                     "[WaveSize({lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
-                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                if split {
+                    h.push_str(
+                        "    xcl_hw_lane = WaveGetLaneIndex();\n    xcl_nwave = gi / 32u;\n    xcl_cwave = gi / 64u;\n    xcl_xw64 = true;\n    lane_id = gi % 64u;\n",
+                    );
+                } else {
+                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                }
                 load_sgprs(&mut h);
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;
@@ -3541,7 +3581,9 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    let _ = writeln!(h, "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);", sname(next).unwrap(), x * y * z);
+                    // the console numbers waves at its own width (64 for a wave64 program)
+                    let wlanes = if self.opt.wave64 { 64 } else { 32 };
+                    let _ = writeln!(h, "    {} = ({}u / {wlanes}u) | ((gi / {wlanes}u) << 6);", sname(next).unwrap(), x * y * z);
                 }
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
@@ -4355,6 +4397,56 @@ void st_bytes(uint a, uint4 r, uint n) {
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
+"#;
+
+/// Prologue of the wave64-on-32-lane-waves form: the console wave's halves are co-resident
+/// native waves that rendezvous per cross-lane operation. `{NW}` = native waves per group,
+/// `{THREADS}` = threads per group. The `rla_x64` body follows the main prelude (it needs
+/// `lane_id`); its prototype here lets the prelude's `rla` dispatch to it.
+const PRELUDE_W64X: &str = r#"
+groupshared uint xcl_bw[{NW}];
+groupshared uint xcl_be[{NW}];
+groupshared uint xcl_xv[{THREADS}];
+groupshared uint xcl_re[{NW}];
+static bool xcl_xw64 = false;
+static uint xcl_hw_lane = 0u;
+static uint xcl_nwave = 0u;
+static uint xcl_cwave = 0u;
+static uint xcl_bep = 0u;
+static uint xcl_rep = 0u;
+uint2 ballot_x64(bool b) {
+    // no barrier intrinsics: DXC lowers them to dx.op.barrier, which is only legal in
+    // group-uniform control flow, while the rendezvous runs after the per-lane publish
+    // branches. Groupshared atomics are coherent per CTA (all its waves share one SM's
+    // LDS), so the seq_cst atomic publish orders the plain word store against the spin's
+    // atomic read without any fence.
+    uint4 m = WaveActiveBallot(b);
+    if (xcl_hw_lane == 0u) { xcl_bw[xcl_nwave] = m.x; }
+    uint xcl_ie;
+    if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_be[xcl_nwave], xcl_bep + 1u, xcl_ie); }
+    uint o = xcl_nwave ^ 1u;
+    uint f;
+    do { InterlockedOr(xcl_be[o], 0u, f); } while (f < xcl_bep + 1u);
+    uint2 r = uint2(xcl_bw[xcl_cwave * 2u], xcl_bw[xcl_cwave * 2u + 1u]);
+    xcl_bep++;
+    return r;
+}
+uint rla_x64(uint v, uint l);
+"#;
+
+/// The cross-half lane read of the wave64-on-32-lane form (after the prelude: `lane_id`).
+const PRELUDE_W64X_RLA: &str = r#"
+uint rla_x64(uint v, uint l) {
+    xcl_xv[xcl_cwave * 64u + lane_id] = v;
+    uint xcl_ie;
+    if (xcl_hw_lane == 0u) { InterlockedExchange(xcl_re[xcl_nwave], xcl_rep + 1u, xcl_ie); }
+    uint o = xcl_nwave ^ 1u;
+    uint f;
+    do { InterlockedOr(xcl_re[o], 0u, f); } while (f < xcl_rep + 1u);
+    uint r = xcl_xv[xcl_cwave * 64u + l];
+    xcl_rep++;
+    return r;
+}
 "#;
 
 const PRELUDE: &str = r#"

@@ -28,6 +28,38 @@ pub fn mem_windows() -> u32 {
     crate::gpu::uma::get().map_or(1, |u| u.windows() as u32)
 }
 
+static HW_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The adapter's wave width when it cannot run the program's own: 32 = the adapter's
+/// wave range (WaveLaneCountMax) does not include 64-lane waves (NVIDIA's D3D12 range is
+/// 32..32), so wave64 console programs are translated to the rendezvous form instead of
+/// [WaveSize(64)], which such a driver rejects at PSO creation. Set once from the device.
+pub fn set_hw_wave(w: u32) {
+    HW_WAVE.store(w, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn hw_wave() -> u32 {
+    HW_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Query and publish the adapter's wave width for `set_hw_wave` (32 when 64-lane waves
+/// are unsupported; 0 = native waves of either width are fine).
+pub fn hw_wave_for_device(device: &ID3D12Device) -> u32 {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            &mut options as *mut _ as _,
+            std::mem::size_of_val(&options) as u32,
+        )
+    };
+    if ok.is_err() || options.WaveLaneCountMax >= 64 {
+        0
+    } else {
+        32
+    }
+}
+
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
 pub type StaticSampler = ([u32; 4], bool);
 
@@ -73,7 +105,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), hw_wave: hw_wave(), static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));

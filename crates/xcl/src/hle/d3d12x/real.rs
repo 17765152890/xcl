@@ -374,6 +374,14 @@ pub fn init() -> Result<String, String> {
             }
         }
         open_uma(&device);
+        // publish the adapter's wave width before any console shader is translated: a
+        // wave64 program on an adapter whose range cannot run 64-lane waves (NVIDIA's
+        // D3D12 range is 32..32) uses the rendezvous form instead of [WaveSize(64)]
+        let hw_wave = crate::gpu::recomp::pso::hw_wave_for_device(&device);
+        if hw_wave != 0 {
+            crate::gpu::recomp::pso::set_hw_wave(hw_wave);
+            crate::xlog_info!("D3D12: the adapter cannot run 64-lane waves - wave64 console programs take the rendezvous form");
+        }
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -1976,7 +1984,7 @@ pub(super) unsafe fn deserialize_compute_x(this: *mut c_void, state: *const c_vo
         cs.user_sgprs
     );
     use crate::gpu::recomp::{detect_wave64, translate, Mode, Options};
-    let t = match translate(code, &Options { mode: Mode::Compute(cs.clone()), wave64: detect_wave64(code), mem_windows: crate::gpu::recomp::pso::mem_windows(), ..Default::default() }) {
+    let t = match translate(code, &Options { mode: Mode::Compute(cs.clone()), wave64: detect_wave64(code), hw_wave: crate::gpu::recomp::pso::hw_wave(), mem_windows: crate::gpu::recomp::pso::mem_windows(), ..Default::default() }) {
         Ok(t) => t,
         Err(e) => {
             crate::xlog_warn!("D3D12.X: deserialised pipeline did not translate: {e}");
@@ -1989,8 +1997,12 @@ pub(super) unsafe fn deserialize_compute_x(this: *mut c_void, state: *const c_vo
         return None;
     }
     if let Some(out) = std::env::var_os("XCL_FFX_HLSL") {
-        let _ = std::fs::write(&out, &t.hlsl);
-        crate::xlog_info!("D3D12.X: deserialised pipeline HLSL written to {out:?} ({} B)", t.hlsl.len());
+        // a directory keeps every pass side by side (named by its blob hash)
+        let path = std::path::Path::new(&out);
+        let per_pass = path.is_dir().then(|| path.join(format!("{:08x}.hlsl", u32::from_le_bytes(hash[0..4].try_into().unwrap()))));
+        let file = per_pass.unwrap_or_else(|| path.to_path_buf());
+        let _ = std::fs::write(&file, &t.hlsl);
+        crate::xlog_info!("D3D12.X: deserialised pipeline HLSL written to {file:?} ({} B)", t.hlsl.len());
     }
     let dxil = match crate::gpu::recomp::dxc::compile_cached(&t.hlsl, "main", "cs_6_6") {
         Ok((d, _)) => d,
