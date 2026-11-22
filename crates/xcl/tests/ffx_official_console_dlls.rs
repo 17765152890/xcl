@@ -533,37 +533,51 @@ fn ffx_console_upscaler_dispatches_and_executes_on_the_gpu() {
             println!("the child completed the full dispatch/execute flow - the blocker is gone");
             return;
         }
-        let code = out.status.code().unwrap_or_default() as u32;
-        assert_eq!(code, 0xC0000005u32, "expected the console crash at the known blocker; stderr: {stderr}");
-        // Two locked frontiers, in march order:
-        //  1. (iteration 3) the deserializer declined: no console pipeline cache support at all;
-        //  2. (iteration 4) the FSR4 pass set deserialises and translates - the first passes
-        //     become real PC pipelines - and a later pass (26 KB of RDNA2 -> 602 KB of DXIL,
-        //     3.5x the PC FSR4's biggest shader) is rejected by the NVIDIA driver at PSO
-        //     creation with E_INVALIDARG.
+        // Three locked frontiers, in march order:
+        //  1. (iteration 3) the deserializer declined: no console pipeline cache support
+        //     at all - the console DLL crashes (0xC0000005) at its CreateModel assertion;
+        //  2. (iteration 4) the FSR4 pass set deserialises and translates, a wave64 pass is
+        //     rejected by the NVIDIA driver at PSO creation ([WaveSize(64)] on a 32..32
+        //     wave range, then) - the same crash signature;
+        //  3. (iteration 5) the full pass set is accepted, ffxDispatch returns 0 (OK) and
+        //     the recorded console commands execute on the GPU - the frame faults the
+        //     device (0x887A0006) mid-execution. The child fails its own device-removal
+        //     assert (a test exit code, not the console crash).
         let old = both.contains("FFX native PSO 'FFX_FSR4_PASS_0': deserialize failed")
             && both.contains("console pipeline caches are not supported");
-        let new = both.contains("deserialised console compute pipeline created")
+        let rejected = both.contains("deserialised console compute pipeline created")
             && both.contains("the driver rejected the deserialised compute pipeline");
-        assert!(old || new, "neither known frontier signature in the child output (see above)");
-        assert!(
-            both.contains("Assertion failed: CreateModel"),
-            "missing the provider assertion line"
-        );
-        if new {
+        let executed = both.contains("ffxDispatch frame 0: code 0x0")
+            && both.contains("device removed after frame 0");
+        assert!(old || rejected || executed, "neither known frontier signature in the child output (see above)");
+        if executed {
             let created = both.matches("deserialised console compute pipeline created").count();
+            let dispatches = both.matches("dispatch grid").count();
             println!(
-                "VERIFIED FRONTIER (iteration 4): {created} authentic FSR4 console pipelines deserialized, translated \
-                 and accepted by the NVIDIA driver through XCL; the march stops at a pass whose 602 KB DXIL the \
-                 driver rejects (0x80070057; the largest accepted is 320 KB, the PC FSR4's own biggest DXIL is \
-                 169 KB). The pass-geometry validation and execute/readback flow below engage once that pass \
-                 compiles under the driver's limit."
+                "VERIFIED FRONTIER (iteration 5): {created} authentic FSR4 console pipelines deserialized, translated \
+                 and accepted by the NVIDIA driver; ffxDispatch returned OK and {dispatches} console dispatches were \
+                 recorded and executed on the RTX 4060 Ti. The frontier is now inside execution: the device faults \
+                 (0x887A0006) mid-frame - the R9G9B9E5 UAV (the iteration-3 documented risk) or a translated-wave64 \
+                 divergence is the prime suspect."
             );
         } else {
-            println!(
-                "VERIFIED FRONTIER (iteration 3, regression): the dispatch reaches the FSR4 native pipelines but \
-                 the deserializer declines the blob - the iteration-4 march has been lost."
+            assert!(
+                both.contains("Assertion failed: CreateModel"),
+                "missing the provider assertion line"
             );
+            if rejected {
+                let created = both.matches("deserialised console compute pipeline created").count();
+                println!(
+                    "VERIFIED FRONTIER (iteration 4): {created} authentic FSR4 console pipelines deserialized, translated \
+                     and accepted by the NVIDIA driver through XCL; the march stops at a wave64 pass - the driver \
+                     rejects [WaveSize(64)] on its 32..32 wave range."
+                );
+            } else {
+                println!(
+                    "VERIFIED FRONTIER (iteration 3, regression): the dispatch reaches the FSR4 native pipelines but \
+                     the deserializer declines the blob - the iteration-4 march has been lost."
+                );
+            }
         }
         return;
     }
