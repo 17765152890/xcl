@@ -65,6 +65,11 @@ const E_QUEUE_TYPE: HRESULT = 0x8924_00F5u32 as i32;
 
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
 const IID_FACTORY: GUID = GUID::from_u128(0xfb3b54ac_bf82_463a_b777_73195837864d);
+/// A newer factory interface (its GDK name is not known to XCL): a 2026 retail title asks the
+/// factory for it before anything else and asserts without it. It gets the same object – its
+/// methods beyond IDStorageFactoryX's are the logged stubs after #8, which name the first one
+/// a title calls.
+const IID_FACTORY_NEWER: GUID = GUID::from_u128(0x62959d11_d45f_4884_a0a3_f7862ea243ae);
 const IID_FILE: GUID = GUID::from_u128(0x43704f9f_27c6_4a9f_8815_d16527894df4);
 const IID_QUEUE: GUID = GUID::from_u128(0xa3f6649a_8c2c_4b3a_8b6e_10186a04b9bc);
 const IID_STATUS_ARRAY: GUID = GUID::from_u128(0xcd66d752_2786_44f7_9070_e2a6fdad3f1b);
@@ -210,6 +215,11 @@ unsafe extern "system" fn static_ref(_p: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn factory_qi(p: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    if !out.is_null() && !riid.is_null() && same(&*riid, &IID_FACTORY_NEWER) {
+        warn_once("newer factory interface", format_args!("62959d11-d45f-4884-a0a3-f7862ea243ae answered with IDStorageFactoryX – its extra methods are stubs (logged when called)"));
+        *out = p;
+        return S_OK;
+    }
     query(p, &IID_FACTORY, riid, out, no_ref)
 }
 
