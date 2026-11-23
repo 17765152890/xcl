@@ -8,8 +8,9 @@ production path disabled.
 ## Implementation status
 
 The bounded, versioned structural JSONL sink exists as an explicit opt-in through
-`XCL_STRUCTURAL_TRACE`. It covers command-list lifecycle, draw, dispatch, and indirect-command
-events with pseudonymous identifiers, fixed categories, and strict caps. The offline validator is
+`XCL_STRUCTURAL_TRACE`. It covers command-list lifecycle through close and queue submission,
+draw, dispatch, and indirect-command events with pseudonymous identifiers, fixed categories, and
+strict caps. The offline validator is
 available through `xcl trace-validate <file> [--json]`; it checks the current schema and command-list
 lifecycle but does not by itself enable production eligibility. It does not validate shader or
 pipeline pairing, root layouts, descriptor or resource contracts, generated shader code, replay,
