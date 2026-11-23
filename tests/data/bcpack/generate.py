@@ -192,6 +192,25 @@ def assemble_bc4(symbols):
     return bytes(raw)
 
 
+def assemble_bc5(symbols):
+    blocks = []
+    raw = bytearray()
+    units = list(zip(*symbols))
+    for i in range(len(units) // 2):
+        a, b = units[2*i], units[2*i + 1]
+        ref = sum((a[0] >> k & 1) << (2*k) | (b[0] >> k & 1) << (2*k + 1) for k in range(4))
+        d = 255 - ref // 2 if ref & 1 else ref // 2
+        predictor = ([128] * 4 if d == 0 else
+                     blocks[i-d] if i >= d else made_up_history((i-d) % 256, 4))
+        diffs = (a[2], b[2], a[3], b[3])
+        ends = [(p + (~(v >> 1) if v & 1 else v >> 1)) % 256 for p, v in zip(predictor, diffs)]
+        blocks.append(ends)
+        for c in range(2):
+            halves = [u[4 + 4*c + y] for y in range(4) for u in (a, b)]
+            raw.extend(bytes(ends[2*c:2*c + 2]) + pair_selectors(halves))
+    return bytes(raw)
+
+
 if __name__ == '__main__':
     for mode in WIDTHS:
         cases = [(2, 0, False), (16, 1, True), (700, 2, False)]
@@ -209,6 +228,8 @@ if __name__ == '__main__':
     # 300 blocks: the first ones predict from the history, the later ones from the stream
     syms, path = generate(4, 300, 4, False, quiet_lane1=True)
     path.with_suffix('.bc4').write_bytes(assemble_bc4(syms))
+    syms, path = generate(5, 600, 5, False, quiet_lane1=True)
+    path.with_suffix('.bc5').write_bytes(assemble_bc5(syms))
 
     for mode, widths in [(1, BC1), (7, BC7)]:
         units = 8192

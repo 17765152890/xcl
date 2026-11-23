@@ -4,7 +4,7 @@
 
 use super::lanes::{self, L};
 use super::rans_tables::FREQ;
-use super::{bc1, bc4, decode_lanes, lane_widths, Error};
+use super::{bc1, bc4, bc5, decode_lanes, lane_widths, Error};
 
 /// The tables the fixtures' `.bc1` files were made with: history entry `slot` has the
 /// channels `(7 * slot + 13 * k) mod range`, and a quadrant symbol is its own selectors.
@@ -35,9 +35,9 @@ fn by_unit(lane_major: &[u8], lanes: usize) -> Vec<u8> {
     (0..units * lanes).map(|i| lane_major[(i % lanes) * units + i / lanes]).collect()
 }
 
-const FIXTURES: [&str; 15] = [
+const FIXTURES: [&str; 16] = [
     "bc1-1-8", "bc1-2-0", "bc1-16-1", "bc1-16-9", "bc1-700-2", "bc1-8192-3", "bc3-16-1", "bc4-16-1", "bc5-16-1", "bc6-16-1", "bc7-2-0", "bc7-16-1",
-    "bc7-700-2", "bc7-8192-3", "bc4-300-4",
+    "bc7-700-2", "bc7-8192-3", "bc4-300-4", "bc5-600-5",
 ];
 
 /// The symbols of the two 64 KiB fixtures, which ship without a `.lanes` file (`generate.py`).
@@ -429,4 +429,52 @@ fn bc4_block_rebuild() {
     let mut lane1 = symbols;
     lane1[12 + 1] = 1;
     assert_eq!(bc4::assemble(&lane1, &tables), Err(Error::Lane1 { block: 1 }));
+}
+
+fn bc5_tables() -> bc5::Tables {
+    bc5::Tables { history: std::array::from_fn(made_up_history), pair_codes: made_up_pairs() }
+}
+
+#[test]
+fn bc5_fixture_decodes_to_its_blocks() {
+    let tables = bc5_tables();
+    let bin = data("bc5-600-5.bin").unwrap();
+    let want = data("bc5-600-5.bc5").unwrap();
+    assert_eq!(bc5::decode(&bin, 300 * 16, &tables).as_deref(), Ok(&want[..]));
+    let lanes = data("bc5-600-5.lanes").unwrap();
+    let d = |i: usize| bc4::back_reference(bc5::interleave(lanes[2 * i], lanes[2 * i + 1]));
+    let i = (0..300).find(|&i| d(i) > i).unwrap();
+    let mut gap = bc5_tables();
+    gap.history[256 + i - d(i)] = None;
+    assert_eq!(bc5::decode(&bin, 300 * 16, &gap), Err(Error::History { block: i, slot: 256 + i - d(i) }));
+    // half a block
+    assert_eq!(bc5::decode(&bin, 300 * 16 - 8, &tables), Err(Error::OutputSize));
+}
+
+/// Two blocks by hand: the back-reference split over both units, both channels' fields.
+#[test]
+fn bc5_block_rebuild() {
+    let mut tables = bc5_tables();
+    tables.pair_codes = std::array::from_fn(|s| s as u8);
+    tables.history[255] = Some([10, 20, 30, 40]);
+    #[rustfmt::skip]
+    let symbols = [
+        // block 0, unit a: lane 0 gives bits 0, 2, 4, 6 of the back-reference (here 2: one
+        // block back, the history's last entry); R0 +2, G0 +0; red rows' left halves, green's
+        0, 0, 4, 0, 0o01, 0o02, 0o03, 0o04, 0o11, 0o12, 0o13, 0o14,
+        // unit b: bits 1, 3, 5, 7 of the back-reference; R1 -2, G1 -128; the right halves
+        1, 0, 3, 255, 0o05, 0o06, 0o07, 0o10, 0o15, 0o16, 0o17, 0o20,
+        // block 1: back-reference 1, 255 blocks back: history entry 2; nothing else
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let out = bc5::assemble(&symbols, &tables).unwrap();
+    let red = 0o10_04_07_03_06_02_05_01u64.to_le_bytes();
+    let green = 0o20_14_17_13_16_12_15_11u64.to_le_bytes();
+    assert_eq!(out[..8], [12, 18, red[0], red[1], red[2], red[3], red[4], red[5]]);
+    assert_eq!(out[8..16], [30, 168, green[0], green[1], green[2], green[3], green[4], green[5]]);
+    assert_eq!(out[16..32], [14, 27, 0, 0, 0, 0, 0, 0, 40, 53, 0, 0, 0, 0, 0, 0]);
+    let mut lane1 = symbols;
+    lane1[36 + 1] = 1;
+    assert_eq!(bc5::assemble(&lane1, &tables), Err(Error::Lane1 { block: 1 }));
 }
