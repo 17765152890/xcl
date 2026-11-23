@@ -130,25 +130,42 @@ pub fn compile_threads() -> usize {
     })
 }
 
-/// Compiles running on the DXC workers (`wait_for_memory` lets them in).
-static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// What `wait_for_memory` lets compiles in through: the compiles running, its lock (holding
+/// when a compile last went in by waiting `ESCAPE_AFTER`) and the wake-up when one ends.
+struct Gate {
+    running: std::sync::atomic::AtomicUsize,
+    last_escape: Mutex<Option<std::time::Instant>>,
+    freed: std::sync::Condvar,
+}
 
-/// A compile let in by `wait_for_memory`, until it is dropped.
-pub struct MemorySlot;
-
-impl Drop for MemorySlot {
-    fn drop(&mut self) {
-        WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        // under the gate's lock: a waiter between its decision and its wait does not miss it
-        let _gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
-        GATE_FREED.notify_all();
+impl Gate {
+    const fn new() -> Gate {
+        Gate { running: std::sync::atomic::AtomicUsize::new(0), last_escape: Mutex::new(None), freed: std::sync::Condvar::new() }
     }
 }
 
-/// `wait_for_memory`'s lock (and when a compile last went in by waiting `ESCAPE_AFTER`);
-/// `GATE_FREED` wakes the waiters when a compile ends.
-static GATE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-static GATE_FREED: std::sync::Condvar = std::sync::Condvar::new();
+/// The DXC workers' gate.
+static GATE: Gate = Gate::new();
+
+/// A compile let in by `wait_for_memory`, until it is dropped.
+pub struct MemorySlot(&'static Gate);
+
+impl Drop for MemorySlot {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // under the gate's lock: a waiter between its decision and its wait does not miss it
+        let _lock = self.0.last_escape.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.freed.notify_all();
+    }
+}
+
+/// The system's available commit (None when Windows does not say).
+fn available_commit() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
 
 /// Commit left for the rest of the system (the title above all) while compiles run.
 const COMMIT_FLOOR: u64 = 6 << 30;
@@ -181,28 +198,31 @@ fn may_start(avail: Option<u64>, running: usize, waited: std::time::Duration, es
 /// while commit was short: with XDefiant's own 10 GB committed, 4 GB were left, and its last
 /// cold-cache shaders came a few a minute.
 pub fn wait_for_memory() -> MemorySlot {
+    admit(&GATE, available_commit)
+}
+
+/// `wait_for_memory` through `gate`, with the available commit from `commit` (read again for
+/// every decision; a test gives it a fixed one).
+fn admit(gate: &'static Gate, commit: impl Fn() -> Option<u64>) -> MemorySlot {
     use std::sync::atomic::Ordering;
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
-    let mut last_escape = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last_escape = gate.last_escape.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let avail = (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile);
+        let avail = commit();
         let waited = start.elapsed();
         let escape_free = last_escape.is_none_or(|t| t.elapsed() >= ESCAPE_AFTER);
-        let running = WORKING.load(Ordering::Acquire);
+        let running = gate.running.load(Ordering::Acquire);
         // the count goes up only from the value the decision saw: workers deciding at the same
         // moment cannot all go in on one reading of the commit
-        if may_start(avail, running, waited, escape_free) && WORKING.compare_exchange(running, running + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if may_start(avail, running, waited, escape_free) && gate.running.compare_exchange(running, running + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             let plenty = avail.is_none_or(|a| a >= COMMIT_FLOOR + COMMIT_PER_COMPILE * running as u64);
             if !plenty && running != 0 {
                 *last_escape = Some(std::time::Instant::now());
             }
-            return MemorySlot;
+            return MemorySlot(gate);
         }
         // woken when a compile ends; the commit can also change without one, so look again soon
-        last_escape = GATE_FREED.wait_timeout(last_escape, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        last_escape = gate.freed.wait_timeout(last_escape, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -649,6 +669,7 @@ pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>,
 #[cfg(test)]
 mod gate_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     const GB: u64 = 1 << 30;
@@ -675,38 +696,55 @@ mod gate_tests {
         assert!(!may_start(Some(short), 1, ESCAPE_AFTER * 5, false), "but not while another just escaped");
     }
 
-    /// Workers that decide on the same reading do not all go in: the count only rises from
-    /// the value each decision saw, so at most as many run as the commit covers.
+    /// Workers that decide at the same moment do not all go in: the count only rises from
+    /// the value each decision saw. A gate of its own (other tests' compiles share the real one)
+    /// and a fixed commit, read at every decision as the real one is: room for exactly three.
     #[test]
-    fn concurrent_admissions_never_exceed_what_the_rule_allows() {
-        // the real gate with the machine's real commit: whatever it is, the number running at
-        // once must stay within what `may_start` allows for it (or 1 when commit is short)
-        let avail = {
-            use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-            let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-            m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-            unsafe { GlobalMemoryStatusEx(&mut m) };
-            m.ullAvailPageFile
-        };
-        let allowed = (avail.saturating_sub(COMMIT_FLOOR) / COMMIT_PER_COMPILE + 1).max(1) as usize;
-        let peak = std::sync::atomic::AtomicUsize::new(0);
-        let now = std::sync::atomic::AtomicUsize::new(0);
+    fn concurrent_admissions_reach_and_never_exceed_what_the_commit_allows() {
+        static TEST_GATE: Gate = Gate::new();
+        let cap = 3;
+        let commit = || Some(COMMIT_FLOOR + COMMIT_PER_COMPILE * (cap as u64 - 1));
+        let (now, peak, filled) = (AtomicUsize::new(0), AtomicUsize::new(0), std::sync::atomic::AtomicBool::new(false));
         std::thread::scope(|s| {
             for _ in 0..32 {
                 s.spawn(|| {
-                    for _ in 0..20 {
-                        let _slot = wait_for_memory();
+                    for _ in 0..10 {
+                        let _slot = admit(&TEST_GATE, commit);
                         let n = now.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(n, Ordering::SeqCst);
+                        // the first ones in stay until the cap is full: it is reached for sure
+                        let t0 = std::time::Instant::now();
+                        while !filled.load(Ordering::SeqCst) && now.load(Ordering::SeqCst) < cap && t0.elapsed() < Duration::from_secs(5) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        filled.store(true, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(1));
                         now.fetch_sub(1, Ordering::SeqCst);
                     }
                 });
             }
         });
-        let peak = peak.into_inner();
-        // other tests' compiles share the gate: they only lower what is let in here
-        assert!(peak >= 1 && peak <= allowed + 1, "peak {peak} running, the commit ({} MB) allows {allowed}", avail >> 20);
+        assert_eq!(peak.into_inner(), cap, "running at once with room for {cap}");
+        assert_eq!(TEST_GATE.running.load(Ordering::SeqCst), 0, "every slot given back");
+    }
+
+    /// The real gate with the machine's commit: 32 workers through it all finish (no lost
+    /// wake-up, no slot kept), whatever the commit is.
+    #[test]
+    fn the_real_gate_lets_every_worker_through() {
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..32 {
+                s.spawn(|| {
+                    for _ in 0..5 {
+                        let _slot = wait_for_memory();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(done.into_inner(), 32);
     }
 }
 
