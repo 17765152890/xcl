@@ -3634,8 +3634,12 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 //   GetTimestampFrequency #18, GetClockCalibration #19, GetDesc #20, SignalX #25, PresentX #32.
 // Nothing the title passes at device creation tells them apart, but its calls do: Signal and
 // Wait take a fence, the older layout's #16 / #17 (GetTimestampFrequency / GetClockCalibration)
-// never do. A title calling #16 / #17 with one of its fences uses the newer layout, and the
-// slots that differ follow that from then on.
+// never do. A title calling #16 / #17 with one of its fences uses the newer layout, one calling
+// #14 / #15 with one the older, and the slots that differ follow that from then on. Until a
+// fence has been seen, #18 is ambiguous: the older layout's GetDesc (16 bytes through the
+// hidden pointer) or the newer layout's GetTimestampFrequency (a UINT64) – a GetDesc written
+// in full into a title's UINT64 overflows it by 8 bytes (#104), so only the first 8 bytes of
+// the descriptor are written then.
 //
 // The same runtime moves the command list's console methods too: Unicorn Overlord records its
 // texture uploads with CopyTextureRegionX at #85 (the older layout's #83; its #85 is
@@ -3646,6 +3650,8 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
 pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
+/// the title's runtime has the older layouts (a fence passed to queue #14 / #15)
+static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
 const NEWER_LIST_SLOTS: [(usize, usize); 8] = [(85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
@@ -3670,6 +3676,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
     }
     let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
+        QUEUE_OLDER.store(true, Ordering::Release);
+    }
     // the method in the older layout's numbering
     let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
     let pc = |s: usize| orig_fn(this, s);
@@ -3688,9 +3697,25 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1, a2) as u32 as usize
         }
         // GetDesc returns its structure through the hidden pointer, and that pointer
-        18 => {
+        18 if shifted || QUEUE_OLDER.load(Ordering::Acquire) => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
             f(this, a1)
+        }
+        // #18 before the layout is known: GetDesc (older) or GetTimestampFrequency (newer, a
+        // UINT64 out-parameter) – the descriptor's first 8 bytes only, so a UINT64 is not
+        // overflowed; the layout is known once the title passes a fence to Signal / Wait
+        18 => {
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::AcqRel) {
+                crate::xlog_warn!("D3D12.X: command queue #18 before the first Signal / Wait – GetDesc (older layout) or GetTimestampFrequency (newer layout, a UINT64): answered as GetDesc, its first 8 bytes only");
+            }
+            let f: unsafe extern "system" fn(*mut c_void, *mut D3D12_COMMAND_QUEUE_DESC) -> *mut D3D12_COMMAND_QUEUE_DESC = std::mem::transmute(pc(PC_GET_DESC));
+            let mut desc = D3D12_COMMAND_QUEUE_DESC::default();
+            f(this, &mut desc);
+            if a1 != 0 {
+                std::ptr::copy_nonoverlapping(&desc as *const _ as *const u8, a1 as *mut u8, 8);
+            }
+            a1
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,

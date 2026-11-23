@@ -54,15 +54,43 @@ pub fn gpu_owned(flags: u32) -> bool {
     flags & 0x7 != 0
 }
 
-/// The arena holding `[va, va + bytes)` – an existing one, or a new one from the 32 MiB below
-/// `va`, 128 MiB or what the resource needs (None: no video memory).
+/// Where a new arena for `[va, va + bytes)` goes between the `arenas` there are (`(base, size)`
+/// each): from the 32 MiB boundary below `va`, 128 MiB or what the resource needs, cut back to
+/// the gap between the neighbouring arenas so that no two arenas stand for the same title
+/// address (two heaps for one address: resources there no longer alias, and every placement
+/// missing the first arena costs 128 MiB of video memory – #104). None: `[va, va + bytes)`
+/// crosses the edge of an arena there is – no heap can hold the resource whole.
+fn new_arena_range(arenas: &[(usize, usize)], va: usize, bytes: usize) -> Option<(usize, usize)> {
+    let end = va + bytes;
+    let mut base = va & !(ARENA_ALIGN - 1);
+    let mut top = base + (end - base).div_ceil(ARENA_ALIGN).max(ARENA / ARENA_ALIGN) * ARENA_ALIGN;
+    for &(b, s) in arenas {
+        if b + s <= va {
+            base = base.max(b + s);
+        } else if b >= end {
+            top = top.min(b);
+        } else {
+            return None;
+        }
+    }
+    Some((base, top - base))
+}
+
+/// The arena holding `[va, va + bytes)` – an existing one, or a new one next to the existing
+/// ones (`new_arena_range`; None: no video memory, or the range crosses an arena's edge).
 unsafe fn arena_for(dev: &ID3D12Device, va: usize, bytes: usize) -> Option<(ID3D12Heap, u64)> {
     let mut g = ARENAS.lock().unwrap();
     if let Some(a) = g.iter().find(|a| a.base <= va && va + bytes <= a.base + a.size) {
         return Some((a.heap.clone(), (va - a.base) as u64));
     }
-    let base = va & !(ARENA_ALIGN - 1);
-    let size = (va + bytes - base).div_ceil(ARENA_ALIGN).max(ARENA / ARENA_ALIGN) * ARENA_ALIGN;
+    let ranges: Vec<(usize, usize)> = g.iter().map(|a| (a.base, a.size)).collect();
+    let Some((base, size)) = new_arena_range(&ranges, va, bytes) else {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            crate::xlog_warn!("D3D12.X: a GPU-owned texture at {va:#x} ({bytes:#x} B) crosses the edge of a video-memory arena – a resource of its own (it aliases nothing; only the first such one is logged)");
+        }
+        return None;
+    };
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: size as u64,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -105,4 +133,41 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     Some(hr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+
+    #[test]
+    fn arenas_never_overlap() {
+        // the first placement: 128 MiB from the 32 MiB boundary below it
+        let (b0, s0) = new_arena_range(&[], 0x1_0400_0000 + 4 * MIB, 16 * MIB).unwrap();
+        assert_eq!((b0, s0), (0x1_0400_0000, 128 * MIB));
+        let arenas = vec![(b0, s0)];
+        // #104's sequence: a placement starting below that arena and ending inside it crosses
+        // its edge – no arena (it would overlap), the resource is made on its own
+        assert_eq!(new_arena_range(&arenas, 0x1_0200_0000, 48 * MIB), None);
+        // one straddling the arena's end
+        assert_eq!(new_arena_range(&arenas, 0x1_0400_0000 + 120 * MIB, 16 * MIB), None);
+        // below the arena, fitting in front of it: the new arena stops at the old one's base
+        let (b1, s1) = new_arena_range(&arenas, 0x1_0200_0000, 16 * MIB).unwrap();
+        assert_eq!((b1, s1), (0x1_0200_0000, 32 * MIB));
+        let arenas = vec![(b0, s0), (b1, s1)];
+        // above both: 128 MiB, starting at the first arena's end
+        let (b2, s2) = new_arena_range(&arenas, b0 + s0 + MIB, MIB).unwrap();
+        assert_eq!((b2, s2), (b0 + s0, 128 * MIB));
+        // a gap between arenas narrower than 128 MiB: the new arena fills exactly the gap
+        let arenas = vec![(0x2_0000_0000, 128 * MIB), (0x2_0C00_0000, 128 * MIB)];
+        let (b3, s3) = new_arena_range(&arenas, 0x2_0900_0000, MIB).unwrap();
+        assert_eq!((b3, s3), (0x2_0800_0000, 64 * MIB));
+        // a resource larger than 128 MiB: the arena grows to hold it
+        let (b4, s4) = new_arena_range(&[], 0x3_0000_0000, 200 * MIB).unwrap();
+        assert_eq!((b4, s4), (0x3_0000_0000, 224 * MIB));
+        for ((ba, sa), (bb, sb)) in [((b0, s0), (b1, s1)), ((b0, s0), (b2, s2)), ((b1, s1), (b2, s2))] {
+            assert!(ba + sa <= bb || bb + sb <= ba, "{ba:#x}+{sa:#x} overlaps {bb:#x}+{sb:#x}");
+        }
+    }
 }
