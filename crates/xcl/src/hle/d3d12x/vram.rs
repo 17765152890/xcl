@@ -436,6 +436,19 @@ fn forget_pages(resource: usize) {
     pages.book.release(resource, std::time::Instant::now());
 }
 
+/// A kept-in-step texture was superseded by a newer placement over its memory: release its
+/// page claims in `Book` so leftover pages and extra tiles cool and return to the pools.
+pub(super) fn detach_title_texture(resource: usize) {
+    forget_pages(resource);
+}
+
+/// Drop a released queue from the mapping-fence wait cache so a reused pointer cannot skip waits.
+pub(super) fn on_queue_release(queue: usize) {
+    if let Some(Some(pages)) = PAGES.lock().unwrap().as_mut() {
+        pages.waited.remove(&queue);
+    }
+}
+
 /// A texture the title placed at `va` whose texels the CPU writes (kept in step with the memory,
 /// `title_textures`) as a reserved resource on the title's pages of such textures (`desc`: the PC
 /// description, `console_bytes` its size on the console). A title streams its world by placing

@@ -46,9 +46,14 @@ extern "system" {
 /// (device, address, layout, states) of an upload
 type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
 
+/// Snapshot reported on the `XCL_ACTIVITY` memory line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats { pub active: usize, pub covered_bytes: usize, pub retired: u64, pub released: u64 }
+
 struct Entry {
     device: usize,
     va: usize,
+    bytes: usize,
     tex: Arc<xg::Texture>,
     /// the state the title's submitted work leaves the texture in (uploads leave it there):
     /// the creation state, then what its transitions give – one state for every subresource,
@@ -65,6 +70,52 @@ struct Entry {
     seq: u64,
 }
 
+/// Active title textures: pairwise-disjoint address intervals per device (`by_end`) so a newer
+/// placement over existing memory retires superseded entries in O(log N + k).
+struct Registry {
+    entries: BTreeMap<usize, Entry>,
+    by_end: BTreeMap<(usize, usize), (usize, usize)>,
+    covered_bytes: usize,
+    retired: u64,
+    released: u64,
+}
+
+impl Registry {
+    const fn new() -> Self { Self { entries: BTreeMap::new(), by_end: BTreeMap::new(), covered_bytes: 0, retired: 0, released: 0 } }
+    fn unlink(&mut self, res: usize) -> Option<Entry> {
+        let e = self.entries.remove(&res)?;
+        self.by_end.remove(&(e.device, e.va.saturating_add(e.bytes)));
+        self.covered_bytes = self.covered_bytes.saturating_sub(e.bytes);
+        Some(e)
+    }
+    fn insert(&mut self, res: usize, e: Entry) -> (Vec<usize>, isize) {
+        let mut delta = isize::from(e.pending) - isize::from(self.unlink(res).is_some_and(|o| o.pending));
+        let end = e.va.saturating_add(e.bytes);
+        let retired: Vec<usize> = if e.bytes > 0 {
+            self.by_end.range((e.device, e.va.saturating_add(1))..=(e.device, usize::MAX)).take_while(|(_, &(ova, _))| ova < end).map(|(_, &(_, r))| r).collect()
+        } else { Vec::new() };
+        for &old_res in &retired {
+            if let Some(old) = self.unlink(old_res) {
+                delta -= isize::from(old.pending);
+                self.retired += 1;
+            }
+        }
+        if e.bytes > 0 { self.by_end.insert((e.device, end), (e.va, res)); }
+        self.covered_bytes = self.covered_bytes.saturating_add(e.bytes);
+        self.entries.insert(res, e);
+        (retired, delta)
+    }
+    fn remove(&mut self, res: usize) -> Option<Entry> {
+        let e = self.unlink(res)?;
+        self.released += 1;
+        Some(e)
+    }
+    fn teardown(&mut self, device: Option<usize>) -> usize {
+        let ids: Vec<usize> = self.entries.iter().filter(|(_, e)| device.is_none_or(|d| e.device == d)).map(|(&r, _)| r).collect();
+        ids.into_iter().filter(|&r| self.unlink(r).is_some_and(|e| e.pending)).count()
+    }
+}
+
 /// the next texture's `Entry::seq`
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -75,7 +126,7 @@ static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 unsafe impl Send for Entry {}
 
 /// PC texture → its place in the title's memory
-static TEXTURES: Mutex<BTreeMap<usize, Entry>> = Mutex::new(BTreeMap::new());
+static TEXTURES: Mutex<Registry> = Mutex::new(Registry::new());
 // The dirty-page scan consumes write-watch state for every submission thread.
 // Keep the scan, pending-list update and GPU uploads together.
 static REFRESH: Mutex<()> = Mutex::new(());
@@ -89,7 +140,13 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
-    (TEXTURES.lock().unwrap().len(), UPLOADS.load(Ordering::Relaxed))
+    (TEXTURES.lock().unwrap().entries.len(), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// Activity memory counters for `XCL_ACTIVITY`.
+pub fn stats() -> Stats {
+    let t = TEXTURES.lock().unwrap();
+    Stats { active: t.entries.len(), covered_bytes: t.covered_bytes, retired: t.retired, released: t.released }
 }
 
 /// The console layout of a texture the title places (its console desc `desc`) when it can be
@@ -135,19 +192,20 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false, seq };
-    {
+    let (bytes, seq) = (tex.size() as usize, SEQ.fetch_add(1, Ordering::Relaxed));
+    let e = Entry { device: device as usize, va, bytes, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false, seq };
+    let retired = {
         let mut t = TEXTURES.lock().unwrap();
-        if let Some(old) = t.insert(res as usize, e) {
-            if old.pending {
-                PENDING.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
-        PENDING.fetch_add(1, Ordering::Relaxed);
-    }
+        let (retired, delta) = t.insert(res as usize, e);
+        TEXTURES_LEN.store(t.entries.len(), Ordering::Relaxed);
+        if delta > 0 { PENDING.fetch_add(delta as usize, Ordering::Relaxed); } else if delta < 0 { PENDING.fetch_sub((-delta) as usize, Ordering::Relaxed); }
+        retired
+    };
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    for old_res in retired {
+        super::vram::detach_title_texture(old_res);
+        super::real::retire_resource_at(old_res);
+    }
     Ok(())
 }
 
@@ -158,7 +216,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
-    if let Some(e) = TEXTURES.lock().unwrap().get_mut(&res) {
+    if let Some(e) = TEXTURES.lock().unwrap().entries.get_mut(&res) {
         if !e.gpu_written {
             e.gpu_written = true;
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -170,15 +228,15 @@ static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
-    TEXTURES.lock().unwrap().iter().filter(|(_, e)| e.va < va + len && va < e.va + e.tex.size() as usize).map(|(&r, e)| (r, e.va)).take(4).collect()
+    TEXTURES.lock().unwrap().entries.iter().filter(|(_, e)| e.va < va + len && va < e.va + e.bytes).map(|(&r, e)| (r, e.va)).take(4).collect()
 }
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
     let removed = {
         let mut t = TEXTURES.lock().unwrap();
-        let r = t.remove(&res);
-        TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
+        let r = t.remove(res);
+        TEXTURES_LEN.store(t.entries.len(), Ordering::Relaxed);
         r
     };
     if let Some(e) = removed {
@@ -189,9 +247,26 @@ pub fn forget(res: usize) {
     }
 }
 
+/// Drop title-texture state and internal upload queues for `device` (or all if `None`).
+pub fn teardown(device: Option<usize>) {
+    let dropped = {
+        let mut t = TEXTURES.lock().unwrap();
+        let d = t.teardown(device);
+        TEXTURES_LEN.store(t.entries.len(), Ordering::Relaxed);
+        d
+    };
+    if dropped > 0 { PENDING.fetch_sub(dropped, Ordering::Relaxed); }
+    match device {
+        Some(d) => { QUEUES.lock().unwrap().remove(&d); }
+        None => { QUEUES.lock().unwrap().clear(); LIST_NOTES.lock().unwrap().clear(); }
+    }
+    *WATCH_CACHE.lock().unwrap() = None;
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+}
+
 /// The title-memory address of a texture kept in step with it.
 pub fn address(res: usize) -> Option<usize> {
-    TEXTURES.lock().unwrap().get(&res).map(|e| e.va)
+    TEXTURES.lock().unwrap().entries.get(&res).map(|e| e.va)
 }
 
 /// (texture, subresource or ALL_SUBRESOURCES, state after) of a transition the title recorded
@@ -215,7 +290,7 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
     }
     let kept: Vec<Transition> = {
         let t = TEXTURES.lock().unwrap();
-        transitions.iter().filter(|(r, _, _)| t.contains_key(r)).copied().collect()
+        transitions.iter().filter(|(r, _, _)| t.entries.contains_key(r)).copied().collect()
     };
     if !kept.is_empty() {
         LIST_NOTES.lock().unwrap().entry(list).or_default().extend(kept);
@@ -245,7 +320,7 @@ pub fn submitted(lists: &[*mut c_void]) {
     }
     let mut t = TEXTURES.lock().unwrap();
     for (res, sub, after) in notes {
-        if let Some(e) = t.get_mut(&res) {
+        if let Some(e) = t.entries.get_mut(&res) {
             let n = subresource_count(&e.tex);
             apply_transition(&mut e.states, n, sub, after);
         }
@@ -305,7 +380,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().entries.values().map(|e| (e.va & !0xFFF, (e.va + e.bytes + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -388,7 +463,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             };
             let (mut with, mut without) = (0, 0);
             let mut shown = 0;
-            for e in t.values() {
+            for e in t.entries.values() {
                 let c = content(e);
                 if c > 0 { with += 1 } else { without += 1 }
                 if c > 0 && shown < 4 {
@@ -415,7 +490,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let mut todo: Vec<(u64, ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.iter_mut()
+        t.entries
+            .iter_mut()
             .filter(|(_, e)| {
                 if e.pending {
                     return true;
@@ -424,7 +500,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     return false;
                 }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.va);
-                dirty.get(i).is_some_and(|&p| p < e.va + e.tex.size() as usize)
+                dirty.get(i).is_some_and(|&p| p < e.va + e.bytes)
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -529,7 +605,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().entries.get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -739,9 +815,10 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, seq: 0 });
+        let bytes = tex.size() as usize;
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, bytes, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, seq: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
-        let states = || TEXTURES.lock().unwrap().get(&res).unwrap().states.clone();
+        let states = || TEXTURES.lock().unwrap().entries.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
 
         note_transitions(l1, &[(res, ALL, SRV), (other, ALL, D3D12_RESOURCE_STATE_RENDER_TARGET), (res, 4, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
@@ -780,5 +857,38 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+
+    #[test]
+    fn overlapping_placements_retire_old_release_and_teardown() {
+        let make = |w: u64, h: u32| {
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&3u32.to_le_bytes());
+            d[0x10..0x18].copy_from_slice(&w.to_le_bytes());
+            d[0x18..0x1C].copy_from_slice(&h.to_le_bytes());
+            d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+            Arc::new(xg::Texture::new(&d).unwrap())
+        };
+        let (small, big) = (make(64, 64), make(256, 256));
+        let (big_bytes, slots, base) = (big.size() as usize, 16usize, 0x2_0000_0000usize);
+        let entry = |dev: usize, va: usize, tex: &Arc<xg::Texture>, seq: u64| Entry { device: dev, va, bytes: tex.size() as usize, tex: Arc::clone(tex), states: vec![SRV], pending: true, gpu_written: false, seq };
+        let mut reg = Registry::new();
+        for i in 0..500usize {
+            let (retired, delta) = reg.insert(0xB000 + i, entry(1, base + (i % slots) * big_bytes, if i % 3 == 0 { &big } else { &small }, i as u64));
+            if i >= slots { assert!(!retired.is_empty() && delta == 0); } else { assert!(retired.is_empty() && delta == 1); }
+            assert!(reg.covered_bytes <= slots * big_bytes && reg.entries.len() <= slots);
+        }
+        assert!(reg.retired >= 500 - slots as u64);
+        assert!(reg.remove(0xB000 + 499).is_some() && reg.released == 1);
+        reg.insert(0xC001, entry(2, base, &big, 500));
+        assert!(reg.teardown(Some(1)) > 0);
+        assert_eq!(reg.entries.len(), 1);
+        assert!(reg.entries.contains_key(&0xC001));
+        assert_eq!(reg.teardown(None), 1);
+        assert_eq!((reg.entries.len(), reg.covered_bytes), (0, 0));
     }
 }
