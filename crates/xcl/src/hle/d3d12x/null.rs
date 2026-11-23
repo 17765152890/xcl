@@ -150,7 +150,10 @@ fn vtable(kind: Kind) -> *const usize {
             v[17] = Queue_GetClockCalibration as usize;
             v[18] = Hidden_ZeroDesc16 as usize; // GetDesc
         }
-        Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
+        Kind::CommandAllocator => {
+            v[8] = Ret_S_OK as usize; // Reset
+            v[9] = Ret_S_OK as usize; // RegisterCustomAllocator
+        }
         Kind::CommandList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
@@ -323,7 +326,7 @@ pub unsafe fn capture_compute_desc(desc: *const u8) {
 pub fn subobject_payload(ty: u32) -> Option<(usize, usize)> {
     Some(match ty {
         0 => (8, 8),                          // ROOT_SIGNATURE
-        1..=6 | 24 | 25 => (16, 8),           // VS PS DS HS GS CS AS MS
+        1..=6 | 23..=25 => (16, 8),           // VS PS DS HS GS CS AS MS (Scarlett AS=23, MS=24; PC AS=24, MS=25)
         7 => (32, 8),                         // STREAM_OUTPUT
         8 => (328, 4),                        // BLEND
         9 | 13 | 14 | 16 | 18 | 20 => (4, 4), // SAMPLE_MASK, IB_STRIP_CUT, TOPOLOGY, DS_FORMAT, NODE_MASK, FLAGS
@@ -366,7 +369,16 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
             4 => Some("hs"),
             5 => Some("gs"),
             6 => Some("cs"),
-            24 => Some("as"),
+            23 => Some("as"),
+            24 => {
+                let at = (base + off + poff) as *const u8;
+                let (p, n) = (*(at as *const usize), *(at.add(8) as *const usize));
+                if p != 0 && n > 0 && crate::gpu::shader::readable(p, n) && super::real::is_mesh_shader(std::slice::from_raw_parts(p as *const u8, n)) {
+                    Some("ms")
+                } else {
+                    Some("as")
+                }
+            }
             25 => Some("ms"),
             _ => None,
         };
@@ -791,5 +803,12 @@ mod tests {
             assert_eq!(unknown(dev), 0);
             assert!(crate::stubs::all_stubs().iter().any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
         }
+    }
+
+    #[test]
+    fn subobject_payload_as_ms_slots() {
+        assert_eq!(subobject_payload(23), Some((16, 8))); // console AS
+        assert_eq!(subobject_payload(24), Some((16, 8))); // console MS / PC AS
+        assert_eq!(subobject_payload(25), Some((16, 8))); // PC MS
     }
 }

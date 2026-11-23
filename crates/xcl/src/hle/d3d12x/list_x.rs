@@ -1226,6 +1226,41 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// command list #75 console extension
+pub(super) unsafe extern "system" fn cmd_list_75_x(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: ID3D12GraphicsCommandList::#75 ({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})"));
+    let _ = (this, a1, a2, a3, a4);
+}
+
+/// command list #126 console extension
+pub(super) unsafe extern "system" fn cmd_list_126_x(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: ID3D12GraphicsCommandList::#126 ({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})"));
+    let _ = (this, a1, a2, a3, a4);
+}
+
+/// command list #131 console extension
+pub(super) unsafe extern "system" fn cmd_list_131_x(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: ID3D12GraphicsCommandList::#131 ({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})"));
+    let _ = (this, a1, a2, a3, a4);
+}
+
+/// command list #132 console extension
+pub(super) unsafe extern "system" fn cmd_list_132_x(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: ID3D12GraphicsCommandList::#132 ({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})"));
+    let _ = (this, a1, a2, a3, a4);
+}
+
+/// command list #142 console extension
+pub(super) unsafe extern "system" fn cmd_list_142_x(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: ID3D12GraphicsCommandList::#142 ({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})"));
+    let _ = (this, a1, a2, a3, a4);
+}
+
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {

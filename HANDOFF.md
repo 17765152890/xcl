@@ -1746,7 +1746,9 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
 - Open: memory the GPU does not see (~4.8 GB of the title's own `VirtualAlloc`, the pages in its 6 GB reservation:
   shaders get empty V#s); rect lists; Write64BitValueBottomOfPipeX gets addresses like 0xa (the newer list layout's
   shift probably starts below #72); the debug layer's Map of a DEFAULT-heap resource and a CopyResource source in
-  UAV state; queue #35, list #131 / #132 and allocator #9 are stubs (#9 registers the title's command memory callback);
+  UAV state; queue #35 (ExecuteCommandListsX), queue #31 extension, list #75 / #126 / #131 / #132 / #142 extensions,
+  allocator #9 (registers title command memory callback), and XGTextureAddressComputer::#10 (GetResourceTiling: total tiles,
+  packed mip info, 64KB tile shapes, and per-subresource tilings for streamed textures) are implemented;
   MSAA layouts. With ~21 GB taken by other programs, 1 - 2 GB of commit stays free during a run.
 - Loading (later): it shows 2 frames and then loads for minutes – ~3 500 shaders, 2 076 of them compute (13 M RDNA2
   instructions, 611 programs over 10 000). Shader dumps (and a second translation of each) are now only made with
@@ -1755,10 +1757,12 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   compiles one program at a time (`wait_for_memory`: under 6 GB of commit free; ~11 GB of the system's commit is the
   kernel's and drivers'), so the caches are filled without the title: `xcl shaders <shaders.rpf> --precompile --only cs`
   (compute programs through `pso::console_to_dxil_in`, the title's path: both caches).
-- Then at ~183 s: 5 mesh pipelines with an "AS" subobject fail and the title writes to address 0. The AS slot (24)
-  holds an MS container (`MSNC_VS_TransformUnlit_*`, NGG) – the console's subobject numbering around AS / MS is to be
-  checked (the message now lists the stream's subobject types and both hashes); translation failures are each logged
-  once (the first five hid this one).
+- Then at ~183 s: 5 mesh pipelines with an "AS" subobject previously failed and the title wrote to address 0.
+  Resolved: Console Scarlett GDK assigns slot 23 to AS and slot 24 to MS (vs PC D3D12 which assigns slot 24 to AS and
+  slot 25 to MS). The subobject parser in `real.rs` and `null.rs` now inspects the shader container (`sh.stage == "MS"`
+  or NGG hardware stage 7) to disambiguate slot 24 between MS and AS: console slot 24 MS containers (`MSNC_VS_TransformUnlit_*`)
+  are routed directly to mesh pipeline translation, and `fallback_stream` rewrites slot 24 to PC slot 25 so the PC
+  driver receives a valid SM 6.5 mesh stream.
 - Then: 30 fps (1 449 frames in 60 s), image black. Why it showed 2 frames: its present thread waits on frame event
   type 2, scheduled at offset 0 like the origin; the clock picked one event per deadline (`min_by_key`: the
   origin) – now every type due at a deadline fires (`frame.rs`). On the way: queue #35 of the newer layout is

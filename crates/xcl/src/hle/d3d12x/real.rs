@@ -749,6 +749,7 @@ fn console_extensions(kind: Kind) -> Option<usize> {
         Kind::Device => Some(44),
         Kind::CommandList => Some(60),
         Kind::DmaList => Some(15),
+        Kind::CommandAllocator => Some(9),
         _ => None,
     }
 }
@@ -831,6 +832,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
+        Kind::CommandAllocator => vec![(9, alloc_register_custom_allocator_x as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -892,6 +894,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (70, l::write64_bottom_x as usize),
                 (71, l::wait32_x as usize),
                 (72, l::wait64_x as usize),
+                (75, l::cmd_list_75_x as usize),
                 (78, l::dispatch_x as usize),
                 (81, l::draw_indexed_x as usize),
                 (84, l::copy_resource_flags_x as usize),
@@ -901,6 +904,10 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                (126, l::cmd_list_126_x as usize),
+                (131, l::cmd_list_131_x as usize),
+                (132, l::cmd_list_132_x as usize),
+                (142, l::cmd_list_142_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -3374,7 +3381,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         let at = off + if palign == 8 { 8 } else { 4 };
         let word = |buf: &[u8], k: usize| u64::from_le_bytes(buf[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
         match ty {
-            1..=6 | 24 | 25 => {
+            1..=6 | 23..=25 => {
                 let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
                 if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
                     blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
@@ -3707,6 +3714,28 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// Whether shader bytecode represents a Mesh Shader (console NGG/MS or PC DXIL MS).
+pub(super) fn is_mesh_shader(blob: &[u8]) -> bool {
+    if let Some(sh) = crate::gpu::xbox::parse(blob) {
+        sh.stage == "MS" || sh.fssm.iter().any(|f| f.stages.iter().any(|s| s.hw == 7))
+    } else if let Some(psv) = crate::gpu::dxbc::psv(blob) {
+        psv.kind == Some(13) || psv.ms_topology != 0 || psv.ms_max_vertices > 0
+    } else {
+        false
+    }
+}
+
+/// Whether shader bytecode represents an Amplification / Task Shader (console AS or PC DXIL AS).
+pub(super) fn is_as_shader(blob: &[u8]) -> bool {
+    if let Some(sh) = crate::gpu::xbox::parse(blob) {
+        sh.stage == "AS"
+    } else if let Some(psv) = crate::gpu::dxbc::psv(blob) {
+        psv.kind == Some(14)
+    } else {
+        false
+    }
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -3719,23 +3748,42 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
-    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
+    let s23 = subs.iter().find(|s| s.0 == 23).and_then(|s| payload_shader(s.1));
+    let s24 = subs.iter().find(|s| s.0 == 24).and_then(|s| payload_shader(s.1));
+    let s25 = subs.iter().find(|s| s.0 == 25).and_then(|s| payload_shader(s.1));
+
+    // Console Scarlett GDK: slot 23 = AS, slot 24 = MS.
+    // PC Direct3D 12:      slot 24 = AS, slot 25 = MS.
+    // A console MS container in slot 24 and no MS subobject in slot 25 (a retail game's minimap
     // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
     // from then on (a black screen every run); refused, it goes on to its menus. What it
     // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
+    if let (None, Some(code24)) = (s25, s24) {
+        if is_mesh_shader(code24) {
+            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(code24)));
             return Some(E_INVALIDARG);
         }
     }
-    let ms = ms_slot?;
+
+    let (ms, a) = if let Some(code24) = s24 {
+        if is_mesh_shader(code24) {
+            // Console layout: slot 24 is MS; AS can be in slot 23 or 25
+            let as_shader = s23.or(s25).filter(|&code| is_as_shader(code));
+            (Some(code24), as_shader)
+        } else {
+            // PC layout: slot 24 is AS, slot 25 is MS
+            (s25, Some(code24))
+        }
+    } else {
+        // Slot 24 absent; PC layout with MS in slot 25
+        (s25, s23.filter(|&code| is_as_shader(code)))
+    };
+
+    let ms = ms?;
     if !is_console(ms) {
         return None;
     }
-    if let Some(a) = as_slot {
+    if let Some(a) = a {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
         note_translation_error(format!(
             "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
@@ -3765,7 +3813,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [0, 2, 19, 23, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -3864,8 +3912,19 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let subs = stream_subobjects(&buf)?;
+    let mesh = subs.iter().any(|s| {
+        if s.0 == 25 {
+            true
+        } else if s.0 == 24 {
+            payload_shader(s.1).is_some_and(is_mesh_shader)
+        } else {
+            false
+        }
+    });
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
+    let is_console_ms = subs.iter().any(|s| s.0 == 24 && payload_shader(s.1).is_some_and(is_mesh_shader));
+    let has_s25 = subs.iter().any(|s| s.0 == 25);
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -3883,8 +3942,29 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
-            3 | 4 | 5 | 24 => put(&mut buf, &[]),
-            25 => put(&mut buf, &dm?.0),
+            3 | 4 | 5 | 23 => put(&mut buf, &[]),
+            24 => {
+                if is_console_ms && !has_s25 {
+                    // Console MS in slot 24: rewrite subobject type to 25 (PC MS)
+                    buf[off..off + 4].copy_from_slice(&25u32.to_le_bytes());
+                    put(&mut buf, &dm.as_ref()?.0);
+                } else if is_console_ms && has_s25 {
+                    // Both 24 and 25 present: 24 is console MS, rewrite to 25 (PC MS)
+                    buf[off..off + 4].copy_from_slice(&25u32.to_le_bytes());
+                    put(&mut buf, &dm.as_ref()?.0);
+                } else {
+                    put(&mut buf, &[]);
+                }
+            }
+            25 => {
+                if is_console_ms {
+                    // Slot 25 was console AS; rewrite to 24 (PC AS) and empty it
+                    buf[off..off + 4].copy_from_slice(&24u32.to_le_bytes());
+                    put(&mut buf, &[]);
+                } else {
+                    put(&mut buf, &dm?.0);
+                }
+            }
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}
@@ -4273,6 +4353,16 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     hr
 }
 
+/// command allocator #9: Registers the title's custom command memory allocator callback.
+unsafe extern "system" fn alloc_register_custom_allocator_x(this: *mut c_void, callback: usize, ctx: usize) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: ID3D12CommandAllocator::#9 RegisterCustomAllocator(allocator {:p}, callback {:#x}, ctx {:#x})", this, callback, ctx);
+    });
+    let _ = (this, callback, ctx);
+    S_OK
+}
+
 // ---------------------------------------------------------------------------------------
 // command queue layouts
 // ---------------------------------------------------------------------------------------
@@ -4339,6 +4429,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
     }
+    if slot == 31 && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue extension #31 called)");
+    }
     let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
     if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
         QUEUE_OLDER.store(true, Ordering::Release);
@@ -4384,6 +4477,13 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        // the newer layout's #31 (older 29): queue extension
+        29 if shifted => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_info!("D3D12.X: queue #31 extension (a1: {a1:#x}, a2: {a2:#x}, a3: {a3:#x}, a4: {a4:#x})"));
+            let _ = (a1, a2, a3, a4);
+            0
+        }
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -4819,6 +4919,38 @@ mod readback_routing_tests {
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(raw).add(2));
             assert_eq!(release(raw), 0);
             assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
+        }
+    }
+
+    #[test]
+    fn console_ms_slot_24_stream_fallback() {
+        let ms_blob = crate::gpu::xbox::tests::sample(13, &[]);
+        assert!(is_mesh_shader(&ms_blob), "sample(13) must be recognized as MS");
+        assert!(!is_as_shader(&ms_blob), "MS must not be recognized as AS");
+
+        let as_blob = crate::gpu::xbox::tests::sample(14, &[]);
+        assert!(is_as_shader(&as_blob), "sample(14) must be recognized as AS");
+        assert!(!is_mesh_shader(&as_blob), "AS must not be recognized as MS");
+
+        // Build a pipeline stream buffer with slot 24 (Console MS).
+        // Subobject format: [ty: u32, pad: u32, ptr: u64, len: u64] (24 bytes)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&24u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // padding for 8-byte align
+        buf.extend_from_slice(&(ms_blob.as_ptr() as u64).to_le_bytes());
+        buf.extend_from_slice(&(ms_blob.len() as u64).to_le_bytes());
+
+        let desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
+        unsafe {
+            let res = fallback_stream(desc.as_ptr() as *const u8);
+            assert!(res.is_some(), "fallback_stream must succeed for console MS stream");
+            let (rewritten, _) = res.unwrap();
+            let subs = stream_subobjects(&rewritten).expect("rewritten stream must be valid");
+            assert_eq!(subs.len(), 1);
+            assert_eq!(subs[0].0, 25, "slot 24 console MS must be rewritten to PC slot 25");
+            let s25_shader = payload_shader(subs[0].1).expect("payload shader exists");
+            let dm = dummy_mesh().expect("dummy mesh exists");
+            assert_eq!(s25_shader, &dm.0[..], "slot 25 must receive dummy mesh bytecode");
         }
     }
 }
