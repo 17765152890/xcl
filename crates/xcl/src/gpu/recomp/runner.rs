@@ -114,7 +114,8 @@ fn init() -> Result<Gpu, String> {
     }
 }
 
-/// Root signature: u0 io, u1 res, u2 mem as root UAVs; CBV/SRV/UAV and sampler heaps
+/// Root signature: u0 io, u1 res, u2..u5 memory, and optional u6 dispatcher scratch as
+/// root UAVs; CBV/SRV/UAV and sampler heaps
 /// directly indexed (SM 6.6 `ResourceDescriptorHeap`); `graphics` adds the input assembler.
 fn root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignature, String> {
     super::pso::abi_root_signature(dev, graphics)
@@ -911,6 +912,61 @@ pub fn mesh_draw_split(
     size: u32,
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    let (pixels, records, _) =
+        mesh_draw_split_impl(cs, ms, ps, groups, split, record_dwords, sgprs, mem, size, clear, None, None)?;
+    Ok((pixels, records))
+}
+
+/// Exercise the dormant two-pass command recorder against the live synthetic runner.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_split_recorded(
+    cs: &[u8], ms: &[u8], ps: &[u8], groups: u32, split: u32,
+    record: super::MsInterface, sgprs: &[u32], mem: &[u32], size: u32, clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    let record_dwords = record.record_dwords();
+    let (pixels, records, _) = mesh_draw_split_impl(
+        cs, ms, ps, groups, split, record_dwords, sgprs, mem, size, clear, None, Some(record),
+    )?;
+    Ok((pixels, records))
+}
+
+/// Synthetic logical-wave dispatcher path. Native two-pass callers continue to use
+/// `mesh_draw_split` and neither allocate nor bind the reserved scratch UAV.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_with_dispatch_scratch(
+    cs: &[u8],
+    ms: &[u8],
+    ps: &[u8],
+    groups: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+    scratch: super::mesh_dispatch::ScratchLayout,
+) -> Result<(Vec<[f32; 4]>, Vec<u32>, Vec<u32>), String> {
+    scratch.validate_for_groups(groups).map_err(str::to_owned)?;
+    let (pixels, records, scratch) =
+        mesh_draw_split_impl(cs, ms, ps, groups, 1, record_dwords, sgprs, mem, size, clear, Some(scratch), None)?;
+    Ok((pixels, records, scratch.expect("scratch was requested")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mesh_draw_split_impl(
+    cs: &[u8],
+    ms: &[u8],
+    ps: &[u8],
+    groups: u32,
+    split: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+    scratch: Option<super::mesh_dispatch::ScratchLayout>,
+    recorded: Option<super::MsInterface>,
+) -> Result<(Vec<[f32; 4]>, Vec<u32>, Option<Vec<u32>>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
@@ -982,6 +1038,7 @@ pub fn mesh_draw_split(
         let mem_bytes = (mem_len * 4) as u64;
         let res_len = record_dwords * groups as usize;
         let res_bytes = (res_len * 4) as u64;
+        let scratch_bytes = scratch.map_or(0, |layout| layout.total_bytes as u64);
         let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -993,48 +1050,91 @@ pub fn mesh_draw_split(
         let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let scratch_buf = scratch
+            .map(|_| buffer(dev, scratch_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true))
+            .transpose()?;
         let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0u64;
         dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
-        let readback = buffer(dev, total + res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+        let readback_bytes = total
+            .checked_add(res_bytes)
+            .and_then(|bytes| bytes.checked_add(scratch_bytes))
+            .ok_or("mesh readback size overflow")?;
+        let readback = buffer(dev, readback_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
-        list.ResourceBarrier(&[
+        let mut upload_barriers = vec![
             transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        ];
+        if let Some(scratch_buf) = &scratch_buf {
+            upload_barriers.push(transition(scratch_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        }
+        list.ResourceBarrier(&upload_barriers);
         // pass 1: the console program as a compute shader
         let _bound = bind_resources(dev, &list, &[], &[])?;
-        list.SetComputeRootSignature(&gpu.rs);
-        list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
-        list.Dispatch(groups, 1, 1);
-        list.ResourceBarrier(&[uav_barrier(&res_buf)]);
-        // pass 2: rasterise the records
-        list.SetPipelineState(&mpso);
-        list.SetGraphicsRootSignature(&gpu.rs);
-        list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
-        list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        if recorded.is_none() {
+            list.SetComputeRootSignature(&gpu.rs);
+            list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        }
+        if let Some(scratch_buf) = &scratch_buf {
+            list.SetComputeRootUnorderedAccessView(
+                super::mesh_dispatch::SCRATCH_UAV_REGISTER,
+                scratch_buf.GetGPUVirtualAddress(),
+            );
+        }
         list.OMSetRenderTargets(1, Some(&rtv), false, None);
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
-        list6.DispatchMesh(groups * split, 1, 1);
-        list.ResourceBarrier(&[
+        if let Some(ref record) = recorded {
+            let plan = super::pso::TwoPassPlan::checked([groups, 1, 1], record_dwords as u32, split)?;
+            let views = [
+                io_buf.GetGPUVirtualAddress(), res_buf.GetGPUVirtualAddress(), mem_buf.GetGPUVirtualAddress(),
+                io_buf.GetGPUVirtualAddress(), io_buf.GetGPUVirtualAddress(), io_buf.GetGPUVirtualAddress(),
+            ];
+            crate::hle::d3d12x::bind::record_two_pass_for_test(
+                &list, &cpso, &gpu.rs, &mpso, &gpu.rs, record.clone(), split, &plan, views,
+            )?;
+        } else {
+            list.Dispatch(groups, 1, 1);
+            list.ResourceBarrier(&[uav_barrier(&res_buf)]);
+            list.SetPipelineState(&mpso);
+            list.SetGraphicsRootSignature(&gpu.rs);
+            list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+            list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+            list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        }
+        // pass 2: rasterise the records
+        if recorded.is_none() {
+            let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
+            list6.DispatchMesh(groups * split, 1, 1);
+        }
+        let mut readback_barriers = vec![
             transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        ]);
+        ];
+        if let Some(scratch_buf) = &scratch_buf {
+            readback_barriers.push(transition(
+                scratch_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ));
+        }
+        list.ResourceBarrier(&readback_barriers);
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
+        if let Some(scratch_buf) = &scratch_buf {
+            list.CopyBufferRegion(&readback, total + res_bytes, scratch_buf, 0, scratch_bytes);
+        }
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
@@ -1057,8 +1157,15 @@ pub fn mesh_draw_split(
             }
         }
         let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec();
+        let scratch_words = scratch.map(|_| {
+            std::slice::from_raw_parts(
+                (q as *const u8).add((total + res_bytes) as usize) as *const u32,
+                scratch_bytes as usize / 4,
+            )
+            .to_vec()
+        });
         readback.Unmap(0, None);
-        Ok((px, recs))
+        Ok((px, recs, scratch_words))
     }
 }
 

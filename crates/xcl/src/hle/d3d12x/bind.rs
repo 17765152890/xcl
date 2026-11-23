@@ -33,6 +33,21 @@ struct State {
     arena: crate::gpu::uma::Arena,
 }
 
+/// ABI allocations shared by both halves of a translated two-pass pipeline. The underlying
+/// unified-memory blocks remain owned by the command-list recording and are released only
+/// when its allocator is reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AbiBindings {
+    views: [u64; 6],
+    pub result_bytes: usize,
+}
+
+impl AbiBindings {
+    pub fn result_va(&self) -> u64 {
+        self.views[1]
+    }
+}
+
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
@@ -661,41 +676,86 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    let bindings = prepare_abi(this, gfx, DEFAULT_RESULT_BYTES)?;
+    bind_prepared_abi(list, pso, gfx, &bindings)
+}
+
+const DEFAULT_RESULT_BYTES: usize = 256;
+
+/// Allocate one ABI record for a checked two-pass plan. Empty dispatches allocate nothing;
+/// callers may bind the returned record first as compute and then as graphics without
+/// allocating or changing its result buffer.
+#[allow(dead_code)] // consumed by the explicit two-pass recorder once its command contract exists
+pub(super) unsafe fn prepare_two_pass_abi(this: *mut c_void, plan: &crate::gpu::recomp::pso::TwoPassPlan) -> Result<Option<AbiBindings>, String> {
+    if plan.total_groups == 0 {
+        return Ok(None);
+    }
+    if plan.result_bytes == 0 {
+        return Err("two-pass result buffer is empty".into());
+    }
+    prepare_abi(this, true, plan.result_bytes).map(Some)
+}
+
+unsafe fn prepare_abi(this: *mut c_void, gfx: bool, result_bytes: usize) -> Result<AbiBindings, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
-    // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
+    // 32-bit console addresses: window 0; small pieces share the command list's arena,
+    // while caller-sized two-pass results get a dedicated block when necessary.
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma))
+            .ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
-    let table_at = copy(&args[inline..])?;
-    let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data(l, &args, table_at as u64),
-        None => vec![table_at as u32, (table_at >> 32) as u32],
+    let zeroed = |bytes: usize| -> Result<usize, String> {
+        if bytes == 0 { return Err("ABI allocation is empty".into()); }
+        let p = with(this, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma))
+            .ok_or("unified memory is full")?;
+        std::ptr::write_bytes(p, 0, bytes);
+        Ok(p as usize)
     };
-    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
+    let built = (|| -> Result<(usize, usize), String> {
+        let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
+        let table_at = copy(&args[inline..])?;
+        let mut io = match layout.as_ref() {
+            Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
+            Some(l) => console_list::user_data(l, &args, table_at as u64),
+            None => vec![table_at as u32, (table_at >> 32) as u32],
+        };
+        io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+        let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+        let res_at = zeroed(result_bytes)?;
+        Ok((io_at, res_at))
+    })();
+    let (io_at, res_at) = built?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
+    let views = abi_views(va(io_at), va(res_at), &windows)?;
+    Ok(AbiBindings { views, result_bytes })
+}
+
+fn abi_views(io: u64, result: u64, windows: &[u64]) -> Result<[u64; 6], String> {
+    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    Ok([io, result, windows.first().copied().unwrap_or(first), windows.get(1).copied().unwrap_or(first), windows.get(2).copied().unwrap_or(first), windows.get(3).copied().unwrap_or(first)])
+}
+
+/// Bind a previously allocated ABI record. Reusing `bindings` is what keeps the result UAV
+/// identical across the compute and mesh passes.
+pub(super) unsafe fn bind_prepared_abi(list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, bindings: &AbiBindings) -> Result<(), String> {
     // a pipeline still being built in the background is waited for
     let real = super::pso_async::resolve_wait(pso);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
+        for (k, &v) in bindings.views.iter().enumerate() {
             list.SetGraphicsRootUnorderedAccessView(k as u32, v);
         }
     } else {
         list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
+        for (k, &v) in bindings.views.iter().enumerate() {
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
@@ -703,4 +763,220 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TwoPassCommand {
+    BindCompute { pso: usize, root: usize, result_va: u64 },
+    Dispatch([u32; 3]),
+    UavBarrier { result_va: u64 },
+    BindMesh { pso: usize, root: usize, result_va: u64 },
+    DispatchMesh(u32),
+}
+
+fn two_pass_commands(
+    metadata: Option<&super::real::TwoPassPso>,
+    mesh_pso: usize,
+    plan: &crate::gpu::recomp::pso::TwoPassPlan,
+    bindings: Option<&AbiBindings>,
+    command_list6: bool,
+) -> Result<Vec<TwoPassCommand>, String> {
+    if plan.total_groups == 0 {
+        if plan.result_bytes != 0 || plan.mesh_groups != 0 || !plan.dispatch_groups.contains(&0) {
+            return Err("inconsistent empty two-pass plan".into());
+        }
+        return Ok(Vec::new());
+    }
+    if !command_list6 { return Err("two-pass recording requires ID3D12GraphicsCommandList6".into()); }
+    let metadata = metadata.ok_or("two-pass pipeline metadata is missing")?;
+    let bindings = bindings.ok_or("two-pass ABI bindings are missing")?;
+    if metadata.compute == 0 || metadata.compute_rs == 0 || metadata.mesh_rs == 0 || mesh_pso == 0 {
+        return Err("two-pass pipeline metadata contains a null object".into());
+    }
+    if bindings.result_va() == 0 || bindings.result_bytes != plan.result_bytes {
+        return Err("two-pass ABI bindings do not match the plan".into());
+    }
+    let record_dwords = u32::try_from(metadata.record.record_dwords()).map_err(|_| "two-pass record size exceeds u32")?;
+    let checked = crate::gpu::recomp::pso::TwoPassPlan::checked(plan.dispatch_groups, record_dwords, metadata.mesh_groups_per_record)?;
+    if checked != *plan { return Err("two-pass plan does not match pipeline metadata".into()); }
+    let va = bindings.result_va();
+    Ok(vec![
+        TwoPassCommand::BindCompute { pso: metadata.compute, root: metadata.compute_rs, result_va: va },
+        TwoPassCommand::Dispatch(plan.dispatch_groups),
+        TwoPassCommand::UavBarrier { result_va: va },
+        TwoPassCommand::BindMesh { pso: mesh_pso, root: metadata.mesh_rs, result_va: va },
+        TwoPassCommand::DispatchMesh(plan.mesh_groups),
+    ])
+}
+
+#[allow(dead_code)] // used only when an explicit two-pass caller is wired in
+unsafe fn bind_prepared_abi_with_root(
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    root: usize,
+    gfx: bool,
+    bindings: &AbiBindings,
+) -> Result<(), String> {
+    let root = root as *mut c_void;
+    let root = ID3D12RootSignature::from_raw_borrowed(&root).ok_or("two-pass root signature")?;
+    if gfx {
+        list.SetGraphicsRootSignature(root);
+        for (k, &v) in bindings.views.iter().enumerate() { list.SetGraphicsRootUnorderedAccessView(k as u32, v); }
+    } else {
+        list.SetComputeRootSignature(root);
+        for (k, &v) in bindings.views.iter().enumerate() { list.SetComputeRootUnorderedAccessView(k as u32, v); }
+    }
+    let pso = super::pso_async::resolve_wait(pso) as *mut c_void;
+    let pso = ID3D12PipelineState::from_raw_borrowed(&pso).ok_or("two-pass pipeline")?;
+    list.SetPipelineState(pso);
+    Ok(())
+}
+
+/// Record an explicitly planned two-pass submission. This is intentionally dormant: draw
+/// interception does not call it, and callers must provide both the plan and prepared ABI.
+#[allow(dead_code)] // deliberately dormant; ordinary draw interception must not call this
+pub(super) unsafe fn record_two_pass(
+    list: &ID3D12GraphicsCommandList,
+    metadata: Option<&super::real::TwoPassPso>,
+    mesh_pso: usize,
+    plan: &crate::gpu::recomp::pso::TwoPassPlan,
+    bindings: Option<&AbiBindings>,
+) -> Result<bool, String> {
+    if plan.total_groups == 0 {
+        two_pass_commands(metadata, mesh_pso, plan, bindings, false)?;
+        return Ok(false);
+    }
+    // Cast before validating the trace so failure cannot leave a partially recorded pass.
+    let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(|_| "two-pass recording requires ID3D12GraphicsCommandList6")?;
+    let commands = two_pass_commands(metadata, mesh_pso, plan, bindings, true)?;
+    let bindings = bindings.unwrap();
+    for command in commands {
+        match command {
+            TwoPassCommand::BindCompute { pso, root, .. } => bind_prepared_abi_with_root(list, pso, root, false, bindings)?,
+            TwoPassCommand::Dispatch([x, y, z]) => list.Dispatch(x, y, z),
+            TwoPassCommand::UavBarrier { .. } => list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+            }]),
+            TwoPassCommand::BindMesh { pso, root, .. } => bind_prepared_abi_with_root(list, pso, root, true, bindings)?,
+            TwoPassCommand::DispatchMesh(groups) => list6.DispatchMesh(groups, 1, 1),
+        }
+    }
+    Ok(true)
+}
+
+/// Test-only bridge which keeps the live GPU runner on the exact dormant recording path.
+/// The borrowed D3D12 objects remain owned by the runner.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) unsafe fn record_two_pass_for_test(
+    list: &ID3D12GraphicsCommandList,
+    compute: &ID3D12PipelineState,
+    compute_rs: &ID3D12RootSignature,
+    mesh: &ID3D12PipelineState,
+    mesh_rs: &ID3D12RootSignature,
+    record: crate::gpu::recomp::MsInterface,
+    mesh_groups_per_record: u32,
+    plan: &crate::gpu::recomp::pso::TwoPassPlan,
+    views: [u64; 6],
+) -> Result<bool, String> {
+    let metadata = std::mem::ManuallyDrop::new(super::real::TwoPassPso {
+        compute: compute.as_raw() as usize,
+        compute_rs: compute_rs.as_raw() as usize,
+        mesh_rs: mesh_rs.as_raw() as usize,
+        record,
+        mesh_groups_per_record,
+        kind: "test",
+    });
+    let bindings = AbiBindings { views, result_bytes: plan.result_bytes };
+    record_two_pass(list, Some(&metadata), mesh.as_raw() as usize, plan, Some(&bindings))
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    #[test]
+    fn abi_views_preserve_available_windows_and_repeat_the_first() {
+        assert_eq!(abi_views(11, 22, &[100]).unwrap(), [11, 22, 100, 100, 100, 100]);
+        assert_eq!(abi_views(11, 22, &[100, 200, 300]).unwrap(), [11, 22, 100, 200, 300, 100]);
+        assert!(abi_views(11, 22, &[]).is_err());
+    }
+
+    #[test]
+    fn prepared_bindings_reuse_the_exact_result_view() {
+        let bindings = AbiBindings { views: [11, 22, 100, 200, 300, 400], result_bytes: 4096 };
+        let compute = bindings;
+        let graphics = bindings;
+        assert_eq!(compute.result_va(), 22);
+        assert_eq!(graphics.result_va(), compute.result_va());
+        assert_eq!(graphics.result_bytes, 4096);
+        assert_eq!(DEFAULT_RESULT_BYTES, 256);
+    }
+
+    #[test]
+    fn empty_two_pass_plan_allocates_nothing_without_requiring_uma() {
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked([u32::MAX, 0, u32::MAX], 16, 2).unwrap();
+        let prepared = unsafe { prepare_two_pass_abi(std::ptr::null_mut(), &plan) }.unwrap();
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn reset_transfers_all_prepared_blocks_to_the_previous_allocator() {
+        let list = 0x1234usize as *mut c_void;
+        with(list, |state| { state.allocator = 7; state.uma = vec![11, 22, 33]; });
+        reset(list, 8);
+        assert_eq!(super::super::console_list::take_pending_for_test(7), vec![11, 22, 33]);
+        with(list, |state| { assert_eq!(state.allocator, 8); assert!(state.uma.is_empty()); });
+        STATES.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+    }
+
+    fn two_pass_metadata() -> std::mem::ManuallyDrop<super::super::real::TwoPassPso> {
+        std::mem::ManuallyDrop::new(super::super::real::TwoPassPso {
+            compute: 10,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        })
+    }
+
+    #[test]
+    fn two_pass_trace_has_exact_order_and_one_result_view() {
+        let metadata = two_pass_metadata();
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked([2, 3, 1], 4, 2).unwrap();
+        let bindings = AbiBindings { views: [11, 22, 100, 200, 300, 400], result_bytes: plan.result_bytes };
+        assert_eq!(two_pass_commands(Some(&metadata), 40, &plan, Some(&bindings), true).unwrap(), vec![
+            TwoPassCommand::BindCompute { pso: 10, root: 20, result_va: 22 },
+            TwoPassCommand::Dispatch([2, 3, 1]),
+            TwoPassCommand::UavBarrier { result_va: 22 },
+            TwoPassCommand::BindMesh { pso: 40, root: 30, result_va: 22 },
+            TwoPassCommand::DispatchMesh(12),
+        ]);
+    }
+
+    #[test]
+    fn two_pass_trace_fails_closed_before_recording() {
+        let metadata = two_pass_metadata();
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked([1, 1, 1], 4, 2).unwrap();
+        let bindings = AbiBindings { views: [11, 22, 100, 200, 300, 400], result_bytes: plan.result_bytes };
+        assert!(two_pass_commands(None, 40, &plan, Some(&bindings), true).is_err());
+        assert!(two_pass_commands(Some(&metadata), 40, &plan, None, true).is_err());
+        assert!(two_pass_commands(Some(&metadata), 40, &plan, Some(&bindings), false).is_err());
+        assert!(two_pass_commands(Some(&metadata), 0, &plan, Some(&bindings), true).is_err());
+        let wrong_size = AbiBindings { result_bytes: plan.result_bytes + 4, ..bindings };
+        assert!(two_pass_commands(Some(&metadata), 40, &plan, Some(&wrong_size), true).is_err());
+        let wrong_plan = crate::gpu::recomp::pso::TwoPassPlan::checked([1, 1, 1], 8, 2).unwrap();
+        let wrong_bindings = AbiBindings { result_bytes: wrong_plan.result_bytes, ..bindings };
+        assert!(two_pass_commands(Some(&metadata), 40, &wrong_plan, Some(&wrong_bindings), true).is_err());
+    }
+
+    #[test]
+    fn empty_two_pass_trace_is_a_noop_and_overflow_is_rejected() {
+        let empty = crate::gpu::recomp::pso::TwoPassPlan::checked([u32::MAX, 0, u32::MAX], 4, 2).unwrap();
+        assert!(two_pass_commands(None, 0, &empty, None, false).unwrap().is_empty());
+        assert!(crate::gpu::recomp::pso::TwoPassPlan::checked([u32::MAX, 2, 1], 4, 2).is_err());
+    }
 }

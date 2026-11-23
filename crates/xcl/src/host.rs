@@ -101,7 +101,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::eh::start_probes();
     HOST_MODE.store(true, Ordering::Release);
 
-    let main = match crate::loader::load_main(&boot.exe_path) {
+    let main = match crate::vfs_hooks::host_io(|| crate::loader::load_main(&boot.exe_path)) {
         Ok(m) => m,
         Err(e) => {
             crate::xlog_error!("loading the game failed: {e}");

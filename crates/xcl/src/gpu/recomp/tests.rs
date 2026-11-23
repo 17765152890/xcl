@@ -149,6 +149,28 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
 }
 
 #[test]
+fn f16_interpolation_family_in_pixel_mode() {
+    let code = prog(&[
+        ("V_INTERP_P1LL_F16", "ENC_VOP3", &[("VDST", 2), ("SRC0", 0), ("SRC1", V)], None),
+        ("V_INTERP_P1LV_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", 0), ("SRC1", V + 1)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 0), ("SRC1", V + 1), ("OP_SEL", 8)], None),
+    ]);
+    let ps = super::PsInterface {
+        inputs: vec![el("COLOR", 0, 0, 3, 0, 0xF)],
+        outputs: vec![],
+        input_ena: 0,
+        attrs: None,
+    };
+    let t = translate(&code, &Options { mode: Mode::Pixel(ps), ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert_eq!(t.hlsl.matches("first half of the interpolation").count(), 2, "{}", t.hlsl);
+    assert!(t.hlsl.contains("v4 & 0xFFFFu") && t.hlsl.contains("f32tof16((float)xi.a0[0])"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[
         ("S_BFE_U64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 4), ("SSRC1", 8)], None),
@@ -266,6 +288,46 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
     assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn vector_relative_source_destination_moves() {
+    let code = prog(&[
+        ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 10)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 12)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 14)], None),
+        ("V_SWAP_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 9)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("switch ((m0 & 0x3FFu))") && t.hlsl.contains("switch (((m0 >> 16) & 0x3FFu))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("v8 = t") && t.hlsl.contains("v9 = t"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_vector_relative_source_destination_moves() {
+    if !gpu_ready() { return; }
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 129)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 20)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0x0003_0002)),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 40), ("SRC0", V + 30)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 50), ("SRC0", V + 43)], None),
+    ]);
+    let mut st = KernelState::default();
+    for regs in &mut st.vgpr {
+        regs[21] = 0x2121;
+        regs[32] = 0x3232;
+        regs[43] = 0xDEAD;
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for (lane, regs) in r.vgpr.iter().enumerate() {
+        assert_eq!(regs[11], 0x2121, "lane {lane}: shared M0 read/write offset");
+        assert_eq!(regs[43], 0x3232, "lane {lane}: split M0 destination offset");
     }
 }
 
@@ -1765,6 +1827,17 @@ fn gpu_mesh_mode_two_passes() {
     assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "group 1 triangle (right)");
     assert_eq!(at(29, 3), [-1.0; 4], "outside both triangles");
 
+    // The dormant recorder must produce the same records and pixels while sharing the
+    // result GPU VA between its compute and mesh bindings. Cover one and several groups.
+    for groups in [1, 2] {
+        let expected = runner::mesh_draw(&cs, &msb, &ps, groups, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+        let recorded = runner::mesh_draw_split_recorded(
+            &cs, &msb, &ps, groups, 1, ms.clone(), &sg, &mem, 32, [-1.0; 4],
+        ).unwrap();
+        assert_eq!(recorded.1, expected.1, "recorded result buffer for {groups} groups");
+        assert_eq!(recorded.0, expected.0, "recorded pixels for {groups} groups");
+    }
+
     // the same records through a pass-through for a pixel shader with 16 inputs: over the
     // mesh output limit (17 · 16 B · 128 vertices), so 4 mesh groups per record, each a run
     // of triangles with their own vertex copies; inputs the program does not write read 0
@@ -1777,6 +1850,11 @@ fn gpu_mesh_mode_two_passes() {
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
     let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
+    let recorded16 = runner::mesh_draw_split_recorded(
+        &cs, &msb16, &ps16, 2, split, ms.clone(), &sg, &mem, 32, [-1.0; 4],
+    ).unwrap();
+    assert_eq!(recorded16.1, rec, "recorded split result buffer");
+    assert_eq!(recorded16.0, px16, "recorded split pixels");
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
@@ -3861,12 +3939,23 @@ fn isa_coverage() {
             "ENC_MIMG" => &[("DMASK", 1)],
             "VOP3_SDST_ENC" => &[("SDST", 106)],
             _ if inst.name == "V_SWAPREL_B32" => &[("SRC0", V)],
+            _ if matches!(inst.name, "V_MOVRELS_B32" | "V_MOVRELSD_B32" | "V_MOVRELSD_2_B32" | "V_SWAP_B32") => &[("SRC0", V)],
+            _ if inst.name == "V_INTERP_MOV_F32" => &[("VSRC", 2)],
             _ => &[],
         };
         let Ok(mut code) = encode(inst.name, enc, fields, lit) else { continue };
         code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
         let ok = std::panic::catch_unwind(|| {
-            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None }))
+            try_mode(&code, Mode::Kernel)
+                || try_mode(
+                    &code,
+                    Mode::Pixel(super::PsInterface {
+                        inputs: vec![el("COLOR", 0, 0, 3, 0, 0xF)],
+                        outputs: vec![],
+                        input_ena: 0x7F,
+                        attrs: None,
+                    }),
+                )
         })
         .unwrap_or(false);
         let e = per_enc.entry(enc.trim_start_matches("ENC_")).or_default();
