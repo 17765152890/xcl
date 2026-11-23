@@ -9,8 +9,11 @@ production path disabled.
 
 The bounded, versioned structural JSONL sink exists as an explicit opt-in through
 `XCL_STRUCTURAL_TRACE`. It covers command-list lifecycle, draw, dispatch, and indirect-command
-events with pseudonymous identifiers, fixed categories, and strict caps. The offline admission
-validator does not exist yet, and the sink does not by itself enable production eligibility.
+events with pseudonymous identifiers, fixed categories, and strict caps. The offline validator is
+available through `xcl trace-validate <file> [--json]`; it checks the current schema and command-list
+lifecycle but does not by itself enable production eligibility. It does not validate shader or
+pipeline pairing, root layouts, descriptor or resource contracts, generated shader code, replay,
+canary behavior, or other admission gates not represented by the current structural schema.
 
 Current frame and shader tracing remains interactive diagnostic logging, not compliant evidence
 export. Those logs may contain raw addresses or bounded memory-derived diagnostics and must not be
@@ -145,7 +148,8 @@ mappings, resource layouts, or draw-to-dispatch conversion.
 3. If graphics initialization is reached, enable bounded frame tracing.
 4. Narrow later local captures to specific shaders and enforce a small event cap.
 5. Export only the sink's redacted structural JSONL plus separately reviewed aggregate results.
-6. Implement and run the offline validator against every admission gate.
+6. Run the offline validator, then separately review any admission gates not represented by the
+   current structural schema.
 7. Add a synthetic regression reproducing the observed contract.
 8. Enable only that exact verified contract behind a fail-closed predicate.
 
