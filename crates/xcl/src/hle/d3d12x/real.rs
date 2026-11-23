@@ -1833,6 +1833,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::Device => v.extend_from_slice(&[
             ("CreateCommandQueue", dev_create_command_queue as usize),
             ("CheckFeatureSupport", dev_check_feature_support as usize),
+            ("GetCustomHeapProperties", dev_get_custom_heap_properties as usize),
             ("CreateCommandAllocator", dev_create_command_allocator as usize),
             ("CreateGraphicsPipelineState", dev_create_graphics_pso as usize),
             ("CreateComputePipelineState", dev_create_compute_pso as usize),
@@ -2012,6 +2013,24 @@ unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
 /// CheckFeatureSupport(feature, data, size): console structures can be larger than the PC's
 /// (XDefiant: D3D12_OPTIONS with 0x40 bytes, 0x3C on the PC – and the title stops on the
 /// error). A size the PC refuses is retried with the PC's, the console's extra bytes zero.
+/// `GetCustomHeapProperties` (#26) returns a `D3D12_HEAP_PROPERTIES` through a hidden pointer:
+/// `(this, ret, nodeMask, heapType)`. A 2026 title calls the slot as a free function – the hidden
+/// pointer in rcx, the device in rdx (`GetCustomHeapProperties(device, nodeMask, heapType)`), so
+/// D3D12 took the stack for `this` and faulted. Both orders are answered; the device's own is
+/// what the title gets either way.
+unsafe extern "system" fn dev_get_custom_heap_properties(a0: usize, a1: usize, a2: usize, a3: usize) -> usize {
+    type F = unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> usize;
+    let device = device_raw() as usize;
+    let f: F = std::mem::transmute(orig_fn(device as *mut c_void, slot_of(device as *mut c_void, "GetCustomHeapProperties")));
+    if a0 != device && a1 == device && a0 != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_info!("D3D12.X: GetCustomHeapProperties called with the device as its first argument (a free-function call, the result pointer in rcx: nodeMask {a2:#x}, heap type {a3}) – answered as the device's"));
+        f(device as *mut c_void, a0, a2, a3);
+        return a0;
+    }
+    f(a0 as *mut c_void, a1, a2, a3)
+}
+
 unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
