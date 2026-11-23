@@ -2919,6 +2919,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     copy.VS = bytecode(&vs_dxil);
     copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    pc_topology_type(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
@@ -2928,7 +2929,14 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     }
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
-        note_translation_error(format!("the driver rejected the PSO with the translated shaders ({hr:#x})"));
+        note_translation_error(format!(
+            "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
+            copy.PrimitiveTopologyType.0,
+            copy.NumRenderTargets,
+            copy.DSVFormat.0,
+            !copy.HS.pShaderBytecode.is_null(),
+            !copy.GS.pShaderBytecode.is_null()
+        ));
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -3208,6 +3216,7 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     copy.StreamOutput = std::mem::zeroed();
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    pc_topology_type(&mut copy);
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     note_fallback("graphics PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
@@ -3567,6 +3576,15 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     Some((buf, [size, 0]))
 }
 
+/// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
+/// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists; UNDEFINED (a stream
+/// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
+fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
+        g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
+    }
+}
+
 enum StreamPipeline {
     Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>),
     Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>),
@@ -3693,6 +3711,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             _ => {}
         }
     }
+    pc_topology_type(&mut g);
     StreamPipeline::Graphics(Box::new(g))
 }
 
@@ -3946,7 +3965,9 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // SetPredicationBufferX, which dropped them – every texture stayed zero). From #85 on the
 // list's console methods sit two slots later (`NEWER_LIST_SLOTS`), and from #72 on as well: a retail game
 // calls Write64BitValueBottomOfPipeX at #72 and Wait64BitValueX at #74. Where the shift starts
-// below #72 is not known.
+// below #72 is not known. The newer layout's #139 is a Reset with one argument more (the same
+// title: (allocator, NULL, 0) on each list it takes from its pool before recording – as a stub
+// the list stayed closed, the debug layer saw every call on it refused, and Close failed).
 
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
@@ -3957,7 +3978,7 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 13] = [(72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
+const NEWER_LIST_SLOTS: [(usize, usize); 14] = [(72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
