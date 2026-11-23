@@ -21,6 +21,9 @@
 - Current verification: 619 library tests passed, 16 ignored, 0 failed; every workspace
   integration and end-to-end suite passed. The only build warning is a pre-existing unrelated
   standard-library deprecation.
+- An external NVIDIA wave32 run reported the pre-existing `V_FRACT_F32(+inf)` NaN edge failure.
+  Upstream PR #68 owns the exact compare/select fix and a dedicated live GPU regression; keep this
+  branch dependent on that change rather than duplicating the contributor's work.
 - `XCL_STRUCTURAL_TRACE=<output>` enables an optional bounded structural JSONL trace for
   command-list lifecycle, draw, dispatch, and indirect-command evidence. It uses pseudonymous
   identifiers, fixed categories, strict event and line caps, contains no raw addresses or
