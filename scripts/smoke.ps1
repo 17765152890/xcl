@@ -44,7 +44,14 @@ $commits = [regex]::Matches($text, 'memory: (\d+) MB committed') | ForEach-Objec
 $peak = if ($commits) { ($commits | Measure-Object -Maximum).Maximum } else { 'n/a' }
 $removals = ([regex]::Matches($text, 'device removed')).Count
 $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
-$gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name
+# the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
+# not the first one Windows lists – on a machine with an iGPU that is often not the one used
+$gpu = $null
+$report = Join-Path (Split-Path $log -Parent) 'report.json'
+if (Test-Path $report) {
+    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
+}
+if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 @"
