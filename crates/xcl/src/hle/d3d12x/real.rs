@@ -272,6 +272,19 @@ unsafe fn open_uma(device: &ID3D12Device) {
     *UMA_BUFFER.lock().unwrap() = bufs;
 }
 
+/// Open the process UMA on the synthetic runner's device exactly as device creation does in
+/// production. Repeated calls reuse the process-lifetime resources.
+#[cfg(test)]
+pub(crate) unsafe fn open_uma_for_test(device: &ID3D12Device) -> Result<(), String> {
+    if UMA_BUFFER.lock().unwrap().is_empty() { open_uma(device); }
+    if UMA_BUFFER.lock().unwrap().is_empty() {
+        let detail = UMA_ERROR.lock().unwrap().clone();
+        Err(if detail.is_empty() { "unified memory was not opened on the GPU".into() } else { detail })
+    } else {
+        Ok(())
+    }
+}
+
 pub fn stats() -> D3d12Stats {
     let classes = CLASSES
         .lock()

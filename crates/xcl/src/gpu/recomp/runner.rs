@@ -1045,9 +1045,36 @@ pub fn mesh_draw_split_recorded(
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let record_dwords = record.record_dwords();
     let (pixels, records, _) = mesh_draw_split_impl(
-        cs, ms, ps, groups, split, record_dwords, sgprs, mem, size, clear, None, Some(record),
+        cs, ms, ps, groups, split, record_dwords, sgprs, mem, size, clear, None, Some((record, false, false)),
     )?;
     Ok((pixels, records))
+}
+
+/// The live synthetic runner through the production console DispatchX entry (slot 78).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_split_dispatched(
+    cs: &[u8], ms: &[u8], ps: &[u8], groups: u32, split: u32,
+    record: super::MsInterface, graphics_constants: &[u32], size: u32, clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    let record_dwords = record.record_dwords();
+    let (pixels, records, _) = mesh_draw_split_impl(
+        cs, ms, ps, groups, split, record_dwords, graphics_constants, &[], size, clear, None, Some((record, true, false)),
+    )?;
+    Ok((pixels, records))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_split_dispatched_cleanup_probe(
+    cs: &[u8], ms: &[u8], ps: &[u8], record: super::MsInterface, graphics_constants: &[u32],
+) -> Result<(), String> {
+    let record_dwords = record.record_dwords();
+    mesh_draw_split_impl(
+        cs, ms, ps, 1, 1, record_dwords, graphics_constants, &[], 1, [0.0; 4], None,
+        Some((record, true, true)),
+    )?;
+    Err("forced route cleanup was not reached".into())
 }
 
 /// Synthetic logical-wave dispatcher path. Native two-pass callers continue to use
@@ -1084,7 +1111,7 @@ fn mesh_draw_split_impl(
     size: u32,
     clear: [f32; 4],
     scratch: Option<super::mesh_dispatch::ScratchLayout>,
-    recorded: Option<super::MsInterface>,
+    recorded: Option<(super::MsInterface, bool, bool)>,
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>, Option<Vec<u32>>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
@@ -1213,7 +1240,12 @@ fn mesh_draw_split_impl(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        if let Some(ref record) = recorded {
+        let routed = recorded.as_ref().is_some_and(|(_, routed, _)| *routed);
+        #[allow(unused_mut)]
+        let mut routed_result: Option<(usize, usize)> = None;
+        #[cfg(test)]
+        let mut route_guards = None;
+        if let Some((record, false, _)) = recorded.as_ref() {
             let plan = super::pso::TwoPassPlan::checked([groups, 1, 1], record_dwords as u32, split)?;
             let views = [
                 io_buf.GetGPUVirtualAddress(), res_buf.GetGPUVirtualAddress(), mem_buf.GetGPUVirtualAddress(),
@@ -1222,6 +1254,43 @@ fn mesh_draw_split_impl(
             crate::hle::d3d12x::bind::record_two_pass_for_test(
                 &list, &cpso, &gpu.rs, &mpso, &gpu.rs, record.clone(), split, &plan, views,
             )?;
+        } else if let Some((_record, true, _force_cleanup)) = recorded.as_ref() {
+            #[cfg(not(test))]
+            return Err("production-route runner is test-only".into());
+            #[cfg(test)]
+            {
+                let record = _record;
+                crate::hle::d3d12x::real::open_uma_for_test(dev)?;
+                let metadata = crate::hle::d3d12x::real::TwoPassPso {
+                    compute: cpso.clone().into_raw() as usize,
+                    compute_rs: gpu.rs.as_raw() as usize,
+                    mesh_rs: gpu.rs.as_raw() as usize,
+                    record: record.clone(),
+                    mesh_groups_per_record: split,
+                    kind: "test",
+                };
+                let pso = mpso.as_raw() as usize;
+                let metadata_guard = crate::hle::d3d12x::real::install_two_pass_for_test(pso, metadata);
+                let constants = sgprs;
+                let root = gpu.rs.as_raw() as usize;
+                let bytes = (constants.len() * 4) as u32;
+                let layout_guard = crate::hle::d3d12x::console_list::install_layout_for_test(
+                    root,
+                    crate::hle::d3d12x::console_list::Layout {
+                        params: vec![crate::hle::d3d12x::console_list::Param::Constants { at: 0, count: constants.len() as u32 }],
+                        size: bytes, inline: bytes, inline_gfx: bytes,
+                    },
+                );
+                let state_guard = crate::hle::d3d12x::bind::install_dispatch_route_for_test(list.as_raw(), pso);
+                crate::hle::d3d12x::bind::set_graphics_root_signature(list.as_raw(), root as *mut std::ffi::c_void);
+                crate::hle::d3d12x::bind::set_graphics_root_constants(list.as_raw(), 0, constants.len() as u32, constants.as_ptr(), 0);
+                if *_force_cleanup {
+                    return Err("forced routed-dispatch cleanup".into());
+                }
+                crate::hle::d3d12x::list_x::dispatch_x(list.as_raw(), groups, 1, 1, 0);
+                routed_result = crate::hle::d3d12x::bind::two_pass_result_for_test(list.as_raw());
+                route_guards = Some((metadata_guard, layout_guard, state_guard));
+            }
         } else {
             list.Dispatch(groups, 1, 1);
             list.ResourceBarrier(&[uav_barrier(&res_buf)]);
@@ -1236,10 +1305,8 @@ fn mesh_draw_split_impl(
             let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
             list6.DispatchMesh(groups * split, 1, 1);
         }
-        let mut readback_barriers = vec![
-            transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        ];
+        let mut readback_barriers = vec![transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)];
+        if !routed { readback_barriers.push(transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)); }
         if let Some(scratch_buf) = &scratch_buf {
             readback_barriers.push(transition(
                 scratch_buf,
@@ -1251,7 +1318,7 @@ fn mesh_draw_split_impl(
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
+        if !routed { list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes); }
         if let Some(scratch_buf) = &scratch_buf {
             list.CopyBufferRegion(&readback, total + res_bytes, scratch_buf, 0, scratch_bytes);
         }
@@ -1276,7 +1343,12 @@ fn mesh_draw_split_impl(
                 px.push([*c, *c.add(1), *c.add(2), *c.add(3)]);
             }
         }
-        let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec();
+        let recs = if let Some((at, bytes)) = routed_result {
+            if bytes != res_bytes as usize { return Err("routed result size does not match the checked plan".into()); }
+            std::slice::from_raw_parts(at as *const u32, res_len).to_vec()
+        } else {
+            std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec()
+        };
         let scratch_words = scratch.map(|_| {
             std::slice::from_raw_parts(
                 (q as *const u8).add((total + res_bytes) as usize) as *const u32,
@@ -1285,6 +1357,8 @@ fn mesh_draw_split_impl(
             .to_vec()
         });
         readback.Unmap(0, None);
+        #[cfg(test)]
+        drop(route_guards);
         Ok((px, recs, scratch_words))
     }
 }

@@ -1857,6 +1857,50 @@ fn gpu_mesh_mode_two_passes() {
     assert_eq!(recorded16.0, px16, "recorded split pixels");
 }
 
+#[test]
+fn console_dispatch_x_live_route_records_and_rasterizes_nonzero_work() {
+    if !gpu_ready_wave32() || !mesh_ready() { return; }
+    let interface = super::MsInterface { outputs: Vec::new(), threads: 1, max_vertices: 3, max_primitives: 1 };
+    assert_eq!(interface.record_dwords(), 17);
+    let compute = super::dxc::compile(r#"
+RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer res : register(u1);
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {
+    uint b = gid.x * 17u;
+    float shift = asfloat(io.Load(8u * 4u)) + (float)gid.x;
+    res.Store(b * 4u, 3u);
+    res.Store((b + 1u) * 4u, 1u);
+    res.Store4((b + 4u) * 4u, asuint(float4(-1.0 + shift, -1.0, 0.0, 1.0)));
+    res.Store4((b + 8u) * 4u, asuint(float4(-1.0 + shift,  1.0, 0.0, 1.0)));
+    res.Store4((b + 12u) * 4u, asuint(float4( 0.0 + shift, -1.0, 0.0, 1.0)));
+    res.Store((b + 16u) * 4u, (1u << 10u) | (2u << 20u));
+}
+"#, "main", "cs_6_6", &[]).unwrap();
+    let mesh_source = super::emit::mesh_passthrough(&interface);
+    let mesh = super::dxc::compile(&mesh_source, "main", "ms_6_6", &[]).unwrap();
+    let pixel = super::dxc::compile(
+        "float4 main() : SV_Target0 { return float4(0.25, 0.5, 0.75, 1.0); }", "main", "ps_6_6", &[],
+    ).unwrap();
+    let shift = 0.125f32;
+    let cleanup = runner::mesh_draw_split_dispatched_cleanup_probe(
+        &compute, &mesh, &pixel, interface.clone(), &[shift.to_bits()],
+    ).unwrap_err();
+    assert_eq!(cleanup, "forced routed-dispatch cleanup");
+    let (pixels, records) = runner::mesh_draw_split_dispatched(
+        &compute, &mesh, &pixel, 2, 1, interface, &[shift.to_bits()], 32, [-1.0; 4],
+    ).unwrap();
+    assert_eq!((records[0], records[1], records[17], records[18]), (3, 1, 3, 1));
+    assert_eq!(f32::from_bits(records[4]), -1.0 + shift, "graphics constants must populate s8");
+    assert_eq!(f32::from_bits(records[21]), shift, "second dispatch group must share the checked result UAV");
+    assert_eq!(records[16], (1 << 10) | (2 << 20));
+    assert_eq!(records[33], (1 << 10) | (2 << 20));
+    let at = |x: usize, y: usize| pixels[y * 32 + x];
+    assert_eq!(at(4, 28), [0.25, 0.5, 0.75, 1.0], "first routed mesh group");
+    assert_eq!(at(20, 28), [0.25, 0.5, 0.75, 1.0], "second routed mesh group");
+    assert_eq!(at(30, 2), [-1.0; 4], "outside routed geometry");
+}
+
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
 #[test]
 #[ignore]

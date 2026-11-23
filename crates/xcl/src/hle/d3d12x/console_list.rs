@@ -163,6 +163,23 @@ pub(super) fn layout_of(rs: usize) -> Option<Arc<Layout>> {
     LAYOUTS.lock().unwrap().as_ref()?.get(&rs).cloned()
 }
 
+#[cfg(test)]
+pub(crate) struct LayoutTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for LayoutTestGuard {
+    fn drop(&mut self) {
+        LAYOUTS.lock().unwrap().as_mut().and_then(|layouts| layouts.remove(&self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_layout_for_test(rs: usize, layout: Layout) -> LayoutTestGuard {
+    let old = LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(layout));
+    assert!(old.is_none(), "test root signature already has a layout");
+    LayoutTestGuard(rs)
+}
+
 // ---------------------------------------------------------------------------------------
 // pipeline states
 // ---------------------------------------------------------------------------------------

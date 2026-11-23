@@ -31,6 +31,8 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    #[cfg(test)]
+    last_two_pass_result: Option<(usize, usize)>,
 }
 
 /// ABI allocations shared by both halves of a translated two-pass pipeline. The underlying
@@ -120,7 +122,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 }
 
 /// #34 SetGraphicsRootSignature (PC #30)
-pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+pub(crate) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -139,7 +141,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_voi
 }
 
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
-pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+pub(crate) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put_in(this, true, i, offset, &bytes);
@@ -796,9 +798,33 @@ unsafe fn prepare_abi(this: *mut c_void, gfx: bool, result_bytes: usize) -> Resu
         Ok((io_at, res_at))
     })();
     let (io_at, res_at) = built?;
+    #[cfg(test)]
+    with(this, |s| s.last_two_pass_result = Some((res_at, result_bytes)));
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let views = abi_views(va(io_at), va(res_at), &windows)?;
     Ok(AbiBindings { views, result_bytes })
+}
+
+#[cfg(test)]
+pub(crate) struct DispatchRouteTestGuard(*mut c_void);
+
+#[cfg(test)]
+impl Drop for DispatchRouteTestGuard {
+    fn drop(&mut self) { forget(self.0); }
+}
+
+#[cfg(test)]
+pub(crate) fn install_dispatch_route_for_test(list: *mut c_void, pso: usize) -> DispatchRouteTestGuard {
+    with(list, |state| {
+        state.pso = pso;
+        state.last_two_pass_result = None;
+    });
+    DispatchRouteTestGuard(list)
+}
+
+#[cfg(test)]
+pub(crate) fn two_pass_result_for_test(list: *mut c_void) -> Option<(usize, usize)> {
+    with(list, |state| state.last_two_pass_result)
 }
 
 fn abi_views(io: u64, result: u64, windows: &[u64]) -> Result<[u64; 6], String> {
