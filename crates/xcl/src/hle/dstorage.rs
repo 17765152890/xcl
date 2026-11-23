@@ -223,6 +223,42 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
     }
 }
 
+/// BCPack requests `bcunpack` rebuilt, by mode: a line on the first, then a running count on
+/// every power of two.
+fn note_bcpack_unpacked(r: &Request, bytes: usize) {
+    static DONE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    let m = r.bcpack();
+    let k = DONE[m as usize & 0xF].fetch_add(1, Ordering::Relaxed) + 1;
+    if k == 1 || k.is_power_of_two() {
+        crate::xlog_info!("DirectStorage: BCPack {} unpacked: {k} request(s) ({bytes} bytes in the latest{})", bcpack_name(m), if r.zlib() { ", after zlib" } else { "" });
+    }
+}
+
+/// A BCPack chunk `bcunpack` could not decode: one warning per mode and kind of failure, then a
+/// running count.
+fn note_bcpack_failed(r: &Request, why: &str) {
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let k = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+    let kind = why.split(':').next().unwrap_or(why);
+    warn_once(&format!("BCPack {} {kind}", bcpack_name(r.bcpack())), format_args!("a chunk did not decode ({why}; source {} bytes, destination {}); the request fails with E_DECOMPRESSION", r.source_size, r.destination_size));
+    if k.is_power_of_two() {
+        crate::xlog_info!("DirectStorage: BCPack chunks that did not decode so far: {k}");
+    }
+}
+
+/// `XCL_BCPACK_DUMP=<folder>`: the first 64 BCPack chunks (after zlib) are written there as
+/// `<mode>_<destination bytes>_<n>.bin` – samples for the unpacker's tests (`XCL_SAMPLE_BCPACK`).
+fn bcpack_dump(r: &Request, chunk: &[u8]) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("XCL_BCPACK_DUMP").map(Into::into)) else { return };
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if k < 64 {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join(format!("{}_{}_{k}.bin", r.bcpack(), r.destination_size)), chunk);
+    }
+}
+
 /// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
 /// format (magenta; red for BC4/BC5) instead of staying as it was, so the title's textures
 /// that wait on BCPack show where they are. The request still fails.
@@ -676,18 +712,23 @@ impl Request {
             }
             // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack
             // (counted and logged at enqueue, `BcpackRefusals`).
-            (true, _) => {
+            (true, m) => {
                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if !crate::hle::bcunpack::supported(m) {
+                    return Err(E_DECOMPRESSION);
+                }
             }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
-            (false, _) => {
+            // Single-stage BCPack: `intermediate_size` must be 0; modes `bcunpack` cannot rebuild
+            // are refused.
+            (false, m) => {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if !crate::hle::bcunpack::supported(m) {
+                    return Err(E_DECOMPRESSION);
+                }
             }
         }
         Ok(())
@@ -805,11 +846,31 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && !crate::hle::bcunpack::supported(r.bcpack())) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    let payload: Vec<u8> = if r.bcpack() != 0 {
+        // zlib (if any) gives the BCPack chunk, which the unpacker turns into the destination's
+        // BC blocks
+        let chunk = if r.zlib() {
+            let limit = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n.max(src.len()) * 4 };
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, limit).map_err(|_| E_ZLIB_DATA)?
+        } else {
+            src
+        };
+        bcpack_dump(r, &chunk);
+        match crate::hle::bcunpack::unpack(r.bcpack(), &chunk, n) {
+            Ok(blocks) => {
+                note_bcpack_unpacked(r, n);
+                blocks
+            }
+            Err(e) => {
+                note_bcpack_failed(r, &e);
+                return Err(E_DECOMPRESSION);
+            }
+        }
+    } else if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         if d.len() != stage1_len {
