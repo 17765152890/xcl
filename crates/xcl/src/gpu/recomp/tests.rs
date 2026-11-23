@@ -5231,10 +5231,12 @@ fn retail_wave64_graphics_lane_census() {
 }
 
 /// The 32-lane form of the pack's wave64 VS / PS (`upper_lanes`): every program whose
-/// translation it changes is compiled with DXC. Digests of every program's translation in the
-/// native form (`split_wave64` off – the form a GPU with 64-lane waves gets) and of the other
-/// modes' 32-lane form are printed, to compare with another build: `XCL_SAMPLE_RPF`;
-/// `XCL_FORMS_NO_DXC=1` skips the compiles.
+/// translation it changes is compiled with DXC, and so is the native form of every VS / PS
+/// with a whole-wave reduction recognised as a whole (`reductions`: it changes the form of
+/// every GPU). Digests of every program's translation in the native form (`split_wave64` off
+/// – the form a GPU with 64-lane waves gets) and of the other modes' 32-lane form are printed,
+/// to compare with another build: `XCL_SAMPLE_RPF`; `XCL_FORMS_NO_DXC=1` skips the compiles;
+/// `XCL_FORMS_LIST=<file>`: each program's digests, one line each (to diff two builds).
 #[test]
 #[ignore]
 fn retail_wave64_graphics_lane_forms() {
@@ -5242,10 +5244,14 @@ fn retail_wave64_graphics_lane_forms() {
     use std::sync::Mutex;
     let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
     let dxc = std::env::var_os("XCL_FORMS_NO_DXC").is_none();
+    let list_out = std::env::var("XCL_FORMS_LIST").ok();
     let data = std::fs::read(path).unwrap();
     let records = crate::gpu::pack::scan(&data, 0x40);
     let (digest, programs, changed, compiled) = (AtomicU64::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let split_digest = AtomicU64::new(0);
+    // VS / PS with a recognised reduction, wave64 / wave32; their native forms compiled
+    let (reduced64, reduced32, reduced_compiled) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let list: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -5272,16 +5278,41 @@ fn retail_wave64_graphics_lane_forms() {
                             Mode::Pixel(_) => "ps_6_6",
                             _ => {
                                 // the other modes' 32-lane form: unchanged by `upper_lanes`
+                                let mut sh = 0;
                                 if let Ok(t) = translate(code, &Options { split_wave64: true, ..opt }) {
-                                    split_digest.fetch_add(crate::gpu::shader::fnv64(format!("{key}\\n{}", t.hlsl).as_bytes()), Ordering::Relaxed);
+                                    sh = crate::gpu::shader::fnv64(format!("{key}\\n{}", t.hlsl).as_bytes());
+                                    split_digest.fetch_add(sh, Ordering::Relaxed);
+                                }
+                                if list_out.is_some() {
+                                    list.lock().unwrap().push(format!("{key}\t{h:016x}\t{sh:016x}\t-"));
                                 }
                                 continue;
                             }
                         };
+                        // (the list's last column: whether the program has one)
+                        let reduced = native.hlsl.contains("uint4 xcl_wave_");
+                        if reduced {
+                            if wave64 { &reduced64 } else { &reduced32 }.fetch_add(1, Ordering::Relaxed);
+                            if dxc {
+                                match super::dxc::compile(&native.hlsl, "main", profile, &[]) {
+                                    Ok(_) => {
+                                        reduced_compiled.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => errors.lock().unwrap().push(format!("{key} (native): {}", e.lines().take(4).collect::<Vec<_>>().join(" | "))),
+                                }
+                            }
+                        }
                         if !wave64 {
+                            if list_out.is_some() {
+                                list.lock().unwrap().push(format!("{key}\t{h:016x}\t-\t{reduced}"));
+                            }
                             continue;
                         }
                         let t = translate(code, &Options { split_wave64: true, ..opt }).unwrap();
+                        if list_out.is_some() {
+                            let sh = crate::gpu::shader::fnv64(format!("{key}\n{}", t.hlsl).as_bytes());
+                            list.lock().unwrap().push(format!("{key}\t{h:016x}\t{sh:016x}\t{reduced}"));
+                        }
                         if t.hlsl == native.hlsl {
                             continue;
                         }
@@ -5301,18 +5332,132 @@ fn retail_wave64_graphics_lane_forms() {
     });
     let errors = errors.into_inner().unwrap();
     println!(
-        "{} programs, native-form digest {:016x}, 32-lane-form digest of the other modes {:016x}; 32-lane form differs for {} wave64 VS / PS, {} compiled, {} DXC errors",
+        "{} programs, native-form digest {:016x}, 32-lane-form digest of the other modes {:016x}; 32-lane form differs for {} wave64 VS / PS, {} compiled; whole-wave reductions as wave operations in {} wave64 and {} wave32 VS / PS, native form {} compiled; {} DXC errors",
         programs.into_inner(),
         digest.into_inner(),
         split_digest.into_inner(),
         changed.into_inner(),
         compiled.into_inner(),
+        reduced64.into_inner(),
+        reduced32.into_inner(),
+        reduced_compiled.into_inner(),
         errors.len()
     );
+    if let Some(out) = list_out {
+        let mut v = list.into_inner().unwrap();
+        v.sort();
+        std::fs::write(out, v.join("\n") + "\n").unwrap();
+    }
     for e in errors.iter().take(10) {
         println!("  {e}");
     }
     assert!(errors.is_empty());
+}
+
+/// The pack's whole-wave sections (`s_or_saveexec_b64` / `_b32` with -1) and the reductions
+/// `reductions` recognises in them: sites, programs and distinct programs (by code) per op,
+/// and per reason for the sections it leaves – for wave64 VS / PS, where the translation uses
+/// them, and for the other modes and wave sizes, where it does not. For wave64 VS / PS also the
+/// programs with a lane ≥ 32 read as a constant (`upper_lanes`, #133), those whose such reads
+/// are all inside recognised reductions, and those that still get the 32-lane form.
+/// `XCL_SAMPLE_RPF`; `XCL_CENSUS_OUT=<file>`: the sections left, with their instructions.
+#[test]
+#[ignore]
+fn retail_wave_reductions_census() {
+    use super::upper_lanes::Read;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let out = std::env::var("XCL_CENSUS_OUT").ok();
+    let data = std::fs::read(path).unwrap();
+    let records = crate::gpu::pack::scan(&data, 0x40);
+    // (programs, kind) → (sites, programs, distinct programs by code hash)
+    type Stats = BTreeMap<(String, String), (usize, usize, BTreeSet<u64>)>;
+    let stats: Mutex<Stats> = Mutex::new(BTreeMap::new());
+    let left: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(r) = records.get(i) else { break };
+                let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+                let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+                for (fi, f) in sh.fssm.iter().enumerate() {
+                    let label = match super::interface(&blob, &sh, f) {
+                        Some(Mode::Vertex(_)) => "VS",
+                        Some(Mode::Pixel(_)) => "PS",
+                        Some(Mode::Compute(_)) => "CS",
+                        Some(Mode::Mesh(_)) => "MS",
+                        Some(Mode::Geometry(_)) => "GS",
+                        _ => "other",
+                    };
+                    for p in &f.programs {
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        let mut insts = Vec::new();
+                        let mut off = 0;
+                        while off + 4 <= code.len() {
+                            let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+                            off += d.len;
+                            insts.push(d);
+                        }
+                        crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+                        let sections = super::reductions::survey(&insts);
+                        if sections.is_empty() {
+                            continue;
+                        }
+                        let wave64 = super::detect_wave64(code);
+                        let group = format!("{label} {}", if wave64 { "wave64" } else { "wave32" });
+                        let hash = crate::gpu::shader::fnv64(code);
+                        let mut kinds = BTreeSet::from(["(programs with a whole-wave section)".to_string()]);
+                        let mut st = stats.lock().unwrap();
+                        for (pc, res) in &sections {
+                            let kind = match res {
+                                Ok(r) => format!("recognised: {}", r.op.name()),
+                                Err(e) => format!("left: {e}"),
+                            };
+                            st.entry((group.clone(), kind.clone())).or_default().0 += 1;
+                            if let (Err(e), Some(_)) = (res, &out) {
+                                let lines = crate::gpu::rdna2::disassemble(code, 0, false);
+                                let k = lines.iter().position(|l| l.pc == *pc).unwrap_or(0);
+                                let text: Vec<String> = lines[k..(k + 16).min(lines.len())].iter().map(|l| format!("  {:05x}: {}", l.pc, l.text)).collect();
+                                left.lock().unwrap().push(format!("=== {group} {} FSSM#{fi} {hash:016x}: {e}\n{}\n", r.name, text.join("\n")));
+                            }
+                            kinds.insert(kind);
+                        }
+                        if wave64 && matches!(label, "VS" | "PS") {
+                            let a = super::upper_lanes::analyze(&insts);
+                            let reduced: BTreeSet<u64> = sections.iter().filter_map(|(_, r)| r.as_ref().ok()).flat_map(|r| r.rest.iter().copied()).collect();
+                            let consts: Vec<u64> = a.reads.iter().filter(|(_, r)| matches!(r, Read::Const(_))).map(|(pc, _)| *pc).collect();
+                            if !consts.is_empty() {
+                                kinds.insert("(programs with a lane >= 32 read as a constant, #133)".into());
+                                if consts.iter().all(|pc| reduced.contains(pc)) {
+                                    kinds.insert("(... all inside recognised reductions)".into());
+                                }
+                            }
+                            if a.reads.iter().any(|(pc, r)| !reduced.contains(pc) && matches!(r, Read::Const(_) | Read::Shadow)) {
+                                kinds.insert("(programs that still get the 32-lane form)".into());
+                            }
+                        }
+                        for k in kinds {
+                            let e = st.entry((group.clone(), k)).or_default();
+                            e.1 += 1;
+                            e.2.insert(hash);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    for ((group, kind), (sites, programs, distinct)) in stats.into_inner().unwrap() {
+        println!("  {group:<11} {kind:<62} {sites:>6} sites {programs:>6} programs {:>6} distinct", distinct.len());
+    }
+    if let Some(out) = out {
+        let mut v = left.into_inner().unwrap();
+        v.sort();
+        std::fs::write(out, v.concat()).unwrap();
+    }
 }
 
 /// `ds_swizzle_b32`'s four modes against the RDNA ISA (its FFT examples, rotate, quad
