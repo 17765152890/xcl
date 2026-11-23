@@ -156,6 +156,67 @@ pub fn in_graphics_reservation(p: usize) -> bool {
 
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// GPU views of title memory: (GPU view, size, CPU view). A retail game reserves 24 GB of
+/// GPU-visible memory read-write and, right after it, 24 GB more with a graphics protection
+/// (0x801): the same memory as the GPU sees it. It maps its physical pages into the first only and
+/// places textures the CPU fills at the same offset in the second (its movie frames: the decoder
+/// writes the first, the textures are in the second). Here the second is memory of its own that
+/// nothing is mapped into, so those textures read zeros (a green movie). What is read of a GPU
+/// view for the GPU comes from its CPU view instead (`gpu_view_pages`, `d3d12x::title_textures`).
+static GPU_VIEWS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static GPU_VIEWS_GEN: AtomicUsize = AtomicUsize::new(0);
+/// the last reservation of GPU-visible memory, and whether it had a graphics protection
+static LAST_GPU_VISIBLE: std::sync::Mutex<Option<(usize, usize, bool)>> = std::sync::Mutex::new(None);
+
+/// A reservation of GPU-visible memory (`base`, `size` bytes, allocation type `t`, protection
+/// `p`) after `last`: the view it is the GPU view of – one with a graphics protection right after
+/// one of the same size without – as (GPU view, size, CPU view).
+fn pair_gpu_view(last: &mut Option<(usize, usize, bool)>, base: usize, size: usize, t: u32, p: u32) -> Option<(usize, usize, usize)> {
+    if t & 0x1000 != 0 {
+        return None; // committed at once: not a view to map pages into
+    }
+    let graphics = p & PAGE_GRAPHICS_ANY != 0;
+    let before = last.replace((base, size, graphics));
+    match before {
+        Some((cpu, n, false)) if graphics && n == size => Some((base, size, cpu)),
+        _ => None,
+    }
+}
+
+fn note_gpu_view(base: usize, size: usize, t: u32, p: u32) {
+    let view = pair_gpu_view(&mut LAST_GPU_VISIBLE.lock().unwrap(), base, size, t, p);
+    if let Some((gpu, size, cpu)) = view.filter(|_| std::env::var("XCL_GPU_VIEWS").map_or(true, |v| v != "0")) {
+        add_gpu_view(gpu, size, cpu);
+        crate::xlog_info!("kernelx: {gpu:#x} ({size:#x} bytes, protection {p:#x}) is the GPU view of {cpu:#x}: textures placed there read what is mapped at {cpu:#x}");
+    }
+}
+
+pub(crate) fn add_gpu_view(gpu: usize, size: usize, cpu: usize) {
+    GPU_VIEWS.lock().unwrap().push((gpu, size, cpu));
+    GPU_VIEWS_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Changes when a GPU view is added.
+pub fn gpu_views_gen() -> usize {
+    GPU_VIEWS_GEN.load(Ordering::Acquire)
+}
+
+/// The 64 KiB pages of `[lo, hi)` that lie in a GPU view, with the address of the CPU view each
+/// shows: (GPU view page, CPU view page).
+pub fn gpu_view_pages(lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    if hi <= lo {
+        return Vec::new();
+    }
+    let views = GPU_VIEWS.lock().unwrap();
+    let lo = lo & !(PHYS_PAGE - 1);
+    let mut out = Vec::new();
+    for &(gpu, size, cpu) in views.iter() {
+        let (a, b) = (lo.max(gpu), hi.min(gpu + size));
+        out.extend((a..b).step_by(PHYS_PAGE).map(|g| (g, cpu + (g - gpu))));
+    }
+    out
+}
+
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
 /// write-watched address space of Windows; everything else from Windows.
@@ -272,6 +333,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
             trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+            note_gpu_view(q as usize, size, t, p);
             return q;
         }
     }
@@ -1635,6 +1697,32 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reservation with a graphics protection right after one of the same size without is
+    /// that one's GPU view; other sequences are not views.
+    #[test]
+    fn a_graphics_reservation_after_a_plain_one_of_its_size_is_its_gpu_view() {
+        const G: u32 = 0x2040_2000; // reserve, 64 KiB pages, graphics
+        let mut last = None;
+        assert_eq!(pair_gpu_view(&mut last, 0x1000_0000, 0x60_0000, G, 0x4), None);
+        assert_eq!(pair_gpu_view(&mut last, 0x2000_0000, 0x60_0000, G, 0x801), Some((0x2000_0000, 0x60_0000, 0x1000_0000)));
+        // a different size, two graphics ones in a row, a committed one: no view
+        assert_eq!(pair_gpu_view(&mut last, 0x3000_0000, 0x10_0000, G, 0x4), None);
+        assert_eq!(pair_gpu_view(&mut last, 0x4000_0000, 0x20_0000, G, 0x801), None);
+        assert_eq!(pair_gpu_view(&mut last, 0x5000_0000, 0x20_0000, G, 0x801), None);
+        assert_eq!(pair_gpu_view(&mut last, 0x6000_0000, 0x20_0000, G, 0x4), None);
+        assert_eq!(pair_gpu_view(&mut last, 0x7000_0000, 0x20_0000, G | 0x1000, 0x801), None);
+    }
+
+    /// The pages of a range in a GPU view, with the CPU view's address of each.
+    #[test]
+    fn gpu_view_pages_name_the_cpu_view_of_each_page() {
+        let (gpu, cpu) = (0x7A00_0000_0000usize, 0x7900_0000_0000usize);
+        add_gpu_view(gpu, 0x40_0000, cpu);
+        assert_eq!(gpu_view_pages(gpu + 0x1_8000, gpu + 0x3_0000), vec![(gpu + 0x1_0000, cpu + 0x1_0000), (gpu + 0x2_0000, cpu + 0x2_0000)]);
+        assert!(gpu_view_pages(gpu - 0x2_0000, gpu).is_empty());
+        assert_eq!(gpu_view_pages(gpu + 0x3F_0000, gpu + 0x50_0000), vec![(gpu + 0x3F_0000, cpu + 0x3F_0000)]);
+    }
 
     #[test]
     fn affinity_masks_outside_the_process_are_fitted() {

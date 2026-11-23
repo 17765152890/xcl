@@ -70,7 +70,7 @@ static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -272,6 +272,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
         crate::hle::kernelx::graphics_reservations_gen(),
+        crate::hle::kernelx::gpu_views_gen() as u64,
     );
     {
         let g = WATCH_CACHE.lock().unwrap();
@@ -287,6 +288,9 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
+    // textures in a GPU view: what the CPU writes is in the CPU view (`kernelx::gpu_view_pages`)
+    let cpu_views: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().flat_map(|e| crate::hle::kernelx::gpu_view_pages(e.va, e.va + e.tex.size() as usize)).map(|(_, cpu)| (cpu, cpu + 0x1_0000)).collect();
+    wanted.extend(cpu_views);
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
@@ -403,8 +407,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.va);
-                dirty.get(i).is_some_and(|&p| p < e.va + e.tex.size() as usize)
+                let written = |lo: usize, hi: usize| {
+                    let i = dirty.partition_point(|&p| p + page as usize <= lo);
+                    dirty.get(i).is_some_and(|&p| p < hi)
+                };
+                let end = e.va + e.tex.size() as usize;
+                written(e.va, end) || crate::hle::kernelx::gpu_view_pages(e.va, end).iter().any(|&(_, cpu)| written(cpu, cpu + 0x1_0000))
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -638,6 +646,15 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
             std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+        } else {
+            // a GPU view, nothing mapped into it: what its CPU view holds (`kernelx::gpu_view_pages`)
+            for (g, cpu) in crate::hle::kernelx::gpu_view_pages(p, end) {
+                let (lo, hi) = (g.max(p), (g + 0x1_0000).min(end));
+                let src = cpu + (lo - g);
+                if lo < hi && crate::gpu::shader::readable(src, hi - lo) {
+                    std::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr().add(lo - at), hi - lo);
+                }
+            }
         }
         p = end;
     }
@@ -667,6 +684,27 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture in a GPU view that nothing is mapped into reads what its CPU view holds.
+    #[test]
+    fn a_gpu_view_reads_its_cpu_view() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let cpu = VirtualAlloc(std::ptr::null(), 0x4_0000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let gpu = VirtualAlloc(std::ptr::null(), 0x4_0000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(cpu != 0 && gpu != 0);
+            assert!(!VirtualAlloc((cpu + 0x1_0000) as *const c_void, 0x1_0000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let texels: Vec<u8> = (0..64u8).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr(), (cpu + 0x1_FFE0) as *mut u8, 32);
+            crate::hle::kernelx::add_gpu_view(gpu, 0x4_0000, cpu);
+            // 32 bytes at the end of the committed page, 32 past it (not committed: zeros)
+            let got = read_committed(gpu + 0x1_FFE0, 64);
+            assert_eq!(&got[..32], &texels[..32]);
+            assert!(got[32..].iter().all(|&b| b == 0));
+            VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
 
     const SRV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0);
     const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
