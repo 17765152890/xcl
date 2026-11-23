@@ -139,31 +139,70 @@ pub struct MemorySlot;
 impl Drop for MemorySlot {
     fn drop(&mut self) {
         WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // under the gate's lock: a waiter between its decision and its wait does not miss it
+        let _gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
+        GATE_FREED.notify_all();
     }
 }
 
-/// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
-/// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
-/// time – it goes when no other is running (and after a minute in any case). Each compile used
-/// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
-/// left, and its last cold-cache shaders came a few a minute.
+/// `wait_for_memory`'s lock (and when a compile last went in by waiting `ESCAPE_AFTER`);
+/// `GATE_FREED` wakes the waiters when a compile ends.
+static GATE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static GATE_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Commit left for the rest of the system (the title above all) while compiles run.
+const COMMIT_FLOOR: u64 = 6 << 30;
+
+/// Commit a running compile may still add: what it already uses is in the system's available
+/// commit, so this is only its growth to come – a typical retail compile peaks at 0.1–0.3 GB
+/// (#113). It was 1 GB on top of that count: with 8.5 GB of commit free (a desktop with a
+/// browser and chat open) about three compiles ran and the other workers polled – Minecraft's
+/// 716 programs took 12.5 s on 16 threads instead of 4.9 s.
+const COMMIT_PER_COMPILE: u64 = 300 << 20;
+
+/// A compile that has waited this long goes in even when commit is short – one per interval,
+/// so a hung compile cannot stop the others for good but the waiting ones do not all start at
+/// once (they did: after a minute every waiting worker went in).
+const ESCAPE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a compile may start: `avail` the system's available commit (None: unknown),
+/// `running` the compiles running now, `waited` how long this one has waited, `escape_free`
+/// no other compile went in by waiting `ESCAPE_AFTER` within the last interval.
+fn may_start(avail: Option<u64>, running: usize, waited: std::time::Duration, escape_free: bool) -> bool {
+    let Some(avail) = avail else { return true };
+    // enough commit for the floor and for what the running ones may still grow; with less, one
+    // compile at a time (it goes when no other is running)
+    avail >= COMMIT_FLOOR + COMMIT_PER_COMPILE * running as u64 || running == 0 || (waited >= ESCAPE_AFTER && escape_free)
+}
+
+/// Before a compile: in at once while commit covers `COMMIT_FLOOR` plus `COMMIT_PER_COMPILE`
+/// for each compile running; with less, one compile at a time, and a compile that has waited
+/// `ESCAPE_AFTER` goes in regardless, one per interval. Each compile used to wait the minute
+/// while commit was short: with XDefiant's own 10 GB committed, 4 GB were left, and its last
+/// cold-cache shaders came a few a minute.
 pub fn wait_for_memory() -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
+    let mut last_escape = GATE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (6u64 << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 {
-            WORKING.fetch_add(1, Ordering::AcqRel);
+        let avail = (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile);
+        let waited = start.elapsed();
+        let escape_free = last_escape.is_none_or(|t| t.elapsed() >= ESCAPE_AFTER);
+        let running = WORKING.load(Ordering::Acquire);
+        // the count goes up only from the value the decision saw: workers deciding at the same
+        // moment cannot all go in on one reading of the commit
+        if may_start(avail, running, waited, escape_free) && WORKING.compare_exchange(running, running + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let plenty = avail.is_none_or(|a| a >= COMMIT_FLOOR + COMMIT_PER_COMPILE * running as u64);
+            if !plenty && running != 0 {
+                *last_escape = Some(std::time::Instant::now());
+            }
             return MemorySlot;
         }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return MemorySlot;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // woken when a compile ends; the commit can also change without one, so look again soon
+        last_escape = GATE_FREED.wait_timeout(last_escape, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -605,6 +644,70 @@ pub fn in_cached_only() -> bool {
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in(&cache_dir(), src, entry, profile)
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn compiles_start_while_commit_covers_the_floor_and_the_running_ones_growth() {
+        let now = Duration::ZERO;
+        // 8.5 GB free (the desktop that #113's 1 GB per compile held to three): eight running
+        // still leave room for a ninth
+        let free = 17 * GB / 2;
+        assert!(may_start(Some(free), 8, now, true));
+        assert!(!may_start(Some(free), 9, now, true));
+        assert!(may_start(Some(64 * GB), 63, now, true));
+        // no reading: in
+        assert!(may_start(None, 100, now, false));
+    }
+
+    #[test]
+    fn short_commit_lets_one_compile_at_a_time_and_one_escape_per_interval() {
+        let short = 4 * GB;
+        assert!(may_start(Some(short), 0, Duration::ZERO, true), "alone, a compile always goes");
+        assert!(!may_start(Some(short), 1, Duration::from_secs(10), true));
+        assert!(may_start(Some(short), 1, ESCAPE_AFTER, true), "a minute's wait goes in");
+        assert!(!may_start(Some(short), 1, ESCAPE_AFTER * 5, false), "but not while another just escaped");
+    }
+
+    /// Workers that decide on the same reading do not all go in: the count only rises from
+    /// the value each decision saw, so at most as many run as the commit covers.
+    #[test]
+    fn concurrent_admissions_never_exceed_what_the_rule_allows() {
+        // the real gate with the machine's real commit: whatever it is, the number running at
+        // once must stay within what `may_start` allows for it (or 1 when commit is short)
+        let avail = {
+            use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+            let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+            m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            unsafe { GlobalMemoryStatusEx(&mut m) };
+            m.ullAvailPageFile
+        };
+        let allowed = (avail.saturating_sub(COMMIT_FLOOR) / COMMIT_PER_COMPILE + 1).max(1) as usize;
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let now = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..32 {
+                s.spawn(|| {
+                    for _ in 0..20 {
+                        let _slot = wait_for_memory();
+                        let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        now.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        let peak = peak.into_inner();
+        // other tests' compiles share the gate: they only lower what is let in here
+        assert!(peak >= 1 && peak <= allowed + 1, "peak {peak} running, the commit ({} MB) allows {allowed}", avail >> 20);
+    }
 }
 
 #[cfg(test)]
