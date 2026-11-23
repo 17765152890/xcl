@@ -26,6 +26,31 @@ pub struct KernelState {
     pub scc: u32,
 }
 
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn pso_diagnostics_are_bounded_deterministic_and_redacted() {
+        let text = "  invalid\tshader at C:\\private folder\\shader.hlsl\r\nwith details  ";
+        assert_eq!(sanitize_pso_diagnostic(text), "invalid shader at <path> <path> with details");
+        assert_eq!(sanitize_pso_diagnostic(text), sanitize_pso_diagnostic(text));
+
+        let long = "x".repeat(MAX_PSO_DIAGNOSTIC_CHARS + 100);
+        assert_eq!(sanitize_pso_diagnostic(&long).chars().count(), MAX_PSO_DIAGNOSTIC_CHARS);
+
+        PSO_DIAGNOSTICS.lock().unwrap().clear();
+        for id in 0..MAX_PSO_DIAGNOSTICS + 3 {
+            push_pso_diagnostic(2, id as i32, text);
+        }
+        let messages = PSO_DIAGNOSTICS.lock().unwrap();
+        assert_eq!(messages.len(), MAX_PSO_DIAGNOSTICS);
+        assert!(messages.iter().all(|message| !message.contains("private") && !message.contains("shader.hlsl")));
+        assert_eq!(messages[0], "2:0 invalid shader at <path> <path> with details");
+        assert_eq!(messages[MAX_PSO_DIAGNOSTICS - 1], "2:7 invalid shader at <path> <path> with details");
+    }
+}
+
 impl Default for KernelState {
     fn default() -> Self {
         let mut sgpr = vec![0u32; KERNEL_SGPRS];
@@ -63,12 +88,70 @@ struct Gpu {
     wave64: bool,
     /// mesh shader tier 1 or higher (`mesh_draw`)
     mesh: bool,
+    /// Keeps the opt-in test debug callback registered for the device lifetime.
+    _diagnostics: Option<ID3D12InfoQueue1>,
 }
 
 // D3D12 objects are free-threaded; access is serialised by the mutex.
 unsafe impl Send for Gpu {}
 
 static GPU: Mutex<Option<Result<Gpu, String>>> = Mutex::new(None);
+static PSO_DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+const MAX_PSO_DIAGNOSTICS: usize = 8;
+const MAX_PSO_DIAGNOSTIC_CHARS: usize = 240;
+
+fn sanitize_pso_diagnostic(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| if token.contains(['\\', '/']) { "<path>" } else { token })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_PSO_DIAGNOSTIC_CHARS)
+        .collect()
+}
+
+unsafe extern "system" fn pso_diagnostic_message(
+    _category: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    text: windows::core::PCSTR,
+    _context: *mut std::ffi::c_void,
+) {
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+        return;
+    }
+    let body = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
+    push_pso_diagnostic(severity.0, id.0, &body);
+}
+
+fn push_pso_diagnostic(severity: i32, id: i32, body: &str) {
+    let Ok(mut messages) = PSO_DIAGNOSTICS.lock() else { return };
+    if messages.len() < MAX_PSO_DIAGNOSTICS {
+        messages.push(format!("{severity}:{id} {}", sanitize_pso_diagnostic(body)));
+    }
+}
+
+fn clear_pso_diagnostics(gpu: &Gpu) {
+    if gpu._diagnostics.is_some() {
+        if let Ok(mut messages) = PSO_DIAGNOSTICS.lock() {
+            messages.clear();
+        }
+    }
+}
+
+fn pso_error(gpu: &Gpu, error: windows::core::Error) -> String {
+    let mut result = format!("CreateComputePipelineState: {error}");
+    if gpu._diagnostics.is_some() {
+        if let Ok(messages) = PSO_DIAGNOSTICS.lock() {
+            if !messages.is_empty() {
+                result.push_str("; D3D12 diagnostics: ");
+                result.push_str(&messages.join(" | "));
+            }
+        }
+    }
+    result
+}
 
 fn e(x: windows::core::Error) -> String {
     format!("{x}")
@@ -76,6 +159,15 @@ fn e(x: windows::core::Error) -> String {
 
 fn init() -> Result<Gpu, String> {
     unsafe {
+        let diagnostics_enabled = std::env::var_os("XCL_TEST_PSO_DIAGNOSTICS").is_some();
+        if diagnostics_enabled {
+            let mut debug: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut debug).is_ok() {
+                if let Some(debug) = debug {
+                    debug.EnableDebugLayer();
+                }
+            }
+        }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");
@@ -110,11 +202,28 @@ fn init() -> Result<Gpu, String> {
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, mesh })
+        let diagnostics = if diagnostics_enabled {
+            dev.cast::<ID3D12InfoQueue1>().ok().and_then(|queue| {
+                let mut cookie = 0;
+                queue
+                    .RegisterMessageCallback(
+                        Some(pso_diagnostic_message),
+                        D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                        std::ptr::null_mut(),
+                        &mut cookie,
+                    )
+                    .ok()
+                    .map(|_| queue)
+            })
+        } else {
+            None
+        };
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, mesh, _diagnostics: diagnostics })
     }
 }
 
-/// Root signature: u0 io, u1 res, u2 mem as root UAVs; CBV/SRV/UAV and sampler heaps
+/// Root signature: u0 io, u1 res, u2..u5 memory, and optional u6 dispatcher scratch as
+/// root UAVs; CBV/SRV/UAV and sampler heaps
 /// directly indexed (SM 6.6 `ResourceDescriptorHeap`); `graphics` adds the input assembler.
 fn root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignature, String> {
     super::pso::abi_root_signature(dev, graphics)
@@ -409,23 +518,32 @@ pub fn run_with_statics(
         regs.resize(KERNEL_VGPRS, 0);
         io.extend_from_slice(&regs);
     }
+    // The disconnected two-wave validation shell packs as many as 128 lanes
+    // into u0. Ordinary kernels retain their original prefix unchanged.
+    io.resize(KERNEL_RES_DWORDS, 0);
     let mem_len = mem.len().max(64);
     unsafe {
         let dev = &gpu.dev;
+        clear_pso_diagnostics(gpu);
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+            .map_err(|x| pso_error(gpu, x))?;
         let io_bytes = (io.len() * 4) as u64;
         let res_bytes = (KERNEL_RES_DWORDS * 4) as u64;
         let mem_bytes = (mem_len * 4) as u64;
+        // Validation epoch kernels use u6 for one checked two-wave VGPR record.
+        // Other kernels leave this reserved UAV untouched.
+        let vgpr_scratch_bytes = super::mesh_vgpr::VgprScratchLayout::new(KERNEL_VGPRS as u32, 1)
+            .map_err(str::to_owned)?.scratch.total_bytes as u64;
         let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let vgpr_scratch_buf = buffer(dev, vgpr_scratch_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let readback = buffer(dev, res_bytes + mem_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -443,12 +561,14 @@ pub fn run_with_statics(
             transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&vgpr_scratch_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         let bound = bind_resources(dev, &list, textures, samplers)?;
         list.SetComputeRootSignature(&rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(super::mesh_dispatch::SCRATCH_UAV_REGISTER, vgpr_scratch_buf.GetGPUVirtualAddress());
         list.Dispatch(1, 1, 1);
         list.ResourceBarrier(&[
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -911,17 +1031,73 @@ pub fn mesh_draw_split(
     size: u32,
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    let (pixels, records, _) =
+        mesh_draw_split_impl(cs, ms, ps, groups, split, record_dwords, sgprs, mem, size, clear, None, None)?;
+    Ok((pixels, records))
+}
+
+/// Exercise the dormant two-pass command recorder against the live synthetic runner.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_split_recorded(
+    cs: &[u8], ms: &[u8], ps: &[u8], groups: u32, split: u32,
+    record: super::MsInterface, sgprs: &[u32], mem: &[u32], size: u32, clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    let record_dwords = record.record_dwords();
+    let (pixels, records, _) = mesh_draw_split_impl(
+        cs, ms, ps, groups, split, record_dwords, sgprs, mem, size, clear, None, Some(record),
+    )?;
+    Ok((pixels, records))
+}
+
+/// Synthetic logical-wave dispatcher path. Native two-pass callers continue to use
+/// `mesh_draw_split` and neither allocate nor bind the reserved scratch UAV.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_with_dispatch_scratch(
+    cs: &[u8],
+    ms: &[u8],
+    ps: &[u8],
+    groups: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+    scratch: super::mesh_dispatch::ScratchLayout,
+) -> Result<(Vec<[f32; 4]>, Vec<u32>, Vec<u32>), String> {
+    scratch.validate_for_groups(groups).map_err(str::to_owned)?;
+    let (pixels, records, scratch) =
+        mesh_draw_split_impl(cs, ms, ps, groups, 1, record_dwords, sgprs, mem, size, clear, Some(scratch), None)?;
+    Ok((pixels, records, scratch.expect("scratch was requested")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mesh_draw_split_impl(
+    cs: &[u8],
+    ms: &[u8],
+    ps: &[u8],
+    groups: u32,
+    split: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+    scratch: Option<super::mesh_dispatch::ScratchLayout>,
+    recorded: Option<super::MsInterface>,
+) -> Result<(Vec<[f32; 4]>, Vec<u32>, Option<Vec<u32>>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
         let dev = &gpu.dev;
+        clear_pso_diagnostics(gpu);
         let cpso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() },
                 ..Default::default()
             })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+            .map_err(|x| pso_error(gpu, x))?;
         let mut blend = D3D12_BLEND_DESC::default();
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
         let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
@@ -982,6 +1158,7 @@ pub fn mesh_draw_split(
         let mem_bytes = (mem_len * 4) as u64;
         let res_len = record_dwords * groups as usize;
         let res_bytes = (res_len * 4) as u64;
+        let scratch_bytes = scratch.map_or(0, |layout| layout.total_bytes as u64);
         let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -993,48 +1170,91 @@ pub fn mesh_draw_split(
         let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let scratch_buf = scratch
+            .map(|_| buffer(dev, scratch_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true))
+            .transpose()?;
         let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0u64;
         dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
-        let readback = buffer(dev, total + res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+        let readback_bytes = total
+            .checked_add(res_bytes)
+            .and_then(|bytes| bytes.checked_add(scratch_bytes))
+            .ok_or("mesh readback size overflow")?;
+        let readback = buffer(dev, readback_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
-        list.ResourceBarrier(&[
+        let mut upload_barriers = vec![
             transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        ];
+        if let Some(scratch_buf) = &scratch_buf {
+            upload_barriers.push(transition(scratch_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        }
+        list.ResourceBarrier(&upload_barriers);
         // pass 1: the console program as a compute shader
         let _bound = bind_resources(dev, &list, &[], &[])?;
-        list.SetComputeRootSignature(&gpu.rs);
-        list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
-        list.Dispatch(groups, 1, 1);
-        list.ResourceBarrier(&[uav_barrier(&res_buf)]);
-        // pass 2: rasterise the records
-        list.SetPipelineState(&mpso);
-        list.SetGraphicsRootSignature(&gpu.rs);
-        list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
-        list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        if recorded.is_none() {
+            list.SetComputeRootSignature(&gpu.rs);
+            list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        }
+        if let Some(scratch_buf) = &scratch_buf {
+            list.SetComputeRootUnorderedAccessView(
+                super::mesh_dispatch::SCRATCH_UAV_REGISTER,
+                scratch_buf.GetGPUVirtualAddress(),
+            );
+        }
         list.OMSetRenderTargets(1, Some(&rtv), false, None);
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
-        list6.DispatchMesh(groups * split, 1, 1);
-        list.ResourceBarrier(&[
+        if let Some(ref record) = recorded {
+            let plan = super::pso::TwoPassPlan::checked([groups, 1, 1], record_dwords as u32, split)?;
+            let views = [
+                io_buf.GetGPUVirtualAddress(), res_buf.GetGPUVirtualAddress(), mem_buf.GetGPUVirtualAddress(),
+                io_buf.GetGPUVirtualAddress(), io_buf.GetGPUVirtualAddress(), io_buf.GetGPUVirtualAddress(),
+            ];
+            crate::hle::d3d12x::bind::record_two_pass_for_test(
+                &list, &cpso, &gpu.rs, &mpso, &gpu.rs, record.clone(), split, &plan, views,
+            )?;
+        } else {
+            list.Dispatch(groups, 1, 1);
+            list.ResourceBarrier(&[uav_barrier(&res_buf)]);
+            list.SetPipelineState(&mpso);
+            list.SetGraphicsRootSignature(&gpu.rs);
+            list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+            list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+            list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        }
+        // pass 2: rasterise the records
+        if recorded.is_none() {
+            let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
+            list6.DispatchMesh(groups * split, 1, 1);
+        }
+        let mut readback_barriers = vec![
             transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        ]);
+        ];
+        if let Some(scratch_buf) = &scratch_buf {
+            readback_barriers.push(transition(
+                scratch_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ));
+        }
+        list.ResourceBarrier(&readback_barriers);
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
+        if let Some(scratch_buf) = &scratch_buf {
+            list.CopyBufferRegion(&readback, total + res_bytes, scratch_buf, 0, scratch_bytes);
+        }
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
@@ -1057,8 +1277,15 @@ pub fn mesh_draw_split(
             }
         }
         let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec();
+        let scratch_words = scratch.map(|_| {
+            std::slice::from_raw_parts(
+                (q as *const u8).add((total + res_bytes) as usize) as *const u32,
+                scratch_bytes as usize / 4,
+            )
+            .to_vec()
+        });
         readback.Unmap(0, None);
-        Ok((px, recs))
+        Ok((px, recs, scratch_words))
     }
 }
 
@@ -1113,13 +1340,14 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         bufs.push(mem_buf.ok_or("arena")?);
         }
         let mem_buf = bufs[0].clone();
+        clear_pso_diagnostics(gpu);
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+            .map_err(|x| pso_error(gpu, x))?;
         let io_bytes = (io.len() * 4) as u64;
         let res_bytes = (KERNEL_RES_DWORDS * 4) as u64;
         let upload = buffer(dev, io_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
@@ -1198,13 +1426,14 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
     let mem_len = mem.len().max(64);
     unsafe {
         let dev = &gpu.dev;
+        clear_pso_diagnostics(gpu);
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+            .map_err(|x| pso_error(gpu, x))?;
         let (io_bytes, mem_bytes) = ((io.len() * 4) as u64, (mem_len * 4) as u64);
         let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();

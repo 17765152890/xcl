@@ -43,6 +43,15 @@ impl Drop for Guard {
     }
 }
 
+/// Run host-owned file I/O without feeding it back through the title VFS.
+///
+/// The hooks are process-wide, so XCL's loader must use the original Win32
+/// paths even when a console mount has the same drive letter as the host path.
+pub fn host_io<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = Guard::enter();
+    f()
+}
+
 macro_rules! orig {
     ($slot:ident as $ty:ty) => {
         std::mem::transmute::<usize, $ty>($slot.load(Ordering::Acquire))

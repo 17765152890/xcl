@@ -282,6 +282,11 @@ pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     }
 }
 
+#[cfg(test)]
+pub(super) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+}
+
 /// Unified-memory blocks recordings hold until their allocators reset: (allocators, blocks).
 pub fn pending_blocks() -> (usize, usize) {
     PENDING.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.len()).sum()))

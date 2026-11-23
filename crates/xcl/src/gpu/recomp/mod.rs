@@ -53,7 +53,24 @@
 
 pub mod dxc;
 pub(crate) mod emit;
+pub mod mesh_alloc_export;
+pub mod mesh_control;
+mod mesh_control_slot;
+pub mod mesh_coverage;
 pub mod mesh_dispatch;
+pub mod mesh_epoch;
+mod mesh_epoch_hlsl;
+#[allow(dead_code)] // Validation prerequisite, intentionally not production-connected yet.
+mod mesh_epoch_vgpr_buffer;
+pub mod mesh_export;
+pub mod mesh_lane;
+pub mod mesh_memory;
+pub mod mesh_program;
+pub mod mesh_reduce;
+pub mod mesh_scalar;
+mod mesh_slot;
+pub mod mesh_vgpr;
+pub mod mesh_vector;
 pub mod mesh_wave;
 pub mod pso;
 pub use emit::mesh_passthrough;
@@ -573,7 +590,6 @@ type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
-
 /// Target of an s_endpgm before the end of the program: "skip to the end".
 const END: u64 = u64::MAX;
 /// "Target" of a jump back to the head of the innermost loop: `continue`.
