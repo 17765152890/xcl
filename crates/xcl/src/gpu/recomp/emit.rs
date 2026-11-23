@@ -603,13 +603,14 @@ impl Em {
                     hex(f32_const(code)?.to_bits())
                 }
             }
+            // vccz / execz: in wave32 the high word is not part of the mask (vcc_hi is a free SGPR)
             251 => {
                 let (l, h) = (self.sreg(106), self.sreg(107));
-                format!("(uint)(({l} | {h}) == 0u)")
+                if self.opt.wave64 { format!("(uint)(({l} | {h}) == 0u)") } else { format!("(uint)({l} == 0u)") }
             }
             252 => {
                 let (l, h) = (self.sreg(126), self.sreg(127));
-                format!("(uint)(({l} | {h}) == 0u)")
+                if self.opt.wave64 { format!("(uint)(({l} | {h}) == 0u)") } else { format!("(uint)({l} == 0u)") }
             }
             253 => "scc".into(),
             255 => hex(lit?),
@@ -2400,8 +2401,8 @@ impl Em {
         s
     }
 
-    /// Float result with output modifiers, as u32.
-    fn fres(m: &Mods, e: &str) -> String {
+    /// Float result with output modifiers (OMOD, CLAMP).
+    fn fmods(m: &Mods, e: &str) -> String {
         let mut s = match m.omod {
             1 => format!("(({e}) * 2.0f)"),
             2 => format!("(({e}) * 4.0f)"),
@@ -2411,7 +2412,12 @@ impl Em {
         if m.clamp {
             s = format!("saturate({s})");
         }
-        format!("asuint({s})")
+        s
+    }
+
+    /// Float result with output modifiers, as u32.
+    fn fres(m: &Mods, e: &str) -> String {
+        format!("asuint({})", Self::fmods(m, e))
     }
 
     /// u32 source expressions in operand order; SGPR-pair masks come as "lo|hi".
@@ -2567,6 +2573,11 @@ impl Em {
             }
             "v_dot2c_f32_f16" => Some(format!("asuint(mad({}, {}, mad({}, {}, asfloat({cur}))))", fh(0, true), fh(1, true), fh(0, false), fh(1, false))),
             "v_dot4c_i32_i8" => Some(format!("dot4_i8({}, {}, {cur})", src(0), src(1))),
+            // CLAMP on the integer dots: the accumulation saturates
+            "v_dot2_i32_i16" if clamp => Some(format!("sat_i32((int64_t)({} * {} + {} * {}) + (int64_t)(int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
+            "v_dot2_u32_u16" if clamp => Some(format!("(uint)min((uint64_t)({} * {} + {} * {}) + (uint64_t){}, (uint64_t)0xFFFFFFFFu)", h(0, false), h(1, false), h(0, true), h(1, true), src(2))),
+            "v_dot4_u32_u8" if clamp => Some(format!("(uint)min((uint64_t)dot4_u8({}, {}, 0u) + (uint64_t){}, (uint64_t)0xFFFFFFFFu)", src(0), src(1), src(2))),
+            "v_dot4_i32_i8" if clamp => Some(format!("sat_i32((int64_t)(int)dot4_i8({}, {}, 0u) + (int64_t)(int){})", src(0), src(1), src(2))),
             "v_dot2_i32_i16" => Some(format!("(uint)({} * {} + {} * {} + (int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
             "v_dot2_u32_u16" => Some(format!("({} * {} + {} * {} + {})", h(0, false), h(1, false), h(0, true), h(1, true), src(2))),
             "v_dot4_u32_u8" => Some(format!("dot4_u8({}, {}, {})", src(0), src(1), src(2))),
@@ -2590,6 +2601,14 @@ impl Em {
                 "v_pk_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
                 "v_pk_min_f16" => fr(format!("min({}, {})", fh(0, hi), fh(1, hi))),
                 "v_pk_max_f16" => fr(format!("max({}, {})", fh(0, hi), fh(1, hi))),
+                // CLAMP: the 16-bit integer results saturate
+                "v_pk_add_u16" if clamp => format!("min({a} + {b}, 0xFFFFu)"),
+                "v_pk_sub_u16" if clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
+                "v_pk_add_i16" if clamp => format!("((uint)clamp({} + {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi)),
+                "v_pk_sub_i16" if clamp => format!("((uint)clamp({} - {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi)),
+                "v_pk_mul_lo_u16" if clamp => format!("min({a} * {b}, 0xFFFFu)"),
+                "v_pk_mad_u16" if clamp => format!("min({a} * {b} + {c}, 0xFFFFu)"),
+                "v_pk_mad_i16" if clamp => format!("((uint)clamp({} * {} + {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi), si(2, hi)),
                 "v_pk_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
                 "v_pk_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
                 "v_pk_add_i16" => format!("((uint)({} + {}) & 0xFFFFu)", si(0, hi), si(1, hi)),
@@ -2938,7 +2957,7 @@ impl Em {
                     "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
                     "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
-                        self.line(&format!("uint {t} = asuint((float){});", f64v(0)));
+                        self.line(&format!("uint {t} = {};", Self::fres(&m, &format!("(float){}", f64v(0)))));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
@@ -2962,11 +2981,19 @@ impl Em {
                     }
                     _ => return Err("VALU 64-bit"),
                 };
-                let mut e = e;
-                if m.clamp {
-                    e = format!("saturate({e})");
+                self.line(&format!("double {t}_d = {e};"));
+                // OMOD and CLAMP on the double (HLSL's saturate has no double overload: it would
+                // round the result to float first)
+                match m.omod {
+                    1 => self.line(&format!("{t}_d *= 2.0;")),
+                    2 => self.line(&format!("{t}_d *= 4.0;")),
+                    3 => self.line(&format!("{t}_d *= 0.5;")),
+                    _ => {}
                 }
-                self.line(&format!("double {t}_d = {e}; uint {t}_l, {t}_h; asuint({t}_d, {t}_l, {t}_h);"));
+                if m.clamp {
+                    self.line(&format!("{t}_d = isnan_d({t}_d) ? 0.0 : min(max({t}_d, 0.0), 1.0);"));
+                }
+                self.line(&format!("uint {t}_l, {t}_h; asuint({t}_d, {t}_l, {t}_h);"));
                 self.write64(&dst, &format!("{t}_l"), &format!("{t}_h"));
                 return Ok(());
             }
@@ -3063,7 +3090,7 @@ impl Em {
                 fr(format!("f16tof32({h})"))
             }
             "v_cvt_f16_f32" => {
-                let h = to_f16_expr(self.dynamic_f16_rm, &fs(0));
+                let h = to_f16_expr(self.dynamic_f16_rm, &Self::fmods(&m, &fs(0)));
                 if m.opsel >> 3 & 1 == 1 {
                     format!("({cur} & 0xFFFFu) | ({h} << 16)")
                 } else if d.variant == Variant::Sdwa {
@@ -3150,6 +3177,10 @@ impl Em {
             "v_cubesc_f32" => fr(format!("cube_sc({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubetc_f32" => fr(format!("cube_tc({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubema_f32" => fr(format!("cube_ma({}, {}, {})", fs(0), fs(1), fs(2))),
+            // CLAMP: unsigned saturation
+            "v_add_nc_u32" if m.clamp => format!("select(({a} + {b}) < {a}, 0xFFFFFFFFu, {a} + {b})"),
+            "v_sub_nc_u32" if m.clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
+            "v_subrev_nc_u32" if m.clamp => format!("select({b} < {a}, 0u, {b} - {a})"),
             "v_add_nc_u32" => format!("{a} + {b}"),
             "v_sub_nc_u32" => format!("{a} - {b}"),
             "v_subrev_nc_u32" => format!("{b} - {a}"),
@@ -3174,6 +3205,7 @@ impl Em {
             "v_and_or_b32" => format!("({a} & {b}) | {c}"),
             "v_or3_b32" => format!("{a} | {b} | {c}"),
             "v_xor3_b32" => format!("{a} ^ {b} ^ {c}"),
+            "v_add3_u32" if m.clamp => format!("(uint)min((uint64_t){a} + (uint64_t){b} + (uint64_t){c}, (uint64_t)0xFFFFFFFFu)"),
             "v_add3_u32" => format!("{a} + {b} + {c}"),
             "v_xad_u32" => format!("({a} ^ {b}) + {c}"),
             "v_bfe_u32" => format!("bfe_u({a}, {b}, {c})"),
@@ -4122,7 +4154,8 @@ impl Em {
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    let _ = writeln!(h, "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);", sname(next).unwrap(), x * y * z);
+                    // TG_SIZE[5:0]: waves in the group (a last partial wave counts), [11:6]: this wave
+                    let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {

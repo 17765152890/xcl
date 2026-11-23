@@ -5658,6 +5658,105 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
 }
 
 #[test]
+/// OMOD / CLAMP where they were dropped or narrowed (#105): f64 results (saturate() has no double
+/// overload: the result went through float), v_cvt_f32_f64, v_cvt_f16_f32, and the integer
+/// saturation of v_add_nc_u32 / v_sub_nc_u32 / v_add3_u32, the packed 16-bit ops and the dots.
+fn gpu_output_modifiers_on_f64_conversions_and_integer_clamp() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // v[10:11] = clamp(v[0:1] + v[2:3]), v[12:13] = (v[0:1] + v[2:3]) * 2
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 2), ("CLAMP", 1)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 2), ("OMOD", 1)], None),
+        // v14 = clamp((float)v[4:5]), v15 = (float)v[4:5] * 0.5
+        ("V_CVT_F32_F64", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 4), ("CLAMP", 1)], None),
+        ("V_CVT_F32_F64", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 4), ("OMOD", 3)], None),
+        // v16 = f16(clamp(v6)), v17 = f16(v6 * 2)
+        ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 6), ("CLAMP", 1)], None),
+        ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 6), ("OMOD", 1)], None),
+        // unsigned saturation
+        ("V_ADD_NC_U32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 7), ("SRC1", V + 8), ("CLAMP", 1)], None),
+        ("V_SUB_NC_U32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V + 8), ("SRC1", V + 7), ("CLAMP", 1)], None),
+        ("V_ADD3_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", V + 8), ("CLAMP", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 7), ("SRC1", V + 8)], None),
+        // packed 16-bit saturation
+        ("V_PK_ADD_U16", "ENC_VOP3P", &[("VDST", 22), ("SRC0", V + 9), ("SRC1", V + 20), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        ("V_PK_SUB_U16", "ENC_VOP3P", &[("VDST", 23), ("SRC0", V + 21), ("SRC1", V + 22), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        ("V_PK_ADD_I16", "ENC_VOP3P", &[("VDST", 24), ("SRC0", V + 23), ("SRC1", V + 24), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        ("V_PK_MAD_U16", "ENC_VOP3P", &[("VDST", 25), ("SRC0", V + 25), ("SRC1", V + 25), ("SRC2", V + 26), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)], None),
+        // the dots' accumulation saturates
+        ("V_DOT4_U32_U8", "ENC_VOP3P", &[("VDST", 26), ("SRC0", V + 27), ("SRC1", V + 27), ("SRC2", V + 27), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)], None),
+        ("V_DOT4_I32_I8", "ENC_VOP3P", &[("VDST", 27), ("SRC0", V + 28), ("SRC1", V + 28), ("SRC2", V + 29), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)], None),
+        ("V_DOT4_I32_I8", "ENC_VOP3P", &[("VDST", 28), ("SRC0", V + 28), ("SRC1", V + 28), ("SRC2", V + 29), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    let mut st = KernelState::default();
+    st.sgpr[127] = 0;
+    let put64 = |v: &mut Vec<u32>, r: usize, x: f64| {
+        let b = x.to_bits();
+        v[r] = b as u32;
+        v[r + 1] = (b >> 32) as u32;
+    };
+    {
+        let v = &mut st.vgpr[0];
+        put64(v, 0, 0.5);
+        put64(v, 2, 2f64.powi(-40)); // 0.5 + 2^-40: kept by a double clamp, lost through float
+        put64(v, 4, 1.5);
+        v[6] = 0x3FC0_0000; // 1.5f
+        v[7] = 0xFFFF_FFF0;
+        v[8] = 0x20;
+        v[9] = 0xFFF0_0001;
+        v[20] = 0x0020_0002;
+        v[21] = 0x0005_0009;
+        v[22] = 0x0007_0004;
+        v[23] = 0x7FF0_8000;
+        v[24] = 0x0020_FFFF;
+        v[25] = 0x0100_0002;
+        v[26] = 0x0000_0001;
+        v[27] = 0xFFFF_FFFF;
+        v[28] = 0x8080_8080;
+        v[29] = 0x7FFF_FFFF;
+    }
+    {
+        // lane 1: the f64 clamp of 0.75 + 0.75 and of a negative sum, the f32 clamp of 0.75
+        let v = &mut st.vgpr[1];
+        put64(v, 0, 0.75);
+        put64(v, 2, 0.75);
+        put64(v, 4, -0.25);
+        v[6] = 0x3F40_0000; // 0.75f
+    }
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    let f64_at = |v: &[u32], r: usize| f64::from_bits(v[r] as u64 | (v[r + 1] as u64) << 32);
+    let (l0, l1) = (&r.vgpr[0], &r.vgpr[1]);
+    assert_eq!(f64_at(l0, 10).to_bits(), (0.5 + 2f64.powi(-40)).to_bits(), "v_add_f64 clamp keeps the double's precision");
+    assert_eq!(f64_at(l0, 12), (0.5 + 2f64.powi(-40)) * 2.0, "v_add_f64 omod * 2");
+    assert_eq!(f64_at(l1, 10), 1.0, "v_add_f64 clamp of 1.5");
+    assert_eq!(f64_at(l1, 12), 3.0, "v_add_f64 omod * 2 of 1.5");
+    assert_eq!(f32::from_bits(l0[14]), 1.0, "v_cvt_f32_f64 clamp of 1.5");
+    assert_eq!(f32::from_bits(l0[15]), 0.75, "v_cvt_f32_f64 omod * 0.5 of 1.5");
+    assert_eq!(f32::from_bits(l1[14]), 0.0, "v_cvt_f32_f64 clamp of -0.25");
+    assert_eq!(l0[16] & 0xFFFF, 0x3C00, "v_cvt_f16_f32 clamp of 1.5");
+    assert_eq!(l0[17] & 0xFFFF, 0x4200, "v_cvt_f16_f32 omod * 2 of 1.5");
+    assert_eq!(l1[16] & 0xFFFF, 0x3A00, "v_cvt_f16_f32 clamp of 0.75");
+    assert_eq!(l0[18], 0xFFFF_FFFF, "v_add_nc_u32 clamp");
+    assert_eq!(l0[19], 0, "v_sub_nc_u32 clamp");
+    assert_eq!(l0[20], 0xFFFF_FFFF, "v_add3_u32 clamp");
+    assert_eq!(l0[21], 0x10, "v_add_nc_u32 without clamp wraps");
+    assert_eq!(l0[22], 0xFFFF_0003, "v_pk_add_u16 clamp");
+    assert_eq!(l0[23], 0x0000_0005, "v_pk_sub_u16 clamp");
+    assert_eq!(l0[24], 0x7FFF_8000, "v_pk_add_i16 clamp");
+    assert_eq!(l0[25], 0xFFFF_0005, "v_pk_mad_u16 clamp");
+    assert_eq!(l0[26], 0xFFFF_FFFF, "v_dot4_u32_u8 clamp");
+    assert_eq!(l0[27], 0x7FFF_FFFF, "v_dot4_i32_i8 clamp");
+    assert_eq!(l0[28], 0x8000_FFFF, "v_dot4_i32_i8 without clamp wraps");
+}
+
+#[test]
 /// int / uint PS inputs read through v_interp_mov / p2 give their value converted to float (#107
 /// made it a bit copy; XDefiant's UI text vanished with it – see `v_interp_mov_f32` in emit.rs).
 fn ps_interp_converts_integer_inputs_and_compiles() {
