@@ -44,7 +44,10 @@ $commits = [regex]::Matches($text, 'memory: (\d+) MB committed') | ForEach-Objec
 $peak = if ($commits) { ($commits | Measure-Object -Maximum).Maximum } else { 'n/a' }
 $removals = ([regex]::Matches($text, 'device removed')).Count
 $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
-$gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name
+# the adapter the run used, as XCL logs it ("D3D12.X: backend 'real' - <name> (<n> MiB VRAM)"): the
+# first display adapter can be another one (an iGPU, a virtual display); that one only without the line
+$gpu = if ($text -match "D3D12\.X: backend 'real' \S+ (.+?) \(\d+ MiB VRAM\)") { $Matches[1] }
+       else { (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 @"
