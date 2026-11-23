@@ -19,6 +19,34 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// the build, until a worker (or a thread waiting for it) takes it
+    job: Mutex<Option<Job>>,
+}
+
+/// Run `p`'s build if nobody took it yet (on a thread with the workers' stack: translation
+/// recurses deeply) and publish the result.
+fn build(p: &Arc<Pending>) {
+    let Some(job) = p.job.lock().unwrap().take() else { return };
+    let real = std::thread::Builder::new().stack_size(64 << 20).spawn(job).map_or(0, |t| t.join().unwrap_or(0));
+    if real == 0 {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BUILT.fetch_add(1, Ordering::Relaxed);
+    }
+    let orphan = {
+        let mut done = p.done.lock().unwrap();
+        let orphan = p.orphan.load(Ordering::Acquire);
+        if !orphan {
+            p.real.store(real, Ordering::Release);
+        }
+        *done = true;
+        p.cv.notify_all();
+        orphan
+    };
+    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    if orphan {
+        release(real);
+    }
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -33,10 +61,10 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<(Arc<Pending>, Job)>>> = OnceLock::new();
+fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
@@ -44,27 +72,8 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok((p, job)) = next else { return };
-                let real = job();
-                if real == 0 {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    BUILT.fetch_add(1, Ordering::Relaxed);
-                }
-                let orphan = {
-                    let mut done = p.done.lock().unwrap();
-                    let orphan = p.orphan.load(Ordering::Acquire);
-                    if !orphan {
-                        p.real.store(real, Ordering::Release);
-                    }
-                    *done = true;
-                    p.cv.notify_all();
-                    orphan
-                };
-                // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
-                if orphan {
-                    release(real);
-                }
+                let Ok(p) = next else { return };
+                build(&p);
             });
         }
         Mutex::new(tx)
@@ -80,13 +89,13 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default() });
+    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default(), job: Mutex::new(Some(job)) });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
-    let _ = queue().lock().unwrap().send((p, job));
+    let _ = queue().lock().unwrap().send(p);
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -104,6 +113,8 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    // still queued (behind the title's thousands of pipelines): built here, now
+    build(&p);
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -147,4 +158,34 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipeline waited for while still queued behind slow ones is built by the waiter,
+    /// not after the queue (stand-ins are fake addresses; the jobs build nothing real).
+    #[test]
+    fn a_waited_pipeline_does_not_wait_for_the_queue() {
+        const SLOW_MS: u64 = 300;
+        let workers = crate::gpu::recomp::dxc::compile_threads();
+        // every worker busy, and as many slow builds again in the queue
+        for k in 0..2 * workers {
+            submit(0x7000_0000 + k * 8, false, Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
+                0
+            }));
+        }
+        let standin = 0x7100_0000;
+        submit(standin, true, Box::new(|| 0x7200_0000));
+        let t0 = std::time::Instant::now();
+        assert_eq!(resolve_wait(standin), 0x7200_0000);
+        let ms = t0.elapsed().as_millis() as u64;
+        assert!(ms < SLOW_MS, "the waiter waited {ms} ms for the queue");
+        for k in 0..2 * workers {
+            released(0x7000_0000 + k * 8);
+        }
+        assert_eq!(released(standin), 0x7200_0000);
+    }
 }
