@@ -162,13 +162,16 @@ static O_GET_ATTR_EX_A: AtomicUsize = AtomicUsize::new(0);
 static O_SET_ATTR_W: AtomicUsize = AtomicUsize::new(0);
 
 /// None = pass through untouched; Some(Ok(path)) = use path; Some(Err(code)) = fail.
-fn read_target(path: &str) -> Option<Result<String, u32>> {
-    let v = vfs::get()?;
+fn read_target_with(v: &vfs::Vfs, path: &str) -> Option<Result<String, u32>> {
     match v.classify(path) {
         Target::Pass => None,
         Target::Translated(p) => Some(Ok(p)),
         Target::Game { rel } => Some(v.read_path_rel(&rel).ok_or(vfs::ERROR_FILE_NOT_FOUND)),
     }
+}
+
+fn read_target(path: &str) -> Option<Result<String, u32>> {
+    read_target_with(vfs::get()?, path)
 }
 
 unsafe extern "system" fn hk_get_attr_w(n: *const u16) -> u32 {
@@ -305,20 +308,93 @@ unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64) -> Option<(u6
     (ok != 0).then(|| (avail.as_ref().copied().unwrap_or(0), total.as_ref().copied().unwrap_or(0)))
 }
 
-unsafe extern "system" fn hk_disk_free_ex_w(n: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
-    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
-    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
-    let Some(path) = from_wide_ptr(n) else { return orig(n, avail, total, free) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, avail, total, free), None),
+fn is_pls_path(path: &str) -> bool {
+    let p = path.trim();
+    let p = p.strip_prefix(r"\\?\")
+        .or_else(|| p.strip_prefix(r"\??\"))
+        .or_else(|| p.strip_prefix(r"\\.\"))
+        .unwrap_or(p);
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[1] == b':' {
+        if b[0].eq_ignore_ascii_case(&b's') {
+            return true;
+        }
+        if let Some(drive) = crate::state::config().pls_drive() {
+            if let Some(letter) = drive.as_bytes().first() {
+                if b[0].eq_ignore_ascii_case(letter) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn clamp_pls_space(avail: *mut u64, total: *mut u64, free: *mut u64) {
+    let quota = match crate::state::config().pls_mb {
+        0 => 4096,
+        mb => mb,
+    }
+    .saturating_mul(1024 * 1024);
+
+    unsafe {
+        if let Some(t) = total.as_mut() {
+            *t = (*t).min(quota);
+        }
+        if let Some(f) = free.as_mut() {
+            *f = (*f).min(quota);
+            if let Some(t) = total.as_ref() {
+                *f = (*f).min(*t);
+            }
+        }
+        if let Some(a) = avail.as_mut() {
+            *a = (*a).min(quota);
+            if let Some(f) = free.as_ref() {
+                *a = (*a).min(*f);
+            } else if let Some(t) = total.as_ref() {
+                *a = (*a).min(*t);
+            }
+        }
+    }
+}
+
+unsafe fn disk_free_space_ex_vfs(
+    v: &vfs::Vfs,
+    path: &str,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+    orig: impl FnOnce(*const u16, *mut u64, *mut u64, *mut u64) -> i32,
+) -> i32 {
+    let (r, real) = match read_target_with(v, path) {
+        None => (orig(wide(path).as_ptr(), avail, total, free), None),
         Some(Ok(p)) => (orig(wide(&p).as_ptr(), avail, total, free), Some(p)),
         Some(Err(e)) => {
             SetLastError(e);
             (0, None)
         }
     };
-    log_space("GetDiskFreeSpaceExW", &path, real.as_deref(), ex_answer(r, avail, total));
+    if r != 0 && is_pls_path(path) {
+        clamp_pls_space(avail, total, free);
+    }
+    log_space("GetDiskFreeSpaceExW", path, real.as_deref(), ex_answer(r, avail, total));
     r
+}
+
+unsafe extern "system" fn hk_disk_free_ex_w(n: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
+    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
+    let Some(path) = from_wide_ptr(n) else { return orig(n, avail, total, free) };
+    if let Some(v) = vfs::get() {
+        disk_free_space_ex_vfs(v, &path, avail, total, free, |p, a, t, f| orig(p, a, t, f))
+    } else {
+        let r = orig(n, avail, total, free);
+        if r != 0 && is_pls_path(&path) {
+            clamp_pls_space(avail, total, free);
+        }
+        log_space("GetDiskFreeSpaceExW", &path, None, ex_answer(r, avail, total));
+        r
+    }
 }
 
 unsafe extern "system" fn hk_disk_free_ex_a(n: *const u8, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
@@ -333,6 +409,9 @@ unsafe extern "system" fn hk_disk_free_ex_a(n: *const u8, avail: *mut u64, total
             (0, None)
         }
     };
+    if r != 0 && is_pls_path(&path) {
+        clamp_pls_space(avail, total, free);
+    }
     log_space("GetDiskFreeSpaceExA", &path, real.as_deref(), ex_answer(r, avail, total));
     r
 }
@@ -1588,5 +1667,110 @@ mod tests {
             .collect();
         after.sort();
         assert_eq!(after, vec![".", ".."]);
+    }
+
+    #[test]
+    fn disk_free_space_ex_clamps_pls_and_preserves_non_pls() {
+        let f = HookFixture::new("pls_space");
+        let pls = f.dir.join("xcldata").join("pls");
+        std::fs::create_dir_all(&pls).unwrap();
+        let mounts = vec![
+            ("G:".to_string(), f.game().to_string_lossy().to_string()),
+            ("T:".to_string(), f.temp().to_string_lossy().to_string()),
+            ("S:".to_string(), pls.to_string_lossy().to_string()),
+        ];
+        let vfs = vfs::Vfs::new(&f.game(), &f.dir.join("xcldata"), mounts);
+
+        let quota = match crate::state::config().pls_mb {
+            0 => 4096,
+            mb => mb,
+        }
+        .saturating_mul(1024 * 1024);
+
+        // 1. S:\ with host space larger than quota -> clamped to quota.
+        let host_total: u64 = 1_000_000_000_000;
+        let host_free: u64 = 500_000_000_000;
+        let mut avail = host_free;
+        let mut total = host_total;
+        let mut free = host_free;
+        let ok = unsafe {
+            disk_free_space_ex_vfs(&vfs, r"S:\", &mut avail, &mut total, &mut free, |_p, a, t, f| {
+                *a = host_free;
+                *t = host_total;
+                *f = host_free;
+                1
+            })
+        };
+        assert_eq!(ok, 1);
+        assert_eq!(total, quota);
+        assert_eq!(free, quota);
+        assert_eq!(avail, quota);
+
+        // 2. S:\ case-insensitivity: "s:\", "S:", "s:/", and subdirectories.
+        for path in [r"s:\", r"S:", r"s:/", r"S:\Users\save"] {
+            let mut avail = host_free;
+            let mut total = host_total;
+            let mut free = host_free;
+            let ok = unsafe {
+                disk_free_space_ex_vfs(&vfs, path, &mut avail, &mut total, &mut free, |_p, a, t, f| {
+                    *a = host_free;
+                    *t = host_total;
+                    *f = host_free;
+                    1
+                })
+            };
+            assert_eq!(ok, 1);
+            assert_eq!(total, quota);
+            assert_eq!(free, quota);
+            assert_eq!(avail, quota);
+        }
+
+        // 3. S:\ with host free space less than quota -> preserves exact byte count (no precision loss).
+        let small_free: u64 = 500 * 1024 * 1024 + 1234;
+        let mut avail = small_free;
+        let mut total = host_total;
+        let mut free = small_free;
+        let ok = unsafe {
+            disk_free_space_ex_vfs(&vfs, r"S:\", &mut avail, &mut total, &mut free, |_p, a, t, f| {
+                *a = small_free;
+                *t = host_total;
+                *f = small_free;
+                1
+            })
+        };
+        assert_eq!(ok, 1);
+        assert_eq!(total, quota);
+        assert_eq!(free, small_free);
+        assert_eq!(avail, small_free);
+
+        // 4. Non-S:\ drives (e.g. G:\, T:\, C:\) remain completely unchanged.
+        for path in [r"G:\", r"T:\", r"C:\"] {
+            let mut avail = host_free;
+            let mut total = host_total;
+            let mut free = host_free;
+            let ok = unsafe {
+                disk_free_space_ex_vfs(&vfs, path, &mut avail, &mut total, &mut free, |_p, a, t, f| {
+                    *a = host_free;
+                    *t = host_total;
+                    *f = host_free;
+                    1
+                })
+            };
+            assert_eq!(ok, 1);
+            assert_eq!(total, host_total, "non-S: drive total must be unchanged");
+            assert_eq!(free, host_free, "non-S: drive free must be unchanged");
+            assert_eq!(avail, host_free, "non-S: drive avail must be unchanged");
+        }
+
+        // 5. Null pointers for optional arguments do not fault.
+        let mut total = host_total;
+        let ok = unsafe {
+            disk_free_space_ex_vfs(&vfs, r"S:\", std::ptr::null_mut(), &mut total, std::ptr::null_mut(), |_p, _a, t, _f| {
+                *t = host_total;
+                1
+            })
+        };
+        assert_eq!(ok, 1);
+        assert_eq!(total, quota);
     }
 }
