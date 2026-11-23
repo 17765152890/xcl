@@ -49,7 +49,9 @@ cargo test --workspace -- --test-threads=4
 .\scripts\smoke.ps1 -Game <folder>
 ```
 
-The merge bar (`CONTRIBUTING.md`) is the workspace test with real counts, plus two smoke blocks when `crates/xcl/src` outside tests changed: one built from `main`, one from the PR head with no uncommitted changes. Paste the `xcl-smoke v1` blocks unchanged. A hand-written block or a count you did not see fails review. Smoke sets `XCL_NETWORK=0`, `XCL_RUN_SECONDS` (default 60), and `XCL_ACTIVITY=1`. Compare frames shown and peak commit against `main`. Any `device removals` or `crashes` above 0 fails `PR checks`.
+The merge bar (`CONTRIBUTING.md`, checked by `scripts/pr_check.py`) is the workspace test with real counts, plus two `xcl-smoke v1` blocks when `crates/xcl/src` outside tests changed. Paste them unchanged. A hand-written block or a count you did not see fails review. Smoke sets `XCL_NETWORK=0`, `XCL_RUN_SECONDS` (default 60), and `XCL_ACTIVITY=1`.
+
+The two blocks must be the same title and the same `seconds`. One commit is the PR head with no uncommitted changes. The other is a commit of `main`. On the PR block, `device removals` and `crashes` must be 0 and `exit` must not start with `killed`. The `main` block may show a crash when that is what the PR fixes. Frames shown on the PR must be at least 80% of `main`. Peak commit must be at most 125% of `main`. The checker is the copy of `pr_check.py` on `main`, not the PR's.
 
 GPU tests call `gpu::recomp::runner::skip_test` and still pass. Report `SKIPPED` lines; they are not coverage. `XCL_REQUIRE_GPU=wave64` or `mesh` (comma-separated) makes those skips fail. `XCL_ADAPTER=1` or a name fragment picks another adapter.
 

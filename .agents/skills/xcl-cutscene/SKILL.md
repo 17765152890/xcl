@@ -43,6 +43,6 @@ Offline services stay offline. A title that blocks the intro on Xbox Live is rep
 1. Read the latest `%LOCALAPPDATA%\XCL\<title>\logs\report.json` (and `xcl.log`). Previous run is `report.prev.json`.
 2. Rank blockers in that order: `crash`, `called_stubs` by count, `vfs.unmapped_paths`, `dstorage`, `d3d12` unknown slots and IIDs, `shaders` missing mnemonics, `xgameruntime` unimplemented slots, `audio` formats played as silence.
 3. Change one subsystem per iteration, as its own PR once the user asks to open one. Add or extend a test under `crates/xcl` or `tests/testtitle` that does not need the title's files.
-4. The title check is `scripts/smoke.ps1`, from `main` and from the commit under test. The user runs it on their files. Quote the printed `xcl-smoke` block. Do not summarize it into new numbers.
+4. The title check is `scripts/smoke.ps1` twice, same title and same duration: once on a commit of `main`, once on the commit under test with a clean tree. The user runs it on their files. Quote both printed `xcl-smoke` blocks. Do not summarize them into new numbers. The new run needs at least 80% of `main`'s frames and at most 125% of its peak commit, with no device removal and no crash. A crash on the `main` run is allowed when the change fixes that crash.
 
 Do not claim a title reached the cutscene without that run. This environment does not have retail game data. A smoke run that never reaches the code you changed still counts as a regression check; name what it does not cover under **Not tested**.
