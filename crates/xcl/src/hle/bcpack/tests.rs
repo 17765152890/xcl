@@ -4,7 +4,7 @@
 
 use super::lanes::{self, L};
 use super::rans_tables::FREQ;
-use super::{bc1, bc4, bc5, decode_lanes, lane_widths, Error};
+use super::{bc1, bc3, bc4, bc5, decode_lanes, lane_widths, Error};
 
 /// The tables the fixtures' `.bc1` files were made with: history entry `slot` has the
 /// channels `(7 * slot + 13 * k) mod range`, and a quadrant symbol is its own selectors.
@@ -35,9 +35,9 @@ fn by_unit(lane_major: &[u8], lanes: usize) -> Vec<u8> {
     (0..units * lanes).map(|i| lane_major[(i % lanes) * units + i / lanes]).collect()
 }
 
-const FIXTURES: [&str; 16] = [
+const FIXTURES: [&str; 17] = [
     "bc1-1-8", "bc1-2-0", "bc1-16-1", "bc1-16-9", "bc1-700-2", "bc1-8192-3", "bc3-16-1", "bc4-16-1", "bc5-16-1", "bc6-16-1", "bc7-2-0", "bc7-16-1",
-    "bc7-700-2", "bc7-8192-3", "bc4-300-4", "bc5-600-5",
+    "bc7-700-2", "bc7-8192-3", "bc4-300-4", "bc5-600-5", "bc3-600-6",
 ];
 
 /// The symbols of the two 64 KiB fixtures, which ship without a `.lanes` file (`generate.py`).
@@ -477,4 +477,67 @@ fn bc5_block_rebuild() {
     let mut lane1 = symbols;
     lane1[36 + 1] = 1;
     assert_eq!(bc5::assemble(&lane1, &tables), Err(Error::Lane1 { block: 1 }));
+}
+
+fn bc3_tables() -> bc3::Tables {
+    bc3::Tables {
+        history: std::array::from_fn(made_up_history),
+        pair_codes: made_up_pairs(),
+        quadrants: std::array::from_fn(|q| ((37 * q + 11) % 256) as u8),
+    }
+}
+
+#[test]
+fn bc3_fixture_decodes_to_its_blocks() {
+    let tables = bc3_tables();
+    let bin = data("bc3-600-6.bin").unwrap();
+    let want = data("bc3-600-6.bc3").unwrap();
+    assert_eq!(bc3::decode(&bin, 300 * 16, &tables).as_deref(), Ok(&want[..]));
+    let lanes = data("bc3-600-6.lanes").unwrap();
+    let d = |i: usize| bc4::back_reference(bc5::interleave(lanes[2 * i], lanes[2 * i + 1]));
+    let i = (0..300).find(|&i| d(i) > i).unwrap();
+    let mut gap = bc3_tables();
+    gap.history[256 + i - d(i)] = None;
+    assert_eq!(bc3::decode(&bin, 300 * 16, &gap), Err(Error::History { block: i, slot: 256 + i - d(i) }));
+    assert_eq!(bc3::decode(&bin, 300 * 16 - 8, &tables), Err(Error::OutputSize));
+}
+
+/// Two blocks by hand: every field, colour differences wrapping in their own range, and a
+/// prediction from a rebuilt block's colours.
+#[test]
+fn bc3_block_rebuild() {
+    let mut tables = bc3_tables();
+    tables.pair_codes = std::array::from_fn(|s| s as u8);
+    tables.quadrants = std::array::from_fn(|q| q as u8);
+    tables.history[255] = Some([200, 100, 31, 0, 5, 1, 63, 16]);
+    #[rustfmt::skip]
+    let symbols = [
+        // block 0, u0: one block back (the history's last entry); A0 +1; alpha rows' left
+        // halves; R0 +1 (wraps to 0), G0 -1 (wraps to 63), B0 +0; top-left, bottom-left quadrants
+        0, 0, 2, 0o01, 0o02, 0o03, 0o04, 2, 1, 0, 0x1B, 0xE4,
+        // u1: A1 -1; the rows' right halves; R1 -2 (wraps to 31), G1 +0, B1 +15; top-right,
+        // bottom-right quadrants
+        1, 0, 1, 0o05, 0o06, 0o07, 0o10, 3, 0, 30, 0x55, 0xAA,
+        // block 1: one block back, nothing else
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let out = bc3::assemble(&symbols, &tables).unwrap();
+    let alpha = 0o10_04_07_03_06_02_05_01u64.to_le_bytes();
+    let c0 = (0u16 << 11 | 63 << 5 | 5).to_le_bytes();
+    let c1 = (31u16 << 11 | 63 << 5 | 31).to_le_bytes();
+    #[rustfmt::skip]
+    let block = [
+        201, 99, alpha[0], alpha[1], alpha[2], alpha[3], alpha[4], alpha[5], c0[0], c0[1], c1[0], c1[1],
+        // rows 0-1 from the top quadrants 0x1B | 0x55, rows 2-3 from 0xE4 | 0xAA
+        0x5B, 0x51, 0xA4, 0xAE,
+    ];
+    assert_eq!(out[..16], block);
+    let mut copy = block;
+    copy[2..8].fill(0);
+    copy[12..16].fill(0);
+    assert_eq!(out[16..32], copy);
+    let mut lane1 = symbols;
+    lane1[12 + 1] = 1;
+    assert_eq!(bc3::assemble(&lane1, &tables), Err(Error::Lane1 { block: 0 }));
 }

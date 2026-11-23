@@ -12,9 +12,10 @@
 //!   the stream ([`bc1::Tables`]). XCL has the estimates bcpack-rs made of them
 //!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off.
 //!
-//! * the rebuild of BC4 and BC5 blocks ([`bc4`], [`bc5`]), which also needs two tables of
-//!   constants each that are not in the stream ([`bc4::Tables`], [`bc5::Tables`]). XCL has no
-//!   source for them it can take, so nothing calls it and those requests are still refused.
+//! * the rebuild of BC3, BC4 and BC5 blocks ([`bc3`], [`bc4`], [`bc5`]), which also needs
+//!   tables of constants that are not in the stream ([`bc3::Tables`], [`bc4::Tables`],
+//!   [`bc5::Tables`]). XCL has no source for them it can take, so nothing calls it and those
+//!   requests are still refused.
 //!
 //! What is not: the rebuild of the other formats. Their lanes decode, but how the symbols map
 //! to block bits is not published in a form XCL can use, so those requests are still refused.
@@ -27,6 +28,7 @@
 
 pub mod bc1;
 mod bc1_fitted;
+pub mod bc3;
 pub mod bc4;
 pub mod bc5;
 mod lanes;
