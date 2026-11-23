@@ -2443,15 +2443,17 @@ impl Em {
             }
         }
         let u64v = |i: usize| format!("(((uint64_t){} << 32) | (uint64_t){})", lo_hi[i].1, lo_hi[i].0);
+        // abs / neg on the sign bit, as the hardware applies them: `-x` is `fsub -0.0, x` in
+        // DXIL, which leaves the sign of a NaN to the driver
         let f64v = |i: usize| {
-            let mut s = format!("asdouble({}, {})", lo_hi[i].0, lo_hi[i].1);
+            let mut hi = lo_hi[i].1.clone();
             if m.abs[i.min(2)] {
-                s = format!("abs({s})");
+                hi = format!("({hi} & 0x7FFFFFFFu)");
             }
             if m.neg[i.min(2)] {
-                s = format!("(-{s})");
+                hi = format!("({hi} ^ 0x80000000u)");
             }
-            s
+            format!("asdouble({}, {hi})", lo_hi[i].0)
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let t = self.t();
