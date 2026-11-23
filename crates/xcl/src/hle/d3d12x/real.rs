@@ -3242,9 +3242,7 @@ unsafe fn go_lazy(
     r
 }
 
-/// The title's graphics pipeline has console shaders (what `go_lazy` defers). Compute pipelines
-/// are not deferred: with GTA VI's built at their first dispatch the device was removed (an
-/// invalid call, ~20 s in); there are far fewer of them and their first bind waits anyway.
+/// The title's graphics pipeline has console shaders (what `go_lazy` defers).
 unsafe fn console_graphics(desc: *const c_void) -> bool {
     use crate::gpu::recomp::pso::is_console;
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
@@ -3323,6 +3321,21 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    // console compute pipelines are built at their first dispatch too (`XCL_LAZY_COMPUTE=0`: at
+    // creation): GTA VI creates thousands while it loads and dispatches a few hundred; built at
+    // creation, AMD's driver held 60+ GB of commit within a minute and the title never left its
+    // loading screen
+    if super::pso_async::lazy()
+        && std::env::var("XCL_LAZY_COMPUTE").map_or(true, |v| v != "0")
+        && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>())
+        && shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS).is_some_and(crate::gpu::recomp::pso::is_console)
+    {
+        if let Some(hr) = own_compute(desc).and_then(|o| go_lazy(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
+            LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+            LAST_COMPUTE_RS.with(|c| c.set(0));
+            return hr;
+        }
+    }
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
