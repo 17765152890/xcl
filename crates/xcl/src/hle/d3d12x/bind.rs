@@ -31,6 +31,23 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    #[cfg(test)]
+    last_two_pass_result: Option<(usize, usize)>,
+}
+
+/// ABI allocations shared by both halves of a translated two-pass pipeline. The underlying
+/// unified-memory blocks remain owned by the command-list recording and are released only
+/// when its allocator is reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AbiBindings {
+    views: [u64; 6],
+    pub result_bytes: usize,
+}
+
+impl AbiBindings {
+    pub fn result_va(&self) -> u64 {
+        self.views[1]
+    }
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -66,33 +83,39 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+fn clear_bound_state(s: &mut State, pso: usize) {
+    s.layout = None;
+    s.args.clear();
+    s.layout_gfx = None;
+    s.args_gfx.clear();
+    s.pso = pso;
+    #[cfg(test)]
+    {
+        s.last_two_pass_result = None;
+    }
+}
+
+/// The list was reset onto `allocator` and `pso`: the previous recording's memory is the
+/// previous allocator's until that one is reset. Root arguments and arena offsets belong to
+/// the previous recording and must not survive Reset.
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
+        clear_bound_state(s, initial_pso);
         s.arena = Default::default();
-        s.pso = initial_pso;
-        s.layout = None;
-        s.args.clear();
-        s.layout_gfx = None;
-        s.args_gfx.clear();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
 }
 
-/// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
-/// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
+/// Clear command-list binding state without ending the current recording. Existing ABI
+/// allocations remain owned by this recording, but no root layout, root argument, or pipeline
+/// binding may leak across ClearState.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
-    with(list, |s| {
-        s.pso = pso;
-        s.layout = None;
-        s.args.clear();
-        s.layout_gfx = None;
-        s.args_gfx.clear();
-    });
+    with(list, |s| clear_bound_state(s, pso));
 }
 
 /// The list is gone.
@@ -100,6 +123,29 @@ pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso: usize, uma: Vec<usize>) {
+    with(list, |s| {
+        s.allocator = allocator;
+        s.pso = pso;
+        s.layout = Some(std::sync::Arc::new(console_list::Layout::default()));
+        s.args = vec![1, 2, 3, 4];
+        s.layout_gfx = Some(std::sync::Arc::new(console_list::Layout::default()));
+        s.args_gfx = vec![5, 6, 7, 8];
+        s.uma = uma;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>, Vec<u8>, Vec<usize>) {
+    with(list, |s| (s.allocator, s.pso, s.args.clone(), s.args_gfx.clone(), s.uma.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn remove_state_for_test(list: *mut c_void) {
+    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -123,7 +169,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 }
 
 /// #34 SetGraphicsRootSignature (PC #30)
-pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+pub(crate) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -142,7 +188,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_voi
 }
 
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
-pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+pub(crate) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put_in(this, true, i, offset, &bytes);
@@ -184,17 +230,34 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
-    let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if super::real::two_pass_of(pso).is_some() {
+        reject_two_pass_draw("ExecuteIndirect");
+        super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::IncompatiblePipeline, [max, u32::from(gfx), u32::from(compute)]);
+        return;
+    }
+    let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     if !gfx && !compute {
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        pc(this, sig, max, args, args_off, count_buf, count_off);
+        super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [max, 0, 0]);
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
+        }
+        super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::IncompatiblePipeline, [max, u32::from(gfx), u32::from(compute)]);
+        return;
+    }
+    if gfx {
+        if prepare_graphics_command(this).is_ok() {
+            pc(this, sig, max, args, args_off, count_buf, count_off);
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [max, 1, 0]);
+        } else {
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [max, 1, 0]);
         }
         return;
     }
@@ -202,7 +265,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            pc(this, sig, max, args, args_off, count_buf, count_off);
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [max, 0, 1]);
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -210,6 +274,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
             }
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [max, 0, 1]);
         }
     }
 }
@@ -217,9 +282,21 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
-    if let Some(list) = graphics_bound(this) {
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+    match prepare_graphics_command(this) {
+        Ok(list) => {
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+            super::structural_trace::event(this, super::structural_trace::Kind::Draw, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [vertices, instances, first_vertex]);
+        }
+        Err(category) => {
+            let outcome = if matches!(category, super::structural_trace::Category::IncompatiblePipeline) { super::structural_trace::Outcome::Rejected } else { super::structural_trace::Outcome::Skipped };
+            super::structural_trace::event(this, super::structural_trace::Kind::Draw, outcome, category, [vertices, instances, first_vertex]);
+        }
     }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn draw_instanced_for_test(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    draw_instanced(this, vertices, instances, first_vertex, first_instance)
 }
 
 thread_local! {
@@ -229,10 +306,66 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
-    if let Some(list) = graphics_bound(this) {
-        list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    match prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        Ok(list) => emit_prepared_indexed_draw(this, &list, indices, instances, first_index, base_vertex, first_instance),
+        Err(category) => {
+            let outcome = if matches!(category, super::structural_trace::Category::IncompatiblePipeline) {
+                super::structural_trace::Outcome::Rejected
+            } else {
+                super::structural_trace::Outcome::Skipped
+            };
+            super::structural_trace::event(this, super::structural_trace::Kind::DrawIndexed, outcome, category, [indices, instances, first_index]);
+        }
     }
+}
+
+/// Prepare an indexed draw exactly once. Callers own the trace for a rejected preparation so a
+/// console wrapper can report its own operation without emitting a duplicate inner event.
+pub(super) unsafe fn prepare_indexed_draw(
+    this: *mut c_void,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+) -> Result<ID3D12GraphicsCommandList, super::structural_trace::Category> {
+    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
+    prepare_graphics_command(this)
+}
+
+/// Emit an indexed draw after `prepare_indexed_draw` succeeded, without preparing a second time.
+pub(super) unsafe fn emit_prepared_indexed_draw(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::structural_trace::event(this, super::structural_trace::Kind::DrawIndexed, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [indices, instances, first_index]);
+}
+
+fn reject_two_pass_draw(what: &str) {
+    count(DRAWS_SKIPPED);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: {what} with a two-pass pipeline skipped: dispatch dimensions are unavailable");
+    }
+}
+
+/// Establish the complete state invariant for a graphics command: reject mesh two-pass
+/// metadata, bind the translated graphics ABI (or retain an ordinary PC pipeline), then apply
+/// pending draw state so a derived depth-bias PSO remains the final pipeline.
+unsafe fn prepare_graphics_command(this: *mut c_void) -> Result<ID3D12GraphicsCommandList, super::structural_trace::Category> {
+    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    if super::real::two_pass_of(pso).is_some() {
+        reject_two_pass_draw("draw");
+        return Err(super::structural_trace::Category::IncompatiblePipeline);
+    }
+    let list = graphics_bound(this).ok_or(super::structural_trace::Category::PrerequisiteUnavailable)?;
+    super::list_x::prepare_draw(this);
+    Ok(list)
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -540,6 +673,10 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    dispatch_kind(this, x, y, z, super::structural_trace::Kind::Dispatch);
+}
+
+unsafe fn dispatch_kind(this: *mut c_void, x: u32, y: u32, z: u32, kind: super::structural_trace::Kind) {
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
@@ -550,16 +687,98 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        super::structural_trace::event(this, kind, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::IncompatiblePipeline, [x, y, z]);
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            super::structural_trace::event(this, kind, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [x, y, z]);
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
             }
+            super::structural_trace::event(this, kind, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [x, y, z]);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchXRoute {
+    TwoPass(crate::gpu::recomp::pso::TwoPassPlan),
+    Compute,
+    Skip,
+}
+
+fn dispatch_x_route(metadata: Option<&super::real::TwoPassPso>, translated_compute: bool, groups: [u32; 3]) -> Result<DispatchXRoute, String> {
+    const MAX_GROUPS_PER_DIMENSION: u32 = 65_535;
+    if groups.iter().any(|&groups| groups > MAX_GROUPS_PER_DIMENSION) {
+        return Err("DispatchX group count exceeds the D3D12 per-dimension limit".into());
+    }
+    if let Some(metadata) = metadata {
+        let record_dwords = u32::try_from(metadata.record.record_dwords()).map_err(|_| "two-pass record size exceeds u32")?;
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked(groups, record_dwords, metadata.mesh_groups_per_record)?;
+        if plan.mesh_groups > MAX_GROUPS_PER_DIMENSION {
+            return Err("two-pass mesh group count exceeds the D3D12 DispatchMesh limit".into());
+        }
+        return Ok(DispatchXRoute::TwoPass(plan));
+    }
+    Ok(if translated_compute { DispatchXRoute::Compute } else { DispatchXRoute::Skip })
+}
+
+/// Console DispatchX. Mesh/geometry pipelines created as checked two-pass pipelines use the
+/// explicit compute -> UAV barrier -> pass-through mesh sequence; ordinary compute pipelines
+/// retain the Dispatch path above.
+pub(super) unsafe fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let held_pso = with(this, |s| s.pso);
+    let real_pso = super::pso_async::resolve_wait(held_pso);
+    let metadata = super::real::two_pass_of(real_pso);
+    let route = dispatch_x_route(metadata.as_deref(), super::real::is_translated_compute(real_pso), [x, y, z]);
+    match route {
+        Ok(DispatchXRoute::Compute) | Ok(DispatchXRoute::Skip) => {
+            dispatch_kind(this, x, y, z, super::structural_trace::Kind::DispatchX)
+        }
+        Ok(DispatchXRoute::TwoPass(plan)) => {
+            if plan.total_groups == 0 {
+                super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [x, y, z]);
+                return;
+            }
+            let result = (|| -> Result<(), String> {
+                let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).ok_or("command list")?;
+                // Validate the required interface before allocating an ABI record, so a cast
+                // failure cannot consume command-list arena space.
+                let _: ID3D12GraphicsCommandList6 = list.cast().map_err(|_| "two-pass recording requires ID3D12GraphicsCommandList6")?;
+                let bindings = prepare_two_pass_abi(this, &plan)?.ok_or("non-empty two-pass plan produced no ABI bindings")?;
+                if !record_two_pass(list, metadata.as_deref(), real_pso, &plan, Some(&bindings))? {
+                    return Err("non-empty two-pass submission recorded no commands".into());
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    count(DISPATCHES);
+                    super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [x, y, z]);
+                }
+                Err(e) => {
+                    count(DISPATCHES_SKIPPED);
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                        crate::xlog_warn!("D3D12.X: DispatchX with a two-pass pipeline skipped: {e}");
+                    }
+                    super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [x, y, z]);
+                }
+            }
+        }
+        Err(e) => {
+            count(DISPATCHES_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: DispatchX plan rejected: {e}");
+            }
+            super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::InvalidArguments, [x, y, z]);
         }
     }
 }
@@ -682,41 +901,145 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    let bindings = prepare_abi(this, gfx, DEFAULT_RESULT_BYTES)?;
+    bind_prepared_abi(list, pso, gfx, &bindings)?;
+    #[cfg(test)]
+    if gfx && GRAPHICS_PREP_TEST_STATE.load(Ordering::SeqCst) == 1 {
+        GRAPHICS_PREP_TEST_STATE.store(2, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static GRAPHICS_PREP_TEST_STATE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) struct GraphicsPrepTestGuard;
+
+#[cfg(test)]
+impl Drop for GraphicsPrepTestGuard {
+    fn drop(&mut self) { GRAPHICS_PREP_TEST_STATE.store(0, Ordering::SeqCst); }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_graphics_preparation_for_test() -> GraphicsPrepTestGuard {
+    assert_eq!(GRAPHICS_PREP_TEST_STATE.swap(1, Ordering::SeqCst), 0);
+    GraphicsPrepTestGuard
+}
+
+#[cfg(test)]
+pub(crate) fn note_prepare_draw_for_test() {
+    let state = GRAPHICS_PREP_TEST_STATE.load(Ordering::SeqCst);
+    if state != 0 && state != 3
+        && GRAPHICS_PREP_TEST_STATE.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        GRAPHICS_PREP_TEST_STATE.store(4, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn graphics_preparation_order_for_test() -> u64 {
+    GRAPHICS_PREP_TEST_STATE.load(Ordering::SeqCst)
+}
+
+const DEFAULT_RESULT_BYTES: usize = 256;
+
+/// Allocate one ABI record for a checked two-pass plan. Empty dispatches allocate nothing;
+/// callers may bind the returned record first as compute and then as graphics without
+/// allocating or changing its result buffer.
+pub(super) unsafe fn prepare_two_pass_abi(this: *mut c_void, plan: &crate::gpu::recomp::pso::TwoPassPlan) -> Result<Option<AbiBindings>, String> {
+    if plan.total_groups == 0 {
+        return Ok(None);
+    }
+    if plan.result_bytes == 0 {
+        return Err("two-pass result buffer is empty".into());
+    }
+    prepare_abi(this, true, plan.result_bytes).map(Some)
+}
+
+unsafe fn prepare_abi(this: *mut c_void, gfx: bool, result_bytes: usize) -> Result<AbiBindings, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
-    // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
+    // 32-bit console addresses: window 0; small pieces share the command list's arena,
+    // while caller-sized two-pass results get a dedicated block when necessary.
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma))
+            .ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
-    let table_at = copy(&args[inline..])?;
-    let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data(l, &args, table_at as u64),
-        None => vec![table_at as u32, (table_at >> 32) as u32],
+    let zeroed = |bytes: usize| -> Result<usize, String> {
+        if bytes == 0 { return Err("ABI allocation is empty".into()); }
+        let p = with(this, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma))
+            .ok_or("unified memory is full")?;
+        std::ptr::write_bytes(p, 0, bytes);
+        Ok(p as usize)
     };
-    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
+    let built = (|| -> Result<(usize, usize), String> {
+        let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
+        let table_at = copy(&args[inline..])?;
+        let mut io = match layout.as_ref() {
+            Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
+            Some(l) => console_list::user_data(l, &args, table_at as u64),
+            None => vec![table_at as u32, (table_at >> 32) as u32],
+        };
+        io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+        let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+        let res_at = zeroed(result_bytes)?;
+        Ok((io_at, res_at))
+    })();
+    let (io_at, res_at) = built?;
+    #[cfg(test)]
+    with(this, |s| s.last_two_pass_result = Some((res_at, result_bytes)));
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
+    let views = abi_views(va(io_at), va(res_at), &windows)?;
+    Ok(AbiBindings { views, result_bytes })
+}
+
+#[cfg(test)]
+pub(crate) struct DispatchRouteTestGuard(*mut c_void);
+
+#[cfg(test)]
+impl Drop for DispatchRouteTestGuard {
+    fn drop(&mut self) { forget(self.0); }
+}
+
+#[cfg(test)]
+pub(crate) fn install_dispatch_route_for_test(list: *mut c_void, pso: usize) -> DispatchRouteTestGuard {
+    with(list, |state| {
+        state.pso = pso;
+        state.last_two_pass_result = None;
+    });
+    DispatchRouteTestGuard(list)
+}
+
+#[cfg(test)]
+pub(crate) fn two_pass_result_for_test(list: *mut c_void) -> Option<(usize, usize)> {
+    with(list, |state| state.last_two_pass_result)
+}
+
+fn abi_views(io: u64, result: u64, windows: &[u64]) -> Result<[u64; 6], String> {
+    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    Ok([io, result, windows.first().copied().unwrap_or(first), windows.get(1).copied().unwrap_or(first), windows.get(2).copied().unwrap_or(first), windows.get(3).copied().unwrap_or(first)])
+}
+
+/// Bind a previously allocated ABI record. Reusing `bindings` is what keeps the result UAV
+/// identical across the compute and mesh passes.
+pub(super) unsafe fn bind_prepared_abi(list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, bindings: &AbiBindings) -> Result<(), String> {
     // a pipeline still being built in the background is waited for
     let real = super::pso_async::resolve_wait(pso);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
+        for (k, &v) in bindings.views.iter().enumerate() {
             list.SetGraphicsRootUnorderedAccessView(k as u32, v);
         }
     } else {
         list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
+        for (k, &v) in bindings.views.iter().enumerate() {
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
@@ -724,6 +1047,465 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TwoPassCommand {
+    BindCompute { pso: usize, root: usize, result_va: u64 },
+    Dispatch([u32; 3]),
+    UavBarrier { result_va: u64 },
+    BindMesh { pso: usize, root: usize, result_va: u64 },
+    DispatchMesh(u32),
+}
+
+fn two_pass_commands(
+    metadata: Option<&super::real::TwoPassPso>,
+    mesh_pso: usize,
+    plan: &crate::gpu::recomp::pso::TwoPassPlan,
+    bindings: Option<&AbiBindings>,
+    command_list6: bool,
+) -> Result<Vec<TwoPassCommand>, String> {
+    if plan.total_groups == 0 {
+        if plan.result_bytes != 0 || plan.mesh_groups != 0 || !plan.dispatch_groups.contains(&0) {
+            return Err("inconsistent empty two-pass plan".into());
+        }
+        return Ok(Vec::new());
+    }
+    if !command_list6 { return Err("two-pass recording requires ID3D12GraphicsCommandList6".into()); }
+    let metadata = metadata.ok_or("two-pass pipeline metadata is missing")?;
+    let bindings = bindings.ok_or("two-pass ABI bindings are missing")?;
+    if metadata.compute == 0 || metadata.compute_rs == 0 || metadata.mesh_rs == 0 || mesh_pso == 0 {
+        return Err("two-pass pipeline metadata contains a null object".into());
+    }
+    if bindings.result_va() == 0 || bindings.result_bytes != plan.result_bytes {
+        return Err("two-pass ABI bindings do not match the plan".into());
+    }
+    let record_dwords = u32::try_from(metadata.record.record_dwords()).map_err(|_| "two-pass record size exceeds u32")?;
+    let checked = crate::gpu::recomp::pso::TwoPassPlan::checked(plan.dispatch_groups, record_dwords, metadata.mesh_groups_per_record)?;
+    if checked != *plan { return Err("two-pass plan does not match pipeline metadata".into()); }
+    let va = bindings.result_va();
+    Ok(vec![
+        TwoPassCommand::BindCompute { pso: metadata.compute, root: metadata.compute_rs, result_va: va },
+        TwoPassCommand::Dispatch(plan.dispatch_groups),
+        TwoPassCommand::UavBarrier { result_va: va },
+        TwoPassCommand::BindMesh { pso: mesh_pso, root: metadata.mesh_rs, result_va: va },
+        TwoPassCommand::DispatchMesh(plan.mesh_groups),
+    ])
+}
+
+#[allow(dead_code)] // used only when an explicit two-pass caller is wired in
+unsafe fn bind_prepared_abi_with_root(
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    root: usize,
+    gfx: bool,
+    bindings: &AbiBindings,
+) -> Result<(), String> {
+    let root = root as *mut c_void;
+    let root = ID3D12RootSignature::from_raw_borrowed(&root).ok_or("two-pass root signature")?;
+    if gfx {
+        list.SetGraphicsRootSignature(root);
+        for (k, &v) in bindings.views.iter().enumerate() { list.SetGraphicsRootUnorderedAccessView(k as u32, v); }
+    } else {
+        list.SetComputeRootSignature(root);
+        for (k, &v) in bindings.views.iter().enumerate() { list.SetComputeRootUnorderedAccessView(k as u32, v); }
+    }
+    let pso = super::pso_async::resolve_wait(pso) as *mut c_void;
+    let pso = ID3D12PipelineState::from_raw_borrowed(&pso).ok_or("two-pass pipeline")?;
+    list.SetPipelineState(pso);
+    Ok(())
+}
+
+/// Record an explicitly planned two-pass submission. DispatchX supplies the checked plan and
+/// prepared ABI; ordinary draw interception intentionally does not infer dispatch dimensions.
+pub(super) unsafe fn record_two_pass(
+    list: &ID3D12GraphicsCommandList,
+    metadata: Option<&super::real::TwoPassPso>,
+    mesh_pso: usize,
+    plan: &crate::gpu::recomp::pso::TwoPassPlan,
+    bindings: Option<&AbiBindings>,
+) -> Result<bool, String> {
+    if plan.total_groups == 0 {
+        two_pass_commands(metadata, mesh_pso, plan, bindings, false)?;
+        return Ok(false);
+    }
+    // Cast before validating the trace so failure cannot leave a partially recorded pass.
+    let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(|_| "two-pass recording requires ID3D12GraphicsCommandList6")?;
+    let commands = two_pass_commands(metadata, mesh_pso, plan, bindings, true)?;
+    let bindings = bindings.unwrap();
+    for command in commands {
+        match command {
+            TwoPassCommand::BindCompute { pso, root, .. } => bind_prepared_abi_with_root(list, pso, root, false, bindings)?,
+            TwoPassCommand::Dispatch([x, y, z]) => list.Dispatch(x, y, z),
+            TwoPassCommand::UavBarrier { .. } => list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+            }]),
+            TwoPassCommand::BindMesh { pso, root, .. } => bind_prepared_abi_with_root(list, pso, root, true, bindings)?,
+            TwoPassCommand::DispatchMesh(groups) => list6.DispatchMesh(groups, 1, 1),
+        }
+    }
+    Ok(true)
+}
+
+/// Test-only bridge which keeps the live GPU runner on the exact production recording path.
+/// The borrowed D3D12 objects remain owned by the runner.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) unsafe fn record_two_pass_for_test(
+    list: &ID3D12GraphicsCommandList,
+    compute: &ID3D12PipelineState,
+    compute_rs: &ID3D12RootSignature,
+    mesh: &ID3D12PipelineState,
+    mesh_rs: &ID3D12RootSignature,
+    record: crate::gpu::recomp::MsInterface,
+    mesh_groups_per_record: u32,
+    plan: &crate::gpu::recomp::pso::TwoPassPlan,
+    views: [u64; 6],
+) -> Result<bool, String> {
+    let metadata = std::mem::ManuallyDrop::new(super::real::TwoPassPso {
+        compute: compute.as_raw() as usize,
+        compute_rs: compute_rs.as_raw() as usize,
+        mesh_rs: mesh_rs.as_raw() as usize,
+        record,
+        mesh_groups_per_record,
+        kind: "test",
+    });
+    let bindings = AbiBindings { views, result_bytes: plan.result_bytes };
+    record_two_pass(list, Some(&metadata), mesh.as_raw() as usize, plan, Some(&bindings))
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    static DISPATCH_X_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn abi_views_preserve_available_windows_and_repeat_the_first() {
+        assert_eq!(abi_views(11, 22, &[100]).unwrap(), [11, 22, 100, 100, 100, 100]);
+        assert_eq!(abi_views(11, 22, &[100, 200, 300]).unwrap(), [11, 22, 100, 200, 300, 100]);
+        assert!(abi_views(11, 22, &[]).is_err());
+    }
+
+    #[test]
+    fn prepared_bindings_reuse_the_exact_result_view() {
+        let bindings = AbiBindings { views: [11, 22, 100, 200, 300, 400], result_bytes: 4096 };
+        let compute = bindings;
+        let graphics = bindings;
+        assert_eq!(compute.result_va(), 22);
+        assert_eq!(graphics.result_va(), compute.result_va());
+        assert_eq!(graphics.result_bytes, 4096);
+        assert_eq!(DEFAULT_RESULT_BYTES, 256);
+    }
+
+    #[test]
+    fn empty_two_pass_plan_allocates_nothing_without_requiring_uma() {
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked([u32::MAX, 0, u32::MAX], 16, 2).unwrap();
+        let prepared = unsafe { prepare_two_pass_abi(std::ptr::null_mut(), &plan) }.unwrap();
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn reset_transfers_all_prepared_blocks_to_the_previous_allocator() {
+        let list = 0x1234usize as *mut c_void;
+        with(list, |state| { state.allocator = 7; state.uma = vec![11, 22, 33]; });
+        reset(list, 8, 9);
+        assert_eq!(super::super::console_list::take_pending_for_test(7), vec![11, 22, 33]);
+        with(list, |state| {
+            assert_eq!((state.allocator, state.pso), (8, 9));
+            assert!(state.uma.is_empty());
+        });
+        STATES.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+    }
+
+    fn two_pass_metadata() -> std::mem::ManuallyDrop<super::super::real::TwoPassPso> {
+        std::mem::ManuallyDrop::new(super::super::real::TwoPassPso {
+            compute: 10,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        })
+    }
+
+    #[test]
+    fn dispatch_x_prefers_two_pass_metadata_over_compute_classification() {
+        let metadata = two_pass_metadata();
+        let expected = crate::gpu::recomp::pso::TwoPassPlan::checked([2, 3, 1], 4, 2).unwrap();
+        assert_eq!(dispatch_x_route(Some(&metadata), true, [2, 3, 1]).unwrap(), DispatchXRoute::TwoPass(expected));
+        assert_eq!(dispatch_x_route(None, true, [2, 3, 1]).unwrap(), DispatchXRoute::Compute);
+        assert_eq!(dispatch_x_route(None, false, [2, 3, 1]).unwrap(), DispatchXRoute::Skip);
+    }
+
+    #[test]
+    fn dispatch_x_zero_groups_are_a_checked_noop_and_overflow_fails_before_recording() {
+        let metadata = two_pass_metadata();
+        let DispatchXRoute::TwoPass(empty) = dispatch_x_route(Some(&metadata), false, [65_535, 0, 65_535]).unwrap() else {
+            panic!("two-pass metadata must select the two-pass route")
+        };
+        assert_eq!((empty.total_groups, empty.result_bytes, empty.mesh_groups), (0, 0, 0));
+        assert!(dispatch_x_route(Some(&metadata), false, [65_536, 0, 1]).is_err());
+        assert!(dispatch_x_route(Some(&metadata), false, [u32::MAX, 2, 1]).is_err());
+    }
+
+    #[test]
+    fn dispatch_x_enforces_compute_and_mesh_group_boundaries() {
+        let mut metadata = two_pass_metadata();
+        metadata.mesh_groups_per_record = 1;
+        let DispatchXRoute::TwoPass(at_limit) = dispatch_x_route(Some(&metadata), false, [65_535, 1, 1]).unwrap() else {
+            panic!("expected a two-pass route")
+        };
+        assert_eq!(at_limit.mesh_groups, 65_535);
+        assert!(dispatch_x_route(Some(&metadata), false, [65_536, 1, 1]).is_err());
+
+        metadata.mesh_groups_per_record = 2;
+        let DispatchXRoute::TwoPass(below_mesh_limit) = dispatch_x_route(Some(&metadata), false, [32_767, 1, 1]).unwrap() else {
+            panic!("expected a two-pass route")
+        };
+        assert_eq!(below_mesh_limit.mesh_groups, 65_534);
+        assert!(dispatch_x_route(Some(&metadata), false, [32_768, 1, 1]).is_err());
+    }
+
+    #[test]
+    fn console_dispatch_x_entry_uses_registered_two_pass_metadata_without_allocating_for_zero_groups() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_1234usize;
+        let list = list_key as *mut c_void;
+        let metadata = super::super::real::TwoPassPso {
+            compute: 0,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        };
+        let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
+        with(list, |state| state.pso = list_key);
+        assert!(super::super::real::two_pass_of(list_key).is_some());
+        let skipped_before = COUNTS[DISPATCHES_SKIPPED].load(Ordering::SeqCst);
+
+        // This is the function installed in console command-list slot 78. The zero Y count
+        // proves the real entry performs registry lookup and checked routing, then exits before
+        // borrowing a native command list or allocating its shared ABI/result record. Ordinary
+        // compute routing would classify the synthetic PSO as untranslated and increment the
+        // skipped-dispatch counter, making this assertion mutation-sensitive to the slot wiring.
+        unsafe { super::super::list_x::dispatch_x(list, 65_535, 0, 65_535, 0) };
+        assert_eq!(COUNTS[DISPATCHES_SKIPPED].load(Ordering::SeqCst), skipped_before);
+        with(list, |state| assert!(state.uma.is_empty()));
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn console_draw_indexed_x_entry_rejects_two_pass_before_native_index_binding() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_5678usize;
+        let list = list_key as *mut c_void;
+        let metadata = super::super::real::TwoPassPso {
+            compute: 0,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        };
+        let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
+        with(list, |state| state.pso = list_key);
+        super::super::structural_trace::start_test_capture();
+        let skipped_before = COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst);
+
+        // This is the function installed in console command-list slot 81. A fake command-list
+        // pointer is intentional: two-pass rejection must happen before any native vtable call
+        // or temporary index-buffer binding. Removing the ABI preparation from the slot makes
+        // this test dereference the fake list instead of incrementing the skipped-draw count.
+        unsafe {
+            super::super::list_x::draw_indexed_x(
+                list,
+                0x1000,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT,
+                3,
+                0,
+            )
+        };
+        assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 1);
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["event"], "draw_indexed_x");
+        assert_eq!(trace[0]["outcome"], "rejected");
+        assert_eq!(trace[0]["category"], "incompatible_pipeline");
+        with(list, |state| assert!(state.uma.is_empty()));
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn standard_graphics_entries_reject_two_pass_before_native_calls() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_6789usize;
+        let list = list_key as *mut c_void;
+        let metadata = super::super::real::TwoPassPso {
+            compute: 0,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        };
+        let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
+        with(list, |state| state.pso = list_key);
+        super::super::structural_trace::start_test_capture();
+        let skipped_before = COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst);
+
+        // The fake pointer proves rejection precedes command-list borrowing or vtable access.
+        unsafe {
+            draw_instanced(list, 3, 1, 0, 0);
+            draw_indexed_instanced(list, 3, 1, 0, 0, 0);
+            execute_indirect(list, 0, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 3);
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 3);
+        for record in &trace {
+            assert_eq!(record["outcome"], "rejected");
+            assert_eq!(record["category"], "incompatible_pipeline");
+        }
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn console_draw_indexed_x_entry_rejects_invalid_index_format_with_exact_category() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list = 0x7fff_6790usize as *mut c_void;
+        super::super::structural_trace::start_test_capture();
+        unsafe {
+            super::super::list_x::draw_indexed_x(
+                list,
+                0x1000,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                3,
+                0,
+            );
+        }
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["event"], "draw_indexed_x");
+        assert_eq!(trace[0]["outcome"], "rejected");
+        assert_eq!(trace[0]["category"], "invalid_arguments");
+    }
+
+    #[test]
+    fn console_draw_indexed_x_zero_work_entry_preserves_trace_sequence() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list = 0x7fff_6791usize as *mut c_void;
+        super::super::structural_trace::start_test_capture();
+        unsafe {
+            super::super::list_x::draw_indexed_x(
+                list,
+                0x1000,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT,
+                0,
+                0,
+            );
+        }
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["sequence"], 0);
+        assert_eq!(trace[0]["event"], "draw_indexed_x");
+        assert_eq!(trace[0]["outcome"], "accepted");
+        assert_eq!(trace[0]["category"], "none");
+        assert_eq!((trace[0]["a"].as_u64(), trace[0]["b"].as_u64(), trace[0]["c"].as_u64()), (Some(0), Some(1), Some(0)));
+    }
+
+    fn seed_stale_binding_state(list: *mut c_void, pso: usize) {
+        with(list, |state| {
+            state.layout = Some(Arc::new(Layout::default()));
+            state.args = vec![1, 2, 3, 4];
+            state.layout_gfx = Some(Arc::new(Layout::default()));
+            state.args_gfx = vec![5, 6, 7, 8];
+            state.pso = pso;
+            state.last_two_pass_result = Some((0x1234, 64));
+        });
+    }
+
+    #[test]
+    fn reset_sets_initial_pipeline_and_drops_previous_root_state() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_789ausize;
+        let list = list_key as *mut c_void;
+        seed_stale_binding_state(list, 0x1111);
+
+        reset(list, 0x2222, 0x3333);
+        with(list, |state| {
+            assert_eq!((state.allocator, state.pso), (0x2222, 0x3333));
+            assert!(state.layout.is_none() && state.args.is_empty());
+            assert!(state.layout_gfx.is_none() && state.args_gfx.is_empty());
+            assert_eq!(state.last_two_pass_result, None);
+            assert!(state.uma.is_empty());
+        });
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn clear_state_replaces_pipeline_and_roots_but_keeps_recording_memory() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_89abusize;
+        let list = list_key as *mut c_void;
+        seed_stale_binding_state(list, 0x1111);
+        // A synthetic value is safe here because the test removes State directly rather than
+        // handing it to the allocator-retirement path.
+        with(list, |state| {
+            state.allocator = 0x2222;
+            state.uma = vec![0x4444];
+        });
+
+        unsafe { super::super::list_x::on_clear_state(list, 0x3333) };
+        with(list, |state| {
+            assert_eq!((state.allocator, state.pso), (0x2222, 0x3333));
+            assert!(state.layout.is_none() && state.args.is_empty());
+            assert!(state.layout_gfx.is_none() && state.args_gfx.is_empty());
+            assert_eq!(state.last_two_pass_result, None);
+            assert_eq!(state.uma, vec![0x4444]);
+        });
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn two_pass_trace_has_exact_order_and_one_result_view() {
+        let metadata = two_pass_metadata();
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked([2, 3, 1], 4, 2).unwrap();
+        let bindings = AbiBindings { views: [11, 22, 100, 200, 300, 400], result_bytes: plan.result_bytes };
+        assert_eq!(two_pass_commands(Some(&metadata), 40, &plan, Some(&bindings), true).unwrap(), vec![
+            TwoPassCommand::BindCompute { pso: 10, root: 20, result_va: 22 },
+            TwoPassCommand::Dispatch([2, 3, 1]),
+            TwoPassCommand::UavBarrier { result_va: 22 },
+            TwoPassCommand::BindMesh { pso: 40, root: 30, result_va: 22 },
+            TwoPassCommand::DispatchMesh(12),
+        ]);
+    }
+
+    #[test]
+    fn two_pass_trace_fails_closed_before_recording() {
+        let metadata = two_pass_metadata();
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked([1, 1, 1], 4, 2).unwrap();
+        let bindings = AbiBindings { views: [11, 22, 100, 200, 300, 400], result_bytes: plan.result_bytes };
+        assert!(two_pass_commands(None, 40, &plan, Some(&bindings), true).is_err());
+        assert!(two_pass_commands(Some(&metadata), 40, &plan, None, true).is_err());
+        assert!(two_pass_commands(Some(&metadata), 40, &plan, Some(&bindings), false).is_err());
+        assert!(two_pass_commands(Some(&metadata), 0, &plan, Some(&bindings), true).is_err());
+        let wrong_size = AbiBindings { result_bytes: plan.result_bytes + 4, ..bindings };
+        assert!(two_pass_commands(Some(&metadata), 40, &plan, Some(&wrong_size), true).is_err());
+        let wrong_plan = crate::gpu::recomp::pso::TwoPassPlan::checked([1, 1, 1], 8, 2).unwrap();
+        let wrong_bindings = AbiBindings { result_bytes: wrong_plan.result_bytes, ..bindings };
+        assert!(two_pass_commands(Some(&metadata), 40, &wrong_plan, Some(&wrong_bindings), true).is_err());
+    }
+
+    #[test]
+    fn empty_two_pass_trace_is_a_noop_and_overflow_is_rejected() {
+        let empty = crate::gpu::recomp::pso::TwoPassPlan::checked([u32::MAX, 0, u32::MAX], 4, 2).unwrap();
+        assert!(two_pass_commands(None, 0, &empty, None, false).unwrap().is_empty());
+        assert!(crate::gpu::recomp::pso::TwoPassPlan::checked([u32::MAX, 2, 1], 4, 2).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -747,7 +1529,7 @@ pub(super) fn tracked_pso(list: *mut c_void) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+mod binding_state_tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;

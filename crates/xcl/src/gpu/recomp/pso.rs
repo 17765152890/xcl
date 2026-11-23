@@ -1,8 +1,9 @@
 //! Console shaders in pipeline states: a shader blob a title passes to Create*PipelineState
 //! (DXBC container with XDAT/XBCH/FSSM, no usable DXIL) becomes DXIL through the recompiler,
 //! and the pipeline gets XCL's shader ABI root signature instead of the title's one:
-//! root UAVs u0 `io` (initial SGPRs = user data), u1 `res`, u2 `mem` (flat memory), plus the
-//! directly indexed descriptor heaps (images / samplers). Mapping the title's root arguments
+//! root UAVs u0 `io` (initial SGPRs = user data), u1 `res`, u2..u5 memory windows, and u6
+//! reserved for logical-wave dispatcher scratch, plus the directly indexed descriptor heaps
+//! (images / samplers). Mapping the title's root arguments
 //! onto that ABI at draw time is the next step (needs the console runtime's user-data layout).
 
 use std::collections::VecDeque;
@@ -320,6 +321,48 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
+/// Checked resource and dispatch sizing for a two-pass geometry submission.
+///
+/// Callers must supply explicit compute dispatch dimensions. Draw arguments are not
+/// interchangeable with dispatch dimensions and must not be used to construct this plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TwoPassPlan {
+    pub dispatch_groups: [u32; 3],
+    pub total_groups: u32,
+    pub result_bytes: usize,
+    pub mesh_groups: u32,
+}
+
+impl TwoPassPlan {
+    pub fn checked(dispatch_groups: [u32; 3], record_dwords: u32, mesh_groups_per_record: u32) -> Result<Self, String> {
+        if record_dwords == 0 {
+            return Err("two-pass record size is zero".into());
+        }
+        if mesh_groups_per_record == 0 {
+            return Err("two-pass mesh split is zero".into());
+        }
+        let total_groups = if dispatch_groups.contains(&0) {
+            0
+        } else {
+            dispatch_groups.into_iter().try_fold(1u32, |product, groups| product.checked_mul(groups))
+                .ok_or("two-pass dispatch group count overflow")?
+        };
+        let result_dwords = total_groups.checked_mul(record_dwords).ok_or("two-pass result size overflow")?;
+        let result_bytes_u32 = result_dwords.checked_mul(4).ok_or("two-pass result byte size overflow")?;
+        let result_bytes = usize::try_from(result_bytes_u32).map_err(|_| "two-pass result size exceeds the host address space")?;
+        let mesh_groups = total_groups.checked_mul(mesh_groups_per_record).ok_or("two-pass mesh group count overflow")?;
+        Ok(Self { dispatch_groups, total_groups, result_bytes, mesh_groups })
+    }
+}
+
+impl TwoPass {
+    /// Plan a submission using this pipeline's generated record and pass-through split.
+    pub fn plan(&self, dispatch_groups: [u32; 3]) -> Result<TwoPassPlan, String> {
+        let record_dwords = u32::try_from(self.record.record_dwords()).map_err(|_| "two-pass record size exceeds u32")?;
+        TwoPassPlan::checked(dispatch_groups, record_dwords, self.mesh_groups_per_record)
+    }
+}
+
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
@@ -419,8 +462,9 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
-        // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
+        // u0 io, u1 res, u2..u5 memory windows, u6 logical-wave dispatcher scratch.
+        // Native shaders do not reference u6 and therefore require no extra binding.
+        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..=super::mesh_dispatch::SCRATCH_UAV_REGISTER)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -706,5 +750,40 @@ mod compile_time_bench {
             batches.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         println!("100 repeated PSO shader requests, warm DXIL cache, ms: {batches:?}");
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::TwoPassPlan;
+
+    #[test]
+    fn two_pass_plan_sizes_multidimensional_and_empty_dispatches() {
+        let plan = TwoPassPlan::checked([2, 3, 4], 5, 2).unwrap();
+        assert_eq!(plan.dispatch_groups, [2, 3, 4]);
+        assert_eq!(plan.total_groups, 24);
+        assert_eq!(plan.result_bytes, 24 * 5 * 4);
+        assert_eq!(plan.mesh_groups, 48);
+
+        let empty = TwoPassPlan::checked([0, 7, 9], 5, 3).unwrap();
+        assert_eq!(empty.total_groups, 0);
+        assert_eq!(empty.result_bytes, 0);
+        assert_eq!(empty.mesh_groups, 0);
+        for dispatch_groups in [[0, u32::MAX, u32::MAX], [u32::MAX, 0, u32::MAX], [u32::MAX, u32::MAX, 0]] {
+            let empty = TwoPassPlan::checked(dispatch_groups, 5, 3).unwrap();
+            assert_eq!(empty.total_groups, 0);
+            assert_eq!(empty.result_bytes, 0);
+            assert_eq!(empty.mesh_groups, 0);
+        }
+    }
+
+    #[test]
+    fn two_pass_plan_rejects_invalid_metadata_and_each_overflow() {
+        assert!(TwoPassPlan::checked([1, 1, 1], 0, 1).is_err());
+        assert!(TwoPassPlan::checked([1, 1, 1], 1, 0).is_err());
+        assert!(TwoPassPlan::checked([u32::MAX, 2, 1], 1, 1).is_err());
+        assert!(TwoPassPlan::checked([u32::MAX, 1, 1], 2, 1).is_err());
+        assert!(TwoPassPlan::checked([u32::MAX / 4 + 1, 1, 1], 1, 1).is_err());
+        assert!(TwoPassPlan::checked([u32::MAX, 1, 1], 1, 2).is_err());
     }
 }

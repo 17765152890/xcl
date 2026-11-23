@@ -642,6 +642,14 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
     }
+    super::bind::reset(list, alloc, pso);
+    super::structural_trace::event(
+        list,
+        super::structural_trace::Kind::Create,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [ty.0 as u32, u32::from(pso != 0), 0],
+    );
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -657,6 +665,14 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::structural_trace::event(
+        list as *mut c_void,
+        super::structural_trace::Kind::Release,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [0, 0, 0],
+    );
+    super::bind::forget(list as *mut c_void);
     if let Some(old) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list)) {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -739,6 +755,14 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
 
 /// Track `ClearState` on a command list: resets dynamic state and binds `pso`.
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
+    super::bind::clear_state(list, pso);
+    super::structural_trace::event(
+        list,
+        super::structural_trace::Kind::ClearState,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [u32::from(pso != 0), 0, 0],
+    );
     let key = list as usize;
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
@@ -1150,8 +1174,8 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 }
 
 /// command list #78 DispatchX(x, y, z, flags)
-pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    super::bind::dispatch(this, x, y, z);
+pub(crate) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
+    super::bind::dispatch_x(this, x, y, z);
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
@@ -1246,6 +1270,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if close_hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if close_hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
@@ -1261,6 +1288,8 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    super::structural_trace::event(this, super::structural_trace::Kind::Submit,
+        super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [0, 0, 0]);
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes);
@@ -1272,8 +1301,12 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, init_pso);
     real::preserve_vtable(this, ext_closed);
     if reset_hr < 0 {
+        super::structural_trace::event(this, super::structural_trace::Kind::Reset,
+            super::structural_trace::Outcome::Rejected, super::structural_trace::Category::NativeFailure, [u32::from(bound_pso != 0), 0, 0]);
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    super::structural_trace::event(this, super::structural_trace::Kind::Reset,
+        super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [u32::from(bound_pso != 0), 0, 0]);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(this, &b);
@@ -1418,6 +1451,8 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
 
 /// Apply a pending fallback `RSSetDepthBiasX` override before a draw call on `list`.
 pub(super) unsafe fn prepare_draw(list: *mut c_void) {
+    #[cfg(test)]
+    super::bind::note_prepare_draw_for_test();
     if !DEPTH_BIAS_USED.load(Ordering::Acquire) {
         return;
     }
@@ -1572,7 +1607,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
 }
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
-pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
+pub(crate) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
@@ -1590,21 +1625,57 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
 
 /// command list #81 DrawIndexedX(index address, index format, index count, flags): one
 /// instance of `count` indices read from that address; the bound index buffer stays
-pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
+pub(crate) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     let stride = match format {
         DXGI_FORMAT_R16_UINT => 2,
         DXGI_FORMAT_R32_UINT => 4,
-        f => return warn(&N, "DrawIndexedX", format_args!("index format {}", f.0)),
+        f => {
+            warn(&N, "DrawIndexedX", format_args!("index format {}", f.0));
+            super::structural_trace::event(
+                this,
+                super::structural_trace::Kind::DrawIndexedX,
+                super::structural_trace::Outcome::Rejected,
+                super::structural_trace::Category::InvalidArguments,
+                [count, 0, 0],
+            );
+            return;
+        }
     };
     if count == 0 {
+        super::structural_trace::event(
+            this,
+            super::structural_trace::Kind::DrawIndexedX,
+            super::structural_trace::Outcome::Accepted,
+            super::structural_trace::Category::None,
+            [0, 1, 0],
+        );
         return;
     }
+    let list = match super::bind::prepare_indexed_draw(this, count, 1, 0, 0) {
+        Ok(list) => list,
+        Err(category) => {
+            let outcome = if matches!(category, super::structural_trace::Category::IncompatiblePipeline) {
+                super::structural_trace::Outcome::Rejected
+            } else {
+                super::structural_trace::Outcome::Skipped
+            };
+            super::structural_trace::event(this, super::structural_trace::Kind::DrawIndexedX, outcome, category, [count, 1, 0]);
+            return;
+        }
+    };
+    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
-    super::bind::draw_indexed_instanced(this, count, 1, 0, 0, 0);
-    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
+    super::bind::emit_prepared_indexed_draw(this, &list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
+    super::structural_trace::event(
+        this,
+        super::structural_trace::Kind::DrawIndexedX,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [count, 1, 0],
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1625,6 +1696,26 @@ type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u
 /// command list #10 Reset(allocator, initial pipeline): updates allocator/pipeline and clears
 /// per-recording state (queries, index buffer, depth bias, pending waits, written ranges)
 pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    // Reset is transactional from XCL's point of view.  The runtime may reject a reset (for
+    // example while the list is still open); in that case the old recording and every object
+    // keeping its resources alive still belong to the list.
+    let ext = *(this as *const usize);
+    let resolved = super::pso_async::resolve_for_bind(pso);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
+    // The PC runtime writes its own vtable into a copy list again on Reset: keep XCL's even
+    // when Reset fails, but do not otherwise commit any state on failure.
+    real::preserve_vtable(this, ext);
+    if hr < 0 {
+        super::structural_trace::event(
+            this,
+            super::structural_trace::Kind::Reset,
+            super::structural_trace::Outcome::Rejected,
+            super::structural_trace::Category::NativeFailure,
+            [u32::from(pso != 0), 0, 0],
+        );
+        return hr;
+    }
+
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -1644,11 +1735,13 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::bind::reset(this, alloc, pso);
-    // the PC runtime writes its own vtable into a list on Reset (copy lists, Agility SDK 1.620+): re-adopt it
-    let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
-    real::preserve_vtable(this, ext);
+    super::structural_trace::event(
+        this,
+        super::structural_trace::Kind::Reset,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure },
+        [u32::from(pso != 0), 0, 0],
+    );
     if hr >= 0 && !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
@@ -1761,6 +1854,9 @@ unsafe fn is_buffer(res: usize) -> bool {
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
     real::preserve_vtable(this, ext);
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
@@ -2073,6 +2169,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
+    static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn reset_test_native(this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        *(this as *mut usize) = RESET_TEST_REPLACEMENT_VT.load(Ordering::SeqCst) as usize;
+        RESET_TEST_HR.load(Ordering::SeqCst) as i32
+    }
+
     #[test]
     fn nested_occlusion_queries_end_the_outer_one_early() {
         let ty = D3D12_QUERY_TYPE_OCCLUSION;
@@ -2281,6 +2385,84 @@ mod tests {
             assert!(!s.pso_dirty);
         }
         on_release(key);
+    }
+
+    #[test]
+    fn reset_commits_state_only_after_native_success_and_always_restores_vtable() {
+        // `orig_fn` expects an adopted vtable whose preceding word points at the native table.
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = reset_test_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let replacement = 0x1234_5678usize;
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+
+        unsafe { on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        {
+            let mut g = LISTS.lock().unwrap();
+            let s = g.as_mut().unwrap().get_mut(&key).unwrap();
+            s.allocator = 0x111;
+            s.bound_pso = 0x222;
+            s.depth_bias = Some(DepthBias::new(-3.5, 0.25, 2.0));
+            s.native_bias = DepthBias::new(-4.5, 0.5, 3.0);
+            s.pso_dirty = true;
+            s.using_fallback_pso = true;
+            s.index_buffer = Some(D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: 0x5000,
+                SizeInBytes: 12,
+                Format: DXGI_FORMAT_R32_UINT,
+            });
+            s.depth_bounds = Some((0.25, 0.75));
+            s.written_ranges.push((0x6000, 0x6010));
+        }
+        super::super::bind::seed_reset_state_for_test(list, 0x111, 0x222, vec![0x4444]);
+        RESET_TEST_REPLACEMENT_VT.store(replacement as u64, Ordering::SeqCst);
+
+        // Native failure may rewrite the vtable, but must not mutate XCL's recording state or
+        // transfer its ABI allocations to the old allocator.
+        RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
+        assert!(unsafe { reset_x(list, 0x333, 0x555) } < 0);
+        assert_eq!(object[0], ext);
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&key).unwrap();
+            assert_eq!((s.allocator, s.bound_pso), (0x111, 0x222));
+            assert_eq!(s.depth_bias, Some(DepthBias::new(-3.5, 0.25, 2.0)));
+            assert_eq!(s.native_bias, DepthBias::new(-4.5, 0.5, 3.0));
+            assert!(s.pso_dirty && s.using_fallback_pso);
+            assert_eq!(s.index_buffer.as_ref().unwrap().BufferLocation, 0x5000);
+            assert_eq!(s.depth_bounds, Some((0.25, 0.75)));
+            assert_eq!(s.written_ranges, vec![(0x6000, 0x6010)]);
+        }
+        assert_eq!(
+            super::super::bind::reset_state_for_test(list),
+            (0x111, 0x222, vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![0x4444])
+        );
+        assert!(super::super::console_list::take_pending_for_test(0x111).is_empty());
+
+        // The same native call succeeding commits the new recording once and transfers the old
+        // allocation exactly once.
+        RESET_TEST_HR.store(0, Ordering::SeqCst);
+        assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
+        assert_eq!(object[0], ext);
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&key).unwrap();
+            assert_eq!((s.allocator, s.bound_pso), (0x333, 0x555));
+            assert!(s.depth_bias.is_none() && s.index_buffer.is_none() && s.depth_bounds.is_none());
+            assert!(!s.pso_dirty && !s.using_fallback_pso && s.written_ranges.is_empty());
+        }
+        assert_eq!(
+            super::super::bind::reset_state_for_test(list),
+            (0x333, 0x555, Vec::new(), Vec::new(), Vec::new())
+        );
+        assert_eq!(super::super::console_list::take_pending_for_test(0x111), vec![0x4444]);
+        assert!(super::super::console_list::take_pending_for_test(0x111).is_empty());
+
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        super::super::bind::remove_state_for_test(list);
     }
 
     #[test]
@@ -2675,10 +2857,14 @@ mod tests {
             );
             assert_eq!(after[2], before[2], "translated graphics PSO must not take the PC draw path");
             let ibs = std::mem::take(&mut *fake.index_buffers.lock().unwrap());
-            assert_eq!(ibs.len(), 2);
-            assert_eq!(ibs[0].unwrap().SizeInBytes, 48);
-            assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R32_UINT);
-            assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
+            if after[0] > before[0] {
+                assert_eq!(ibs.len(), 2);
+                assert_eq!(ibs[0].unwrap().SizeInBytes, 48);
+                assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R32_UINT);
+                assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
+            } else {
+                assert!(ibs.is_empty(), "a rejected preparation must not mutate the native index buffer");
+            }
 
             // 3. Zero count or invalid format returns early without touching IB or draws.
             let draws_before = fake.draws.lock().unwrap().len();

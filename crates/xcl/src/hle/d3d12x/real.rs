@@ -272,6 +272,19 @@ unsafe fn open_uma(device: &ID3D12Device) {
     *UMA_BUFFER.lock().unwrap() = bufs;
 }
 
+/// Open the process UMA on the synthetic runner's device exactly as device creation does in
+/// production. Repeated calls reuse the process-lifetime resources.
+#[cfg(test)]
+pub(crate) unsafe fn open_uma_for_test(device: &ID3D12Device) -> Result<(), String> {
+    if UMA_BUFFER.lock().unwrap().is_empty() { open_uma(device); }
+    if UMA_BUFFER.lock().unwrap().is_empty() {
+        let detail = UMA_ERROR.lock().unwrap().clone();
+        Err(if detail.is_empty() { "unified memory was not opened on the GPU".into() } else { detail })
+    } else {
+        Ok(())
+    }
+}
+
 pub fn stats() -> D3d12Stats {
     let classes = CLASSES
         .lock()
@@ -1440,6 +1453,25 @@ pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+#[cfg(test)]
+pub(crate) struct TranslatedGraphicsTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for TranslatedGraphicsTestGuard {
+    fn drop(&mut self) {
+        if let Some(set) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_translated_graphics_for_test(pso: usize) -> TranslatedGraphicsTestGuard {
+    let inserted = TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    assert!(inserted, "test pipeline was already registered as translated graphics");
+    TranslatedGraphicsTestGuard(pso)
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -1943,6 +1975,9 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
         let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
     }
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
     hr
 }
 
@@ -2635,6 +2670,25 @@ pub fn pso_root_signature(pso: usize) -> Option<usize> {
     PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
+#[cfg(test)]
+pub(crate) struct PsoRootTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for PsoRootTestGuard {
+    fn drop(&mut self) {
+        if let Some(map) = PSO_RS.lock().unwrap().as_mut() {
+            map.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_pso_root_for_test(pso: usize, root: usize) -> PsoRootTestGuard {
+    let old = PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, root);
+    assert!(old.is_none(), "test pipeline already has a root signature");
+    PsoRootTestGuard(pso)
+}
+
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).
 static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
 
@@ -3156,6 +3210,24 @@ pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
 
 pub fn two_pass_count() -> usize {
     TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
+}
+
+#[cfg(test)]
+pub(crate) struct TwoPassTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for TwoPassTestGuard {
+    fn drop(&mut self) {
+        let removed = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&self.0));
+        drop(removed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_two_pass_for_test(pso: usize, metadata: TwoPassPso) -> TwoPassTestGuard {
+    let previous = TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, std::sync::Arc::new(metadata));
+    assert!(previous.is_none(), "test pipeline key is already registered");
+    TwoPassTestGuard(pso)
 }
 
 /// A pipeline state stream being written: subobjects aligned as D3D12 expects
@@ -3758,6 +3830,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        for &list in chunk {
+            super::structural_trace::event(list, super::structural_trace::Kind::Submit,
+                super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [0, 0, 0]);
+        }
         super::list_x::readback_sparse_writes(this, chunk);
     });
     super::present::note_execute(this, &mapped);

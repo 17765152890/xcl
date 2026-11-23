@@ -27,6 +27,7 @@ mod rpf_probe;
 pub mod shaders;
 pub mod state;
 pub mod stubs;
+pub mod structural_trace_validate;
 pub mod tls;
 pub mod util;
 pub mod vfs;

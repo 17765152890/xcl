@@ -163,6 +163,23 @@ pub(super) fn layout_of(rs: usize) -> Option<Arc<Layout>> {
     LAYOUTS.lock().unwrap().as_ref()?.get(&rs).cloned()
 }
 
+#[cfg(test)]
+pub(crate) struct LayoutTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for LayoutTestGuard {
+    fn drop(&mut self) {
+        LAYOUTS.lock().unwrap().as_mut().and_then(|layouts| layouts.remove(&self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_layout_for_test(rs: usize, layout: Layout) -> LayoutTestGuard {
+    let old = LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(layout));
+    assert!(old.is_none(), "test root signature already has a layout");
+    LayoutTestGuard(rs)
+}
+
 // ---------------------------------------------------------------------------------------
 // pipeline states
 // ---------------------------------------------------------------------------------------
@@ -282,6 +299,11 @@ pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     }
 }
 
+#[cfg(test)]
+pub(super) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+}
+
 /// Unified-memory blocks recordings hold until their allocators reset: (allocators, blocks).
 pub fn pending_blocks() -> (usize, usize) {
     PENDING.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.len()).sum()))
@@ -373,13 +395,17 @@ macro_rules! list_forward {
 list_forward!(cl_3 = 3, cl_4 = 4, cl_5 = 5, cl_6 = 6, cl_7 = 7, cl_8 = 8);
 
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
-    match close(this) {
+    let hr = match close(this) {
         Ok(_) => S_OK,
         Err(e) => {
             crate::xlog_error!("console list: Close – {e}");
             crate::util::E_FAIL
         }
-    }
+    };
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
+    hr
 }
 
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {

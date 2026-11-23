@@ -38,6 +38,8 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl trace-validate <trace.jsonl> [--json]
+      Validates one bounded structural runtime trace. This does not enable production eligibility.
   xcl --version
 ";
 
@@ -66,6 +68,9 @@ fn main() {
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("trace-validate") if args.len() >= 2 => {
+            xcl::structural_trace_validate::run(&PathBuf::from(&args[1]), &args[2..])
+        }
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0

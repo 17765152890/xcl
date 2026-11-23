@@ -1,5 +1,55 @@
 # XCL – work handoff (status as of 2026-11-20, session 5)
 
+## Current compatibility and runtime checkpoint (2026-11-23)
+
+- The bounded validation corpus is complete: 9,282/9,282 programs decode and validate, with
+  no decode failures, rejected programs, unsupported opcodes, or unsupported forms. Measured
+  scalar and vector per-slot coverage are both 100%.
+- Console `DispatchX` now routes translated two-pass pipelines through the checked
+  compute → UAV barrier → mesh sequence. Dispatch limits are validated before allocation,
+  ordinary translated compute dispatch is unchanged, and zero-work dispatch allocates nothing.
+- Live synthetic GPU coverage invokes the actual console dispatch entry with nonzero work,
+  captures graphics root arguments, uses one shared result allocation across both passes, and
+  verifies both generated records and rendered pixels.
+- Console-specific indexed draws, standard draws, and graphics indirect execution share a
+  checked graphics preparation order: reject incompatible two-pass metadata, bind the
+  translated ABI, then apply pending draw state. Live tests verify shader-observed graphics
+  arguments, pixels, and temporary index-buffer restoration.
+- Command-list creation, `Reset`, `ClearState`, and release now synchronize the bound pipeline
+  and root-argument state. `Reset` is transactional: native failure preserves the current
+  recording and its allocation ownership; success commits the new state exactly once.
+- Current verification: 619 library tests passed, 16 ignored, 0 failed; every workspace
+  integration and end-to-end suite passed. The only build warning is a pre-existing unrelated
+  standard-library deprecation.
+- An external NVIDIA wave32 run reported the pre-existing `V_FRACT_F32(+inf)` NaN edge failure.
+  Upstream PR #68 owns the exact compare/select fix and a dedicated live GPU regression; keep this
+  branch dependent on that change rather than duplicating the contributor's work.
+- `XCL_STRUCTURAL_TRACE=<output>` enables an optional bounded structural JSONL trace for
+  command-list lifecycle, draw, dispatch, and indirect-command evidence. It uses pseudonymous
+  identifiers, fixed categories, strict event and line caps, contains no raw addresses or
+  payloads; output errors are swallowed and latch tracing off without changing command outcomes.
+- `xcl trace-validate <file> [--json]` validates structural traces offline with strict schema,
+  size, sequence, run, list, epoch, lifecycle, outcome, and category checks. Hostile lines are
+  capped at 513 bytes before rejection, and errors expose only stable line numbers and categories.
+- A release synthetic run exercised the sink and validator together: its bounded trace contained
+  158 events across 29 anonymous lists and 39 epochs, and the release CLI accepted it. The trace
+  includes command-list close and queue-submission ordering across ordinary, copy, wrapper, and
+  internal kickoff paths. Rebinding an active list advances its epoch exactly once; submit before
+  close, commands after close, stale epochs, recreation after release, incomplete lifecycles, and
+  commands without an observed creation remain rejected.
+- The optimized workspace build produces a runnable `xcl.exe`; release-mode launcher tests
+  execute the synthetic title end to end and verify that its source folder remains unchanged.
+  The complete optimized workspace suite passes, including all six GPU pipeline integration
+  tests and every launcher, console-library, shader, package, oracle, and documentation target.
+
+### Deliberate boundary
+
+The validation-only mesh scheduler and per-slot lowering remain disconnected from general
+real-program eligibility. Connecting them safely requires executable-derived shader entry
+points, dispatch dimensions, resource bindings, and runtime traces. Do not infer draw-to-dispatch
+parameters or enable broader production eligibility from synthetic coverage alone. Protected
+packages, keys, and decryption are outside the project scope.
+
 Xbox Series X|S → Windows compatibility layer (no CPU emulation), Rust (this repository).
 Design: `docs/specs/2026-11-20-xcl-design.md` (sections 5.x, including 5.7a – console shader format, 5.7b – recompiler status). Manual: `README.md`.
 Conversation with the user in Polish; everything in the repo (code, comments, messages, docs) in English. Git repo: `main`, pushed to origin; commits only at the user's request.

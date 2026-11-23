@@ -23,6 +23,7 @@ pub mod present;
 pub mod pso_async;
 pub mod real;
 pub mod sparse;
+mod structural_trace;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
