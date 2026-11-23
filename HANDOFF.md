@@ -1736,6 +1736,12 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   RAM and VRAM, not broken down); ~4.5 GB of `VirtualAlloc` with PAGE_GRAPHICS_* protection is plain memory, so
   shaders get empty buffers and GPU writes / waits there are dropped; one list fails to Close; queue #35, list #131 /
   #132 / #139 and allocator #9 are stubs; MSAA layouts.
+- `chad.dll` (`hle/xdsp.rs`): `XDspConnectWithMaximumStreamLimit` / `XDspActivate` / `XDspSubmitCommand` /
+  `XDspDeactivate` / `XDspDisconnect`. A title that treats `E_NOTIMPL` from the connect as fatal now gets a client;
+  commands complete in the call and the output block inside the registered buffer is silence. No convolution.
+  Checked with the unit tests and a local run (`XCL_NETWORK=0`): the connect that used to breakpoint the title
+  (128 streams, 1 channel, 30 s impulse, 384 KiB buffer) returns success and the title keeps compiling pipelines.
+  A later null write (`0xc0000005` at `game+0x2215c35`) is separate, during PSO creation.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
 ## Next steps (priority)

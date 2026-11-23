@@ -23,6 +23,7 @@ pub mod netoff;
 pub mod opus;
 pub mod user;
 pub mod xaudio2;
+pub mod xdsp;
 pub mod xma2;
 pub mod xg;
 pub mod xgameruntime;
@@ -91,6 +92,8 @@ pub const XCRDAPI: &str = "xcrdapi.dll";
 pub const MINUSERX: &str = "minuserx.dll";
 /// the console's audio processor (APU memory, its channel, SHAPE contexts) and decoder (xapu)
 pub const ACPHAL: &str = "acphal.dll";
+/// the console's DSP (convolution / FFT blocks over a caller-owned buffer)
+pub const CHAD: &str = "chad.dll";
 /// controllers (`GameInputCreate`)
 pub const GAMEINPUT: &str = "gameinput.dll";
 
@@ -106,6 +109,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XCRDAPI, dstorage::exports(), &[]),
         HleModule::new(XG, xg::exports(), &[]),
         HleModule::new(ACPHAL, acphal::exports(), &[]),
+        HleModule::new(CHAD, xdsp::exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
     ];
     let offline = netoff::enabled();
@@ -177,6 +181,8 @@ fn build(config: &Config) -> Registry {
     for p in ["acphal.dll", "xapu.dll"] {
         routes.push((p.into(), Route::Hle(ap)));
     }
+    let ch = idx(CHAD);
+    routes.push((CHAD.into(), Route::Hle(ch)));
     let gi = idx(GAMEINPUT);
     routes.push((GAMEINPUT.into(), Route::Hle(gi)));
     let c = idx(DXCOMPILER);
@@ -241,6 +247,7 @@ mod tests {
         assert_eq!(name("xgameruntime.dll"), Some(XGAMERUNTIME));
         assert_eq!(name("d3d12_xs.dll"), Some(D3D12X));
         assert_eq!(name("xaudio2_9.dll"), Some(XAUDIO2));
+        assert_eq!(name("chad.dll"), Some(CHAD));
         assert_eq!(name("mfplat.dll"), Some(MFPLAT));
         assert!(r.hle_for("kernel32.dll").unwrap().aliases_are_system());
         assert!(!r.hle_for("xaudio2_9.dll").unwrap().aliases_are_system());
