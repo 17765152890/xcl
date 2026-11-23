@@ -428,6 +428,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     }
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
+    let _native = super::real::NativeArgs::new([allocator]);
     f(pc, allocator, pc_pso(pso))
 }
 

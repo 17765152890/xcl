@@ -660,6 +660,42 @@ pub(super) unsafe fn preserve_vtable(this: *mut c_void, prev_ext: usize) {
     }
 }
 
+/// Adopted objects passed as *arguments* to a native D3D12 method, shown to it with their
+/// native vtable for the call. vkd3d-proton (D3D12 on Wine / Proton) recognises its command
+/// allocators and command lists by the vtable pointer (`d3d12_command_allocator_from_iface`,
+/// `d3d12_command_list_from_iface`): with XCL's extended vtable, CreateCommandList / Reset fail
+/// with E_INVALIDARG ("Invalid command allocator") and ExecuteCommandLists skips the lists.
+/// Microsoft's runtime does not check, so on Windows nothing is swapped. D3D12 requires
+/// allocators and submitted lists to be externally synchronised, so no other thread calls
+/// through them while their native vtable is in place. On drop, XCL's vtable is put back.
+pub(super) struct NativeArgs(Vec<(*mut c_void, usize)>);
+
+impl NativeArgs {
+    pub(super) unsafe fn new(objs: impl IntoIterator<Item = *mut c_void>) -> Self {
+        if !crate::util::under_wine() {
+            return Self(Vec::new());
+        }
+        let mut swapped = Vec::new();
+        for obj in objs {
+            if is_adopted(obj) {
+                let ext = *(obj as *const usize);
+                *(obj as *mut usize) = *(ext as *const usize).sub(1);
+                swapped.push((obj, ext));
+            }
+        }
+        Self(swapped)
+    }
+}
+
+impl Drop for NativeArgs {
+    fn drop(&mut self) {
+        // back to the extended vtable of the same kind (a new native table if the call changed it)
+        for &(obj, ext) in &self.0 {
+            unsafe { preserve_vtable(obj, ext) };
+        }
+    }
+}
+
 /// An adopted object gets the extended vtable of another kind (a DMA list: created as a PC
 /// list, it needs the console's DMA layout).
 pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
@@ -2460,7 +2496,10 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
-    let hr = f(this, allocator, resolved);
+    let hr = {
+        let _native = NativeArgs::new([allocator]);
+        f(this, allocator, resolved)
+    };
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
@@ -2619,7 +2658,14 @@ macro_rules! creator {
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
 creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [a1, a2]);
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
-creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+creator!(dev_create_command_list_native, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+
+/// CreateCommandList(node mask, type, allocator, initial pipeline, riid, list): the allocator
+/// with its native vtable for the call (`NativeArgs`) – for console code and XCL's own lists
+pub(super) unsafe extern "system" fn dev_create_command_list(this: *mut c_void, node: usize, ty: usize, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _native = NativeArgs::new([alloc as *mut c_void]);
+    dev_create_command_list_native(this, node, ty, alloc, pso, riid, ppv)
+}
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
@@ -2950,8 +2996,27 @@ creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 /// the title's threads suspended – a reader that holds it then blocks no other reader)
 static FENCES: std::sync::RwLock<Vec<usize>> = std::sync::RwLock::new(Vec::new());
 
-/// CreateFence: as on the PC; the fence is remembered for `end_title`
+/// D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER
+const FENCE_FLAGS_SHARED: usize = 0x1 | 0x2;
+
+/// CreateFence: as on the PC; the fence is remembered for `end_title`.
+///
+/// On Wine, the sharing flags are dropped. vkd3d-proton has two fence structures and picks
+/// one by the vtable pointer (`is_shared_ID3D12Fence1`), also later on its queue's submission
+/// thread, where `NativeArgs` cannot help. With XCL's extended vtable a shared fence is taken
+/// for an ordinary one, the submission thread blocks in `d3d12_fence_lock` and the fence
+/// never advances (ivall/xcl#175; `VKD3D_CONFIG=ignore_shared_fence` does the same). Console
+/// titles create their fences shared, but nothing in XCL exports a fence handle.
 unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flags: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let flags = if crate::util::under_wine() && flags & FENCE_FLAGS_SHARED != 0 {
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: Wine: fences are created without the sharing flags ({flags:#x}; vkd3d-proton tells shared fences by their vtable)");
+        }
+        flags & !FENCE_FLAGS_SHARED
+    } else {
+        flags
+    };
     let hr = dev_create_fence_pc(this, value, flags, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let add: RefFn = std::mem::transmute(*vt(*ppv).add(1));
@@ -4746,7 +4811,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        {
+            let _native = NativeArgs::new(chunk.iter().copied());
+            f(this, chunk.len() as u32, chunk.as_ptr());
+        }
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });

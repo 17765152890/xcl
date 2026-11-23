@@ -1498,7 +1498,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    {
+        let _native = real::NativeArgs::new(one);
+        exec(q_raw, 1, one.as_ptr());
+    }
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
@@ -1511,7 +1514,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
-    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, init_pso);
+    let reset_hr = {
+        let _native = real::NativeArgs::new([alloc as *mut c_void]);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, init_pso)
+    };
     real::preserve_vtable(this, ext_closed);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
@@ -2047,7 +2053,10 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
+    let hr = {
+        let _native = real::NativeArgs::new([alloc as *mut c_void]);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved)
+    };
     real::preserve_vtable(this, ext);
     if hr < 0 {
         return hr;
