@@ -257,6 +257,10 @@ fn is_writable(va: usize, bytes: usize) -> bool {
 
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 
+/// The most lines (64 bytes each, 256 MiB) a `ClzeroLoop` fault zeroes: a longer loop goes on
+/// from its clzero at the next fault.
+const CLZERO_LOOP_LINES: u64 = (256 << 20) / 64;
+
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
 unsafe fn code_at(rip: usize) -> String {
     let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
@@ -320,17 +324,24 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
                 &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,
             ];
-            let end = *regs[end_reg as usize & 15] as usize;
-            let start = ctx.Rax as usize;
-            if end > start && (end - start) < 2 * 1024 * 1024 * 1024 {
-                let bytes = end - start;
-                if is_writable(start, bytes) {
-                    std::ptr::write_bytes(start as *mut u8, 0, bytes);
-                } else {
+            let end = *regs[end_reg as usize & 15];
+            let Some(mut run) = crate::insn::clzero_loop(ctx.Rax, end, CLZERO_LOOP_LINES) else {
+                return 0; // rAX wraps: the real loop faults
+            };
+            if !is_writable(run.line as usize, (run.lines * 64) as usize) {
+                // not one writable region: a line a fault, so the loop stops at the line the CPU
+                // would fault on
+                run = crate::insn::clzero_loop(ctx.Rax, end, 1).expect("one line fits where more did");
+                if !is_writable(run.line as usize, 64) {
                     return 0;
                 }
             }
-            ctx.Rax = end as u64;
+            std::ptr::write_bytes(run.line as *mut u8, 0, (run.lines * 64) as usize);
+            ctx.Rax = run.rax;
+            ctx.EFlags = (ctx.EFlags & !crate::insn::ARITH_FLAGS) | run.flags;
+            if !run.done {
+                return -1; // the jb is taken: back at the clzero, which faults again and goes on
+            }
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
@@ -970,5 +981,69 @@ mod tests {
             }
         }
         modules::unregister_mapped(code);
+    }
+
+    /// The CLZERO loop (#278): whole lines from the one rAX is in, rAX advanced by whole lines,
+    /// one line when the end is at or below rAX, the cmp's flags, and a span over two regions
+    /// zeroed a line a fault, back at the clzero until the loop ends.
+    #[test]
+    fn clzero_loop_zeroes_whole_lines_as_the_cpu() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        // two pages, two regions (different protections, both writable)
+        let buf = unsafe { VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize };
+        assert!(code != 0 && buf != 0);
+        unsafe {
+            assert_ne!(VirtualAlloc(buf as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            assert_ne!(VirtualAlloc((buf + 0x1000) as *const _, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize, 0);
+        }
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_loop.exe".into(), path: "clzero_loop.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // clzero; add rax, 0x40; cmp rax, rdx; jb back
+        let bytes = [0x0Fu8, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4];
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len()) };
+        let run = |rax: usize, rdx: usize| unsafe {
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x2000);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, rax as u64, rdx as u64, 0x202 | crate::insn::ARITH_FLAGS);
+            let mut faults = 0;
+            while ctx.Rip == code as u64 {
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                faults += 1;
+                assert!(faults <= 0x2000 / 64, "the loop ends");
+            }
+            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.EFlags, 0x202 | crate::insn::cmp_flags(ctx.Rax, rdx as u64), "the last cmp's flags");
+            let zeroed: Vec<usize> = (0..0x2000).filter(|&i| *((buf + i) as *const u8) == 0).collect();
+            let span = zeroed.first().map_or(0..0, |&a| a..zeroed.last().unwrap() + 1);
+            assert_eq!(zeroed.len(), span.len(), "one span");
+            (span, ctx.Rax as usize - buf, faults)
+        };
+        // unaligned start and an end in the middle of a line: whole lines, rAX keeps its offset
+        assert_eq!(run(buf + 0x110, buf + 0x1C1), (0x100..0x1C0, 0x1D0, 1));
+        // end at or below rAX: one line, rAX one line on
+        assert_eq!(run(buf + 0x200, buf + 0x200), (0x200..0x240, 0x240, 1));
+        assert_eq!(run(buf + 0x220, buf), (0x200..0x240, 0x260, 1));
+        // across the two regions: a line a fault until the rest is in one region (0xF80, 0xFC0,
+        // then 0x1000..0x1080 at once)
+        assert_eq!(run(buf + 0xF80, buf + 0x1080), (0xF80..0x1080, 0x1080, 3));
+        // into memory that is not there: what was zeroed stays, and the fault is the title's
+        unsafe {
+            VirtualFree((buf + 0x1000) as *mut _, 0x1000, windows_sys::Win32::System::Memory::MEM_DECOMMIT);
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x1000);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx) = (code as u64, (buf + 0xFC0) as u64, (buf + 0x1080) as u64);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!((ctx.Rip, ctx.Rax), (code as u64, (buf + 0x1000) as u64));
+            assert_eq!(emulate_console_only(&mut ctx), 0);
+            assert!((0xFC0..0x1000).all(|i| *((buf + i) as *const u8) == 0));
+            VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+        modules::unregister_mapped(code);
+        unsafe { VirtualFree(code as *mut _, 0, MEM_RELEASE) };
     }
 }

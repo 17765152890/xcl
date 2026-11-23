@@ -11,7 +11,8 @@ pub enum ConsoleOnly {
     Clwb,
     /// `clzero`: zero the 64-byte cache line at rAX
     Clzero,
-    /// `clzero` loop: `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` – zero `[rax..reg)`
+    /// `clzero` loop: `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` – zero the lines from rAX
+    /// on until rAX reaches the register (`clzero_loop`; `end_reg` is never rax)
     ClzeroLoop { end_reg: u8 },
     /// `rdpru`: ecx = 0 MPERF / 1 APERF → edx:eax (a counter)
     Rdpru,
@@ -59,6 +60,47 @@ pub fn insertq(dst: u64, src: u64, len: u8, idx: u8) -> u64 {
     let ones = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
     let mask = ones.checked_shl(idx).unwrap_or(0);
     (dst & !mask) | ((src & ones).checked_shl(idx).unwrap_or(0) & mask)
+}
+
+/// The arithmetic flags in EFLAGS: CF, PF, AF, ZF, SF and OF.
+pub const ARITH_FLAGS: u32 = 0x8D5;
+
+/// The arithmetic flags `cmp a, b` (64-bit) leaves.
+pub fn cmp_flags(a: u64, b: u64) -> u32 {
+    let r = a.wrapping_sub(b);
+    let cf = (a < b) as u32;
+    let pf = (r as u8).count_ones() % 2 == 0;
+    let af = (a ^ b ^ r) & 0x10 != 0;
+    let zf = r == 0;
+    let sf = r >> 63 != 0;
+    let of = ((a ^ b) & (a ^ r)) >> 63 != 0;
+    cf | (pf as u32) << 2 | (af as u32) << 4 | (zf as u32) << 6 | (sf as u32) << 7 | (of as u32) << 11
+}
+
+/// What the `ClzeroLoop` emulation does on one fault: zero `lines` 64-byte lines from `line`,
+/// leave rAX and the flags as the last `add` / `cmp` did and, when the loop is not `done`, stay
+/// at the clzero (the next fault goes on from there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClzeroRun {
+    pub line: u64,
+    pub lines: u64,
+    pub rax: u64,
+    pub flags: u32,
+    pub done: bool,
+}
+
+/// The `clzero; add rax, 0x40; cmp rax, end; jb` loop from `rax`, at most `max_lines` (at least
+/// one) of its iterations. As the CPU runs it: the body runs at least once (an `end` at or below
+/// rAX zeroes one line), each clzero zeroes the line rAX is in (an unaligned rAX zeroes the line
+/// below it; rAX moves by whole lines), and the loop ends at the first rAX not below `end`
+/// (unsigned). None when rAX would wrap past the top of the address space, where the real loop
+/// faults anyway.
+pub fn clzero_loop(rax: u64, end: u64, max_lines: u64) -> Option<ClzeroRun> {
+    let after_one = rax.checked_add(64)?;
+    let total = if end <= after_one { 1 } else { (end - rax).div_ceil(64) };
+    let lines = total.min(max_lines.max(1));
+    let rax_after = rax.checked_add(lines.checked_mul(64)?)?;
+    Some(ClzeroRun { line: rax & !63, lines, rax: rax_after, flags: cmp_flags(rax_after, end), done: lines == total })
 }
 
 /// The length of a ModRM-encoded operand (ModRM, SIB and displacement) at `b[0]`, None when the
@@ -116,12 +158,16 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
         (0x01, Some(0xFC)) => {
             // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
             // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
-            // prefix – it is stepped alone, the loop is taken from the next one)
+            // prefix – it is stepped alone, the loop is taken from the next one). The ModRM must be
+            // mod 3 with rax in r/m – anything else compares another register or memory – and the
+            // register is not rax itself (`cmp rax, rax` never loops: the clzero is stepped alone).
             if code.len() >= i + 12
                 && !code[..i].contains(&0x67)
                 && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
                 && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
                 && code[i + 8] == 0x39
+                && code[i + 9] & 0xC7 == 0xC0
+                && (code[i + 7], code[i + 9]) != (0x48, 0xC0)
                 && code[i + 10..i + 12] == [0x72, 0xF4]
             {
                 let rex_r = code[i + 7] == 0x4C;
@@ -179,6 +225,99 @@ mod tests {
         assert_eq!(insertq(0x1111, 0xDEAD_BEEF_0000_0000, 0, 0), 0xDEAD_BEEF_0000_0000);
         for (v, len, idx) in [(0x0123_4567_89AB_CDEFu64, 12u8, 20u8), (u64::MAX, 63, 1), (0x55, 3, 0)] {
             assert_eq!(extrq(insertq(0, v, len, idx), len, idx), extrq(v, len, 0));
+        }
+    }
+
+    /// The loop's tail with `cmp` bytes `rex 39 modrm`.
+    fn loop_with(rex: u8, modrm: u8) -> [u8; 12] {
+        [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, rex, 0x39, modrm, 0x72, 0xF4]
+    }
+
+    /// Only `cmp rax, <reg>` (ModRM mod 3, r/m 0, no REX.B) ends a CLZERO loop (#278).
+    #[test]
+    fn clzero_loop_needs_cmp_rax_with_a_register() {
+        for (reg, modrm) in [(1u8, 0xC8u8), (2, 0xD0), (3, 0xD8), (4, 0xE0), (5, 0xE8), (6, 0xF0), (7, 0xF8)] {
+            assert_eq!(decode(&loop_with(0x48, modrm)), Some((ConsoleOnly::ClzeroLoop { end_reg: reg }, 12)), "{modrm:02x}");
+            assert_eq!(decode(&loop_with(0x4C, modrm)), Some((ConsoleOnly::ClzeroLoop { end_reg: reg + 8 }, 12)), "{modrm:02x}");
+        }
+        assert_eq!(decode(&loop_with(0x4C, 0xC0)), Some((ConsoleOnly::ClzeroLoop { end_reg: 8 }, 12)), "cmp rax, r8");
+        // not the loop: the clzero alone
+        for (rex, modrm, what) in [
+            (0x48, 0xC0, "cmp rax, rax: never loops"),
+            (0x48, 0xD1, "cmp rcx, rdx"),
+            (0x48, 0xCA, "cmp rdx, rcx"),
+            (0x48, 0x10, "cmp [rax], rdx"),
+            (0x48, 0x50, "cmp [rax+disp8], rdx"),
+            (0x48, 0x90, "cmp [rax+disp32], rdx"),
+            (0x49, 0xD0, "cmp r8, rdx (REX.B)"),
+            (0x4D, 0xD0, "cmp r8, r10 (REX.B)"),
+        ] {
+            assert_eq!(decode(&loop_with(rex, modrm)), Some((ConsoleOnly::Clzero, 3)), "{what}");
+        }
+    }
+
+    #[test]
+    fn cmp_flags_match_the_cpu() {
+        const CF: u32 = 1;
+        const PF: u32 = 4;
+        const AF: u32 = 0x10;
+        const ZF: u32 = 0x40;
+        const SF: u32 = 0x80;
+        const OF: u32 = 0x800;
+        assert_eq!(cmp_flags(5, 5), ZF | PF);
+        assert_eq!(cmp_flags(0x40, 0x80), CF | SF | PF); // r = 0xFFFF_FFFF_FFFF_FFC0
+        assert_eq!(cmp_flags(0x80, 0x40), 0); // r = 0x40: one bit, odd parity
+        assert_eq!(cmp_flags(0x10, 0x01), AF | PF); // r = 0x0F: four bits, borrow out of bit 3
+        assert_eq!(cmp_flags(0x8000_0000_0000_0000, 1), OF | AF | PF); // r = 0x7FFF..FF
+        assert_eq!(cmp_flags(0, 1), CF | SF | AF | PF);
+        assert_eq!(cmp_flags(1, 0) & !ARITH_FLAGS, 0);
+    }
+
+    /// The loop as the CPU runs it (#278): whole lines from rAX's, rAX by whole lines, at least
+    /// one iteration, and the flags of the last cmp.
+    #[test]
+    fn clzero_loop_runs_like_the_cpu() {
+        /// The loop stepped one iteration at a time, as the CPU does it.
+        fn reference(mut rax: u64, end: u64) -> (u64, u64, u64, u32) {
+            let (line, mut lines) = (rax & !63, 0);
+            loop {
+                lines += 1;
+                rax += 64;
+                if rax >= end {
+                    return (line, lines, rax, cmp_flags(rax, end));
+                }
+            }
+        }
+        let full = |rax, end| clzero_loop(rax, end, u64::MAX).unwrap();
+        // aligned, and a whole number of lines: [0x1000, 0x1100)
+        assert_eq!(full(0x1000, 0x1100), ClzeroRun { line: 0x1000, lines: 4, rax: 0x1100, flags: cmp_flags(0x1100, 0x1100), done: true });
+        // an unaligned start: the line below it, and rAX keeps its offset
+        assert_eq!(full(0x1010, 0x1100), ClzeroRun { line: 0x1000, lines: 4, rax: 0x1110, flags: cmp_flags(0x1110, 0x1100), done: true });
+        // an end that is not a whole number of lines away: the last line is zeroed whole
+        assert_eq!(full(0x1000, 0x1081), ClzeroRun { line: 0x1000, lines: 3, rax: 0x10C0, flags: cmp_flags(0x10C0, 0x1081), done: true });
+        // end at or below rAX: the body still runs once
+        for end in [0x1000, 0x0FFF, 0, 0x1040] {
+            let r = full(0x1000, end);
+            assert_eq!((r.line, r.lines, r.rax, r.done), (0x1000, 1, 0x1040, true), "end {end:#x}");
+        }
+        // a run cut to max_lines leaves rAX below end (CF set: the jb is taken) and is not done
+        let r = clzero_loop(0x1000, 0x2000, 16).unwrap();
+        assert_eq!((r.line, r.lines, r.rax, r.done), (0x1000, 16, 0x1400, false));
+        assert_eq!(r.flags & 1, 1);
+        let rest = full(r.rax, 0x2000);
+        assert_eq!((rest.line, rest.lines, rest.rax), (0x1400, 48, 0x2000));
+        assert_eq!(clzero_loop(0x1000, 0x2000, 0).unwrap().lines, 1, "at least one line a fault");
+        // rAX wrapping past the top of the address space: left to fault
+        assert_eq!(clzero_loop(u64::MAX - 0x20, 0, u64::MAX), None);
+        assert_eq!(clzero_loop(u64::MAX - 0x1010, u64::MAX, u64::MAX), None, "the last add wraps");
+        assert_eq!(clzero_loop(u64::MAX - 0x1000, u64::MAX, u64::MAX).map(|r| (r.lines, r.rax)), Some((64, u64::MAX)), "it just reaches the top");
+        // against the stepped loop
+        for rax in [0x1_0000u64, 0x1_0001, 0x1_003F, 0x1_0040, 0x1_0077] {
+            for end in [0u64, 0x1_0000, 0x1_0001, 0x1_0040, 0x1_0041, 0x1_00C0, 0x1_00FF, 0x1_1000, 0x1_1001] {
+                let r = full(rax, end);
+                assert_eq!((r.line, r.lines, r.rax, r.flags), reference(rax, end), "rax {rax:#x} end {end:#x}");
+                assert!(r.done);
+            }
         }
     }
 
