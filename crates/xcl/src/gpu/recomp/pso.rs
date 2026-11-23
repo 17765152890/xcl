@@ -367,10 +367,13 @@ struct ShaderKey {
 }
 
 struct ShaderEntry {
+    key: Arc<ShaderKey>,
+    bucket_index: usize,
     blob: Vec<u8>,
     shader: Arc<Compiled>,
     bytes: usize,
-    last_used: u64,
+    older: Option<usize>,
+    newer: Option<usize>,
 }
 
 fn entry_bytes(key: &ShaderKey, blob: &[u8], shader: &Compiled) -> usize {
@@ -381,12 +384,15 @@ fn entry_bytes(key: &ShaderKey, blob: &[u8], shader: &Compiled) -> usize {
 }
 
 struct ShaderCache {
-    entries: HashMap<ShaderKey, Vec<ShaderEntry>>,
+    // Slots are stable until eviction. Each entry knows its position in its collision bucket.
+    buckets: HashMap<Arc<ShaderKey>, Vec<usize>>,
+    slots: Vec<Option<ShaderEntry>>,
+    free: Vec<usize>,
+    oldest: Option<usize>,
+    newest: Option<usize>,
     bytes: usize,
     limit: usize,
-    entry_count: usize,
     max_entries: usize,
-    clock: u64,
 }
 
 impl ShaderCache {
@@ -397,54 +403,81 @@ impl ShaderCache {
 
     fn with_max_entries(limit: usize, max_entries: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            buckets: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            oldest: None,
+            newest: None,
             bytes: 0,
             limit,
-            entry_count: 0,
             max_entries: max_entries.max(1),
-            clock: 0,
         }
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
-        self.entry_count
+        self.slots.len() - self.free.len()
     }
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.entry_count == 0
+        self.oldest.is_none()
+    }
+
+    fn find(&self, key: &ShaderKey, blob: &[u8]) -> Option<usize> {
+        self.buckets.get(key)?.iter().copied().find(|&id| {
+            self.slots[id].as_ref().unwrap().blob == blob
+        })
+    }
+
+    fn unlink(&mut self, id: usize) {
+        let entry = self.slots[id].as_ref().unwrap();
+        let (older, newer) = (entry.older, entry.newer);
+        if let Some(prev) = older {
+            self.slots[prev].as_mut().unwrap().newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(next) = newer {
+            self.slots[next].as_mut().unwrap().older = older;
+        } else {
+            self.newest = older;
+        }
+    }
+
+    fn append_newest(&mut self, id: usize) {
+        let entry = self.slots[id].as_mut().unwrap();
+        entry.older = self.newest;
+        entry.newer = None;
+        if let Some(prev) = self.newest {
+            self.slots[prev].as_mut().unwrap().newer = Some(id);
+        } else {
+            self.oldest = Some(id);
+        }
+        self.newest = Some(id);
     }
 
     fn get(&mut self, key: &ShaderKey, blob: &[u8]) -> Option<Arc<Compiled>> {
-        let bucket = self.entries.get_mut(key)?;
-        let entry = bucket.iter_mut().find(|e| e.blob == blob)?;
-        self.clock += 1;
-        entry.last_used = self.clock;
-        Some(entry.shader.clone())
+        let id = self.find(key, blob)?;
+        if self.newest != Some(id) {
+            self.unlink(id);
+            self.append_newest(id);
+        }
+        Some(self.slots[id].as_ref().unwrap().shader.clone())
     }
 
-    fn evict_oldest(&mut self) -> bool {
-        let Some((key, idx)) = self
-            .entries
-            .iter()
-            .flat_map(|(k, bucket)| bucket.iter().enumerate().map(move |(i, e)| (e.last_used, k, i)))
-            .min_by_key(|&(tick, _, _)| tick)
-            .map(|(_, k, i)| (k.clone(), i))
-        else {
-            return false;
-        };
-        let empty = {
-            let bucket = self.entries.get_mut(&key).unwrap();
-            let removed = bucket.swap_remove(idx);
-            self.bytes -= removed.bytes;
-            self.entry_count -= 1;
-            bucket.is_empty()
-        };
-        if empty {
-            self.entries.remove(&key);
+    fn remove(&mut self, id: usize) {
+        self.unlink(id);
+        let entry = self.slots[id].take().unwrap();
+        let bucket = self.buckets.get_mut(&entry.key).unwrap();
+        bucket.swap_remove(entry.bucket_index);
+        if let Some(&moved) = bucket.get(entry.bucket_index) {
+            self.slots[moved].as_mut().unwrap().bucket_index = entry.bucket_index;
         }
-        true
+        if bucket.is_empty() {
+            self.buckets.remove(&entry.key);
+        }
+        self.bytes -= entry.bytes;
+        self.free.push(id);
     }
 
     fn insert(&mut self, key: ShaderKey, blob: &[u8], shader: Arc<Compiled>) {
@@ -452,31 +485,30 @@ impl ShaderCache {
         if bytes > self.limit {
             return;
         }
-        if let Some(bucket) = self.entries.get_mut(&key) {
-            if let Some(pos) = bucket.iter().position(|e| e.blob == blob) {
-                let removed = bucket.swap_remove(pos);
-                self.bytes -= removed.bytes;
-                self.entry_count -= 1;
-                if bucket.is_empty() {
-                    self.entries.remove(&key);
-                }
-            }
+        if let Some(id) = self.find(&key, blob) {
+            self.remove(id);
         }
-        while self.bytes + bytes > self.limit || self.entry_count >= self.max_entries {
-            if !self.evict_oldest() {
-                break;
-            }
+        while self.bytes > self.limit - bytes || self.len() >= self.max_entries {
+            self.remove(self.oldest.unwrap());
         }
-        self.clock += 1;
-        let last_used = self.clock;
-        self.entries.entry(key).or_default().push(ShaderEntry {
+        let id = self.free.pop().unwrap_or_else(|| {
+            self.slots.push(None);
+            self.slots.len() - 1
+        });
+        let key = Arc::new(key);
+        let bucket = self.buckets.entry(key.clone()).or_default();
+        self.slots[id] = Some(ShaderEntry {
+            key,
+            bucket_index: bucket.len(),
             blob: blob.to_vec(),
             shader,
             bytes,
-            last_used,
+            older: None,
+            newer: None,
         });
+        bucket.push(id);
+        self.append_newest(id);
         self.bytes += bytes;
-        self.entry_count += 1;
     }
 }
 
@@ -1082,6 +1114,22 @@ mod shader_cache_tests {
         assert_eq!(cache.len(), 300);
         assert!(cache.get(&key(0), b"a").is_some());
         assert!(cache.get(&key(1), b"a").is_none());
+    }
+
+    #[test]
+    fn eviction_repairs_collision_bucket_after_slot_reuse() {
+        let mut cache = ShaderCache::with_max_entries(1 << 20, 3);
+        for blob in [b"a", b"b", b"c"] {
+            cache.insert(key(1), blob, Arc::new(compiled(blob[0])));
+        }
+        cache.get(&key(1), b"a").unwrap();
+        cache.insert(key(2), b"d", Arc::new(compiled(4))); // evicts b, moves c in the bucket
+        cache.insert(key(2), b"e", Arc::new(compiled(5))); // evicts c via its updated index
+        assert!(cache.get(&key(1), b"b").is_none());
+        assert!(cache.get(&key(1), b"c").is_none());
+        assert_eq!(cache.get(&key(1), b"a").unwrap().dxil[0], b'a');
+        assert_eq!(cache.get(&key(2), b"d").unwrap().dxil[0], 4);
+        assert_eq!(cache.get(&key(2), b"e").unwrap().dxil[0], 5);
     }
 
     #[test]
