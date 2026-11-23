@@ -719,7 +719,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             std::env::set_var("XCL_DXC_THREADS", "4");
         }
         let pause = opt("--pause").unwrap_or(0);
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), gentle, pause, t0);
+        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
+        let pipelines = args.iter().any(|a| a == "--pipelines") || gentle;
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), gentle, pause, only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -739,18 +741,38 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--gentle` compiles with four threads at below-normal priority and builds two compute
 /// pipelines at a time on its own device, so the driver cache fills without taking the machine.
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, gentle: bool, pause_ms: usize, t0: std::time::Instant) -> i32 {
+/// `--pipelines`: each compute program's pipeline is made on the GPU with XCL's ABI root
+/// signature and that program's static samplers, so the driver's cache is what the title finds.
+/// `--only STAGE` keeps one stage. Nothing is drawn.
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, gentle: bool, pause_ms: usize, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+    let most = if gentle {
+        2
+    } else {
+        std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1)
+    };
+    let pipes = if pipelines {
+        match Pipelines::new(most) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("xcl shaders --pipelines: no GPU device: {e}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = if gentle { 4 } else { recomp::dxc::compile_threads() + 2 };
+    // no title runs: only a little commit is kept free besides the compiles
+    recomp::dxc::set_memory_reserve(2);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     if gentle {
         bake_priority();
     }
-    let pipes = if gentle { Pipelines::new(2).map_err(|e| eprintln!("xcl shaders: pipelines stay for the game ({e})")).ok() } else { None };
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -772,7 +794,48 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, ge
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
+                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let mut busy = false;
+                // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
+                // into the translation cache too, so the title does not translate it again
+                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok(c) => {
+                            if let Some(p) = pipes.as_ref() {
+                                if p.alive() {
+                                    busy = true;
+                                    p.make(&c);
+                                }
+                            }
+                            compiled.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let mut g = errors.lock().unwrap();
+                            if g.len() < 10 {
+                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                            }
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    };
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if gentle && pause_ms > 0 && busy {
+                        std::thread::sleep(std::time::Duration::from_millis(pause_ms as u64));
+                    }
+                    if (gentle && d % 25 == 0) || (!gentle && d % 200 == 0) {
+                        let pipes_n = pipes.as_ref().map(|p| p.counts()).unwrap_or((0, 0));
+                        eprintln!(
+                            "  {d}/{n} shaders, {} new, {} cached, {} pipelines ({:.0} s)",
+                            compiled.load(Ordering::Relaxed),
+                            cached.load(Ordering::Relaxed),
+                            pipes_n.0,
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+                    continue;
+                }
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -850,6 +913,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, ge
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if let Some(p) = pipes.as_ref() {
+        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+    }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
     }

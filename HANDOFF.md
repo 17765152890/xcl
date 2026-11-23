@@ -45,7 +45,8 @@ NOTE:
   opcodes that are free in the spec. The VALU literal is fetched when ANY SRC0/1/2 field = 255, even one unused by the opcode
   (the compiler hides a hash in `v_nop` this way) – displayed as `v_nop ; lit 0x…`. SDWA/DPP: src0 from the extension dword (was `?249`).
 - **Shader capture** (`gpu/shader.rs`): classification DXIL/DXBC/**xbox-native**/unknown container/ELF/raw RDNA2,
-  dump to `<data>\shaders\` (+ `*.fssmN.bin`, `*.rdna2.txt`); `report.json → shaders`: `xbox_hw_stages`, `xbox_errors`,
+  dump to `<data>\shaders\` (+ `*.fssmN.bin`, `*.rdna2.txt`; since 2026-11-23 only with `XCL_DUMP_SHADERS=1`, as the
+  `.hlsl` and `recomp_*` below); `report.json → shaders`: `xbox_hw_stages`, `xbox_errors`,
   `rdna2_instructions`, `rdna2_undecoded_dwords`, `rdna2_mnemonics` (histogram sorted in descending order).
 - **Console shader format** (`gpu/xbox.rs`, NEW) – worked out on `shaders.rpf` (23 869 shaders, all stages),
   full description in the design §5.7a: DXIL (bitcode `NOBC`) → XDAT (+0x18; offsets from the program header) → XBCH v3 (zlib from +0x18)
@@ -1747,6 +1748,31 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   shift probably starts below #72); the debug layer's Map of a DEFAULT-heap resource and a CopyResource source in
   UAV state; queue #35, list #131 / #132 and allocator #9 are stubs (#9 registers the title's command memory callback);
   MSAA layouts. With ~21 GB taken by other programs, 1 - 2 GB of commit stays free during a run.
+- Loading (later): it shows 2 frames and then loads for minutes – ~3 500 shaders, 2 076 of them compute (13 M RDNA2
+  instructions, 611 programs over 10 000). Shader dumps (and a second translation of each) are now only made with
+  `XCL_DUMP_SHADERS=1` (they took 4.8 GB and its loading threads' time); translations are kept on disk
+  (`<dxil cache>	ranslated`, by the console bytes and the XCL binary's hash); `XCL_FRAME_DUMP=n`. During a run DXC
+  compiles one program at a time (`wait_for_memory`: under 6 GB of commit free; ~11 GB of the system's commit is the
+  kernel's and drivers'), so the caches are filled without the title: `xcl shaders <shaders.rpf> --precompile --only cs`
+  (compute programs through `pso::console_to_dxil_in`, the title's path: both caches).
+- Then at ~183 s: 5 mesh pipelines with an "AS" subobject fail and the title writes to address 0. The AS slot (24)
+  holds an MS container (`MSNC_VS_TransformUnlit_*`, NGG) – the console's subobject numbering around AS / MS is to be
+  checked (the message now lists the stream's subobject types and both hashes); translation failures are each logged
+  once (the first five hid this one).
+- Then: 30 fps (1 449 frames in 60 s), image black. Why it showed 2 frames: its present thread waits on frame event
+  type 2, scheduled at offset 0 like the origin; the clock picked one event per deadline (`min_by_key`: the
+  origin) – now every type due at a deadline fires (`frame.rs`). On the way: queue #35 of the newer layout is
+  ExecuteCommandListsX(count, lists, value, flags) – all its command lists went through the stub; list #61 is
+  ExecuteIndirect (the shift by two from #59 on; #61 went to FillMemoryWith32BitValueX); bottom-of-pipe writes into
+  memory outside unified memory are done by the CPU after the queue's work (`cpu_writes.rs`), waits there read it on
+  the CPU; compute pipelines of 256 KB of DXIL or more are built in the background (the driver takes ~30 s for
+  its 1 MB ray-tracing resolve programs; 2 at a time, within `wait_for_memory`), and a bind of one not started
+  builds it itself (`pso_async`); DXC -O1 from 1 MB of HLSL; `xcl shaders --precompile --pipelines` makes the
+  compute pipelines on the GPU too (the driver's cache: 41.6 s then 0.2 s; 4 at a time, `XCL_PIPELINE_THREADS`);
+  `XCL_TRACE_FRAME_EVENTS`; the end of a timed run logs the PresentX calls.
+- Measured: the memory-window `switch` of every memory access doubles DXC + driver time (one 21 000-instruction CS:
+  41.6 s with 4 windows, 22.5 s with 1); heap-indexed windows would remove it but a raw buffer view cannot cover a
+  4 GiB window – a redesign of how shaders reach title memory.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
 ## Next steps (priority)
