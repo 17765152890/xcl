@@ -274,13 +274,25 @@ const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
 fn trace_mem(what: &str, addr: usize, size: usize, flags: u64, protect: u32, got: usize) {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     static N: AtomicUsize = AtomicUsize::new(0);
-    let limit = *LIMIT.get_or_init(|| match std::env::var("XCL_TRACE_MEM") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(60),
-        Err(_) => 0,
-    });
-    if size >= 0x1_0000 && N.fetch_add(1, Ordering::Relaxed) < limit {
-        crate::xlog_info!("mem: {what}({addr:#x}, {size:#x}, flags {flags:#x}, protect {protect:#x}) → {got:#x}");
-    }
+    // the call being traced may have just set the title's last error: reading XCL_TRACE_MEM
+    // (the first trace; 203 ERROR_ENVVAR_NOT_FOUND when unset) or logging must not change it
+    keep_last_error(|| {
+        let limit = *LIMIT.get_or_init(|| match std::env::var("XCL_TRACE_MEM") {
+            Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(60),
+            Err(_) => 0,
+        });
+        if size >= 0x1_0000 && N.fetch_add(1, Ordering::Relaxed) < limit {
+            crate::xlog_info!("mem: {what}({addr:#x}, {size:#x}, flags {flags:#x}, protect {protect:#x}) → {got:#x}");
+        }
+    })
+}
+
+/// `f` with the thread's last error as it was before.
+fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
+    let e = unsafe { fnd::GetLastError() };
+    let r = f();
+    unsafe { fnd::SetLastError(e) };
+    r
 }
 
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
@@ -1644,6 +1656,21 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Tracing keeps the last error of the call it traces: a lookup of an unset environment
+    /// variable (what trace_mem's first call does) sets 203, which reached the title instead of
+    /// the call's own error (xmem_and_physical_page_overflows_fail_cleanly, when it ran first).
+    #[test]
+    fn tracing_keeps_the_last_error() {
+        unsafe {
+            fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+            keep_last_error(|| assert!(std::env::var_os("XCL_TEST_UNSET_8C1F").is_none()));
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+            fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+            trace_mem("test", 0, 0x1_0000, 0, 0, 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
     }
 
     /// The GDK thunks' device type lookup: RegOpenKeyW(HKLM\…\OEM) + RegQueryValueExW(ConsoleMode).
