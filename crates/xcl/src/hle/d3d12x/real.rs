@@ -1025,7 +1025,7 @@ unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
     h
 }
 
-unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system-unwind" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let mut d = if desc.is_null() { [u32::MAX; 4] } else { *desc };
     d[0] = pc_heap_type(d[0]);
     let desc = if desc.is_null() { desc } else { &d as *const [u32; 4] };
@@ -1838,7 +1838,7 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
 }
 
 /// descriptor heap Release (every caller): a console heap's slots go with it
-unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
+unsafe extern "system-unwind" fn heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
@@ -2204,7 +2204,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
 /// – the arguments of the PC's CreateCommittedResource3 (heap properties, flags, desc, layout,
 /// clear value, protected session, castable formats, riid, resource).
 #[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn dev_create_committed_resource_layout_x(
+unsafe extern "system-unwind" fn dev_create_committed_resource_layout_x(
     this: *mut c_void,
     props: usize,
     flags: u32,

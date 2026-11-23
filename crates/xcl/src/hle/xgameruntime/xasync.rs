@@ -50,7 +50,7 @@ pub struct XAsyncProviderData {
     pub context: *mut c_void,
 }
 
-pub type XAsyncProvider = unsafe extern "system" fn(u32, *const XAsyncProviderData) -> HRESULT;
+pub type XAsyncProvider = unsafe extern "system-unwind" fn(u32, *const XAsyncProviderData) -> HRESULT;
 
 /// The PC runtime's XAsync / XTaskQueue object (0 = XCL's own queues). Its slots: 3 GetStatus,
 /// 4 GetResultSize, 5 Cancel, 6 Run, 7 Begin, 9 Schedule, 10 Complete, 11 GetResult.
@@ -74,14 +74,14 @@ unsafe fn pc(slot: usize) -> Option<(usize, usize)> {
 /// XAsync object when in use – its queue handles mean nothing to XCL's – else XCL's).
 pub unsafe fn submit_callback(queue: *mut c_void, port: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
     if let Some((o, f)) = pc(18) {
-        let f: unsafe extern "system" fn(usize, *mut c_void, u32, *mut c_void, usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut c_void, u32, *mut c_void, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, queue, port, ctx, cb);
     }
     super::taskqueue::XTaskQueueSubmitCallback(queue, port, ctx, cb)
 }
 
-pub type XAsyncWork = unsafe extern "system" fn(*mut XAsyncBlock) -> HRESULT;
-type Completion = unsafe extern "system" fn(*mut XAsyncBlock);
+pub type XAsyncWork = unsafe extern "system-unwind" fn(*mut XAsyncBlock) -> HRESULT;
+type Completion = unsafe extern "system-unwind" fn(*mut XAsyncBlock);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -195,7 +195,7 @@ unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_
     f(op, &data)
 }
 
-unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
+unsafe extern "system-unwind" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
     let b = ctx as *mut XAsyncBlock;
     let Lookup::Active(s) = lookup(b) else { return };
     if canceled {
@@ -217,7 +217,7 @@ unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
     }
 }
 
-unsafe extern "system" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
+unsafe extern "system-unwind" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
     let b = ctx as *mut XAsyncBlock;
     if (*b).callback != 0 {
         let f: Completion = std::mem::transmute((*b).callback);
@@ -225,7 +225,7 @@ unsafe extern "system" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
     }
 }
 
-pub unsafe extern "system" fn XAsyncBegin(
+pub unsafe extern "system-unwind" fn XAsyncBegin(
     b: *mut XAsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
@@ -233,7 +233,7 @@ pub unsafe extern "system" fn XAsyncBegin(
     provider: usize,
 ) -> HRESULT {
     if let Some((o, f)) = pc(7) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, context, identity, _identity_name, provider);
     }
     if b.is_null() || provider == 0 {
@@ -249,18 +249,30 @@ pub unsafe extern "system" fn XAsyncBegin(
         cv: Condvar::new(),
     });
     register_state(b, s.clone());
+    // Remove `b` from `ACTIVE` if the guest `OP_BEGIN` provider unwinds.
+    struct BeginCleanup(usize, u64);
+    impl Drop for BeginCleanup {
+        fn drop(&mut self) {
+            let mut map = active_map().lock().unwrap_or_else(|e| e.into_inner());
+            if map.get(&self.0).is_some_and(|cur| cur.id == self.1) {
+                map.remove(&self.0);
+            }
+        }
+    }
+    let cleanup = BeginCleanup(b as usize, s.id);
     // A failing Begin fails the async call, not XAsyncBegin (libHttpClient): the caller gets
     // the error once, through the block, and not also as this return value.
     let hr = call_provider(&s, OP_BEGIN, b, std::ptr::null_mut(), 0);
+    std::mem::forget(cleanup);
     if hr < 0 {
         XAsyncComplete(b, hr, 0);
     }
     S_OK
 }
 
-pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
+pub unsafe extern "system-unwind" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
     if let Some((o, f)) = pc(9) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
         return f(o, b, delay_ms);
     }
     if b.is_null() {
@@ -276,9 +288,9 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     S_OK
 }
 
-pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
+pub unsafe extern "system-unwind" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
     if let Some((o, f)) = pc(10) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
         return f(o, b, result, required);
     }
     // E_PENDING is not a completion: the provider still has work to do (libHttpClient).
@@ -318,12 +330,18 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         let mut g = s.inner.lock().unwrap();
         g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
     }
+    struct NotifyGuard<'a>(&'a Condvar);
+    impl Drop for NotifyGuard<'_> {
+        fn drop(&mut self) {
+            self.0.notify_all();
+        }
+    }
+    let _notify = NotifyGuard(&s.cv);
     if cb != 0 {
         if let Some(q) = taskqueue::queue_from(queue_ptr) {
             let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
-    s.cv.notify_all();
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
@@ -372,7 +390,7 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
     }
 }
 
-pub unsafe extern "system" fn XAsyncGetResult(
+pub unsafe extern "system-unwind" fn XAsyncGetResult(
     b: *mut XAsyncBlock,
     identity: *const c_void,
     size: usize,
@@ -380,7 +398,7 @@ pub unsafe extern "system" fn XAsyncGetResult(
     used: *mut usize,
 ) -> HRESULT {
     if let Some((o, f)) = pc(11) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *const c_void, usize, *mut c_void, *mut usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *const c_void, usize, *mut c_void, *mut usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, identity, size, buffer, used);
     }
     match lookup(b) {
@@ -443,9 +461,9 @@ pub unsafe extern "system" fn XAsyncGetResult(
     }
 }
 
-pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
+pub unsafe extern "system-unwind" fn XAsyncCancel(b: *mut XAsyncBlock) {
     if let Some((o, f)) = pc(5) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock) = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock) = std::mem::transmute(f);
         return f(o, b);
     }
     let Lookup::Active(s) = lookup(b) else { return };
@@ -459,9 +477,9 @@ pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
     let _ = call_provider(&s, OP_CANCEL, b, std::ptr::null_mut(), 0);
 }
 
-pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
+pub unsafe extern "system-unwind" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
     if let Some((o, f)) = pc(6) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, work);
     }
     if b.is_null() || work == 0 {
@@ -501,7 +519,7 @@ struct Payload {
     work: Mutex<Option<Box<dyn FnOnce() -> Result<PayloadBuf, HRESULT> + Send>>>,
 }
 
-unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+unsafe extern "system-unwind" fn payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
     let d = &*data;
     let p = &*(d.context as *const Payload);
     match op {
@@ -1224,6 +1242,58 @@ mod tests {
             assert_eq!(ctx_err.cb_calls.load(Ordering::SeqCst), 1);
 
             taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn provider_and_completion_callbacks_unwind_cleanly() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe extern "system-unwind" fn throwing_provider(op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_BEGIN {
+                panic!("guest XAsyncProvider unwind");
+            }
+            S_OK
+        }
+
+        unsafe extern "system-unwind" fn noop_provider(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+            S_OK
+        }
+
+        unsafe extern "system-unwind" fn throwing_completion(_b: *mut XAsyncBlock) {
+            panic!("guest XAsync completion callback unwind");
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+
+            // (a) Unwind from guest XAsyncProvider::OP_BEGIN across XAsyncBegin.
+            let mut b1: XAsyncBlock = std::mem::zeroed();
+            b1.queue = q;
+            let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncBegin(&mut b1, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), throwing_provider as usize)
+            }));
+            assert!(r1.is_err(), "XAsyncBegin must propagate unwind from guest provider");
+            assert!(
+                !active_map().lock().unwrap().contains_key(&(&mut b1 as *mut XAsyncBlock as usize)),
+                "BeginCleanup must remove active entry when OP_BEGIN unwinds"
+            );
+
+            // (b) Unwind from guest completion callback across XAsyncComplete (MODE_IMMEDIATE).
+            let mut b2: XAsyncBlock = std::mem::zeroed();
+            b2.queue = q;
+            b2.callback = throwing_completion as usize;
+            assert_eq!(XAsyncBegin(&mut b2, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), noop_provider as usize), S_OK);
+            let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncComplete(&mut b2, S_OK, 0);
+            }));
+            assert!(r2.is_err(), "XAsyncComplete must propagate unwind from guest completion callback");
+            assert_eq!(XAsyncGetStatus(&mut b2, false), S_OK);
+            assert!(taskqueue::XTaskQueueIsEmpty(q, taskqueue::PORT_COMPLETION));
+
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
             taskqueue::XTaskQueueCloseHandle(q);
         }
     }
