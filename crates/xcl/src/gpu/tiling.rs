@@ -396,13 +396,41 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
+        let lay = &self.layout;
+        let e = 1usize << lay.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
+        // linear (a retail game's video planes): each row is whole, `pitch` elements apart
+        if lay.mode == 0 && lay.base_xor == 0 && l.origin == (0, 0) {
+            let row = l.width * e;
+            for (y, d) in out.chunks_exact_mut(row).enumerate() {
+                let o = l.offset + y * l.pitch.div_ceil(lay.block_w) * lay.block_bytes;
+                let n = row.min(src.len().saturating_sub(o) / e * e);
+                if n > 0 {
+                    d[..n].copy_from_slice(&src[o..o + n]);
+                }
+            }
+            return out;
+        }
+        // `element_at` with its x and y parts worked out once (a block column and the in-block
+        // bits of x; a block row and the bits of y and the slice): per element it took ~5.7 ms
+        // a MB, and a retail game's video planes are 12 MB a frame
+        let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        let xs: Vec<(usize, u32)> = (0..l.width)
+            .map(|x| {
+                let x = x + l.origin.0;
+                (x / lay.block_w * lay.block_bytes, lay.ox[x % lay.block_w] ^ hi(&lay.hx, x, lay.block_w))
+            })
+            .collect();
+        let zbits = lay.oz[slice % lay.block_d] ^ hi(&lay.hz, slice, lay.block_d);
+        let pitch_blocks = l.pitch.div_ceil(lay.block_w);
+        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
+            let yy = y + l.origin.1;
+            let base = l.offset + (yy / lay.block_h) * pitch_blocks * lay.block_bytes;
+            let ybits = (lay.oy[yy % lay.block_h] ^ hi(&lay.hy, yy, lay.block_h) ^ zbits) as usize ^ lay.base_xor;
+            for (d, &(bx, xb)) in row.chunks_exact_mut(e).zip(&xs) {
+                let o = base + bx + (xb as usize ^ ybits);
                 if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    d.copy_from_slice(s);
                 }
             }
         }
@@ -438,6 +466,49 @@ mod tests {
     use super::*;
 
     const MODES: [u32; 14] = [1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27];
+
+    /// `detile_level` reads every element where `element_at` puts it: every mode (linear too),
+    /// element size and a few pipe configurations, mips in and out of the tail, array slices,
+    /// a base swizzle, a source cut short
+    #[test]
+    fn detile_level_matches_element_at() {
+        for mode in std::iter::once(0).chain(MODES) {
+            for e in 0..5u32 {
+                for cfg in [PipeConfig { pipes_log2: 0, pkrs_log2: 0 }, PipeConfig { pipes_log2: 3, pkrs_log2: 2 }, PipeConfig { pipes_log2: 5, pkrs_log2: 3 }] {
+                    let Some(mut lay) = Layout::new(mode, e, cfg) else { continue };
+                    if lay.block_bytes > 256 {
+                        lay.base_xor = 0x500 & (lay.block_bytes - 1);
+                    }
+                    let c = Chain::new(lay, 300, 77, 1, 9);
+                    let src: Vec<u8> = (0..c.slice_bytes * 2).map(|k| (k * 7 + k / 251) as u8).collect();
+                    let eb = 1usize << e;
+                    for slice in 0..2 {
+                        let s = &src[slice * c.slice_bytes..][..c.slice_bytes];
+                        for (i, l) in c.levels.iter().enumerate() {
+                            let mut want = vec![0u8; l.width * l.height * eb];
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at(l, x, y, slice);
+                                    if let Some(b) = s.get(o..o + eb) {
+                                        want[(y * l.width + x) * eb..][..eb].copy_from_slice(b);
+                                    }
+                                }
+                            }
+                            assert!(c.detile_level(s, i, slice) == want, "mode {mode} elem {e} {cfg:?} level {i} slice {slice}");
+                            // a source cut short: what is past its end reads as 0
+                            let short = &s[..s.len() / 3 + 1];
+                            let cut: Vec<u8> = (0..want.len()).map(|k| {
+                                let (x, y) = ((k / eb) % l.width, (k / eb) / l.width);
+                                let o = c.element_at(l, x, y, slice);
+                                if o + eb <= short.len() { short[o + k % eb] } else { 0 }
+                            }).collect();
+                            assert!(c.detile_level(short, i, slice) == cut, "mode {mode} elem {e} {cfg:?} level {i} slice {slice}, cut short");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn configs() -> Vec<PipeConfig> {
         let mut v = vec![];
