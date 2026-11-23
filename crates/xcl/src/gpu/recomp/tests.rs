@@ -7041,3 +7041,215 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+/// After a pixel shader's reduction, what the helper lanes of a quad hold (sT copied to a
+/// VGPR, vA, vB), read by the live pixels through DPP quad_perm (the console: every lane holds
+/// the result).
+#[test]
+fn gpu_ps_reduction_result_in_helper_lanes() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut bad = 0;
+    for wave64 in [true, false] {
+        let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+        for (op, id, rop) in WAVE_REDUCTIONS.iter() {
+            for view in 0..3u64 {
+                // view 0: sT (as a VGPR), 1: vA, 2: vB
+                let mut c = vec![
+                    ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 16), ("SSRC0", 126)], None),
+                    ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+                    ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
+                    ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+                    ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None),
+                    ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None),
+                ];
+                c.push(whole_wave_reduction_as(wave64, op, *id, 13, Some(16), 40, 41));
+                let src = [41, V + 6, V + 7][view as usize];
+                c.extend([
+                    ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", src)], None),
+                    ins("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 21), ("SRC0", 0xFA), ("VSRC0", 20), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                    ins("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 22), ("SRC0", 0xFA), ("VSRC0", 20), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                    ins("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 23), ("SRC0", 0xFA), ("VSRC0", 20), ("DPP_CTRL", 0x1B), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                    ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 20)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 31), ("SRC0", V + 21)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 32), ("SRC0", V + 22)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 33), ("SRC0", V + 23)], None),
+                    ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 30), ("VSRC1", 31), ("VSRC2", 32), ("VSRC3", 33), ("DONE", 1), ("VM", 1)], None),
+                ]);
+                let code = program_of(&c);
+                for (shape, tri) in [("3 quads", [[0.0f32, 0.0], [3.2, 0.0], [0.0, 3.2]]), ("55 pixels", [[0.0, 0.0], [11.0, 0.0], [0.0, 11.0]]), ("sliver", [[1.0, 1.0], [15.0, 2.2], [1.0, 2.2]])] {
+                    let px = draw_console_as(None, Some(&code), &tri, wave64);
+                    let live: Vec<(usize, [u32; 4])> = px.iter().enumerate().filter(|(_, p)| p[0] >= 0.0).map(|(i, p)| (i, p.map(|x| x as u32))).collect();
+                    let wrong: Vec<&(usize, [u32; 4])> = live.iter().filter(|(_, p)| p[1] != p[0] || p[2] != p[0] || p[3] != p[0]).collect();
+                    if !wrong.is_empty() {
+                        bad += 1;
+                        println!(
+                            "wave64 {wave64} {} view {} {shape}: {} of {} live pixels see another value in their quad, e.g. pixel {} own {:#x} h {:#x} v {:#x} d {:#x}",
+                            rop.name(),
+                            ["sT", "vA", "vB"][view as usize],
+                            wrong.len(),
+                            live.len(),
+                            wrong[0].0,
+                            wrong[0].1[0],
+                            wrong[0].1[1],
+                            wrong[0].1[2],
+                            wrong[0].1[3]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    println!("gpu_ps_reduction_result_in_helper_lanes: {bad} cases differ");
+    assert_eq!(bad, 0);
+}
+
+enum RvIt {
+    L(&'static str),
+    I(Vec<u8>),
+    B(&'static str, &'static str),
+}
+
+/// Assemble items with labels and branches; ends in s_endpgm.
+fn rv_assemble(items: &[RvIt]) -> Vec<u8> {
+    let mut at = std::collections::BTreeMap::new();
+    let mut pc = 0usize;
+    for it in items {
+        match it {
+            RvIt::L(l) => {
+                at.insert(*l, pc);
+            }
+            RvIt::I(b) => pc += b.len(),
+            RvIt::B(..) => pc += 4,
+        }
+    }
+    let mut code = Vec::new();
+    for it in items {
+        match it {
+            RvIt::L(_) => {}
+            RvIt::I(b) => code.extend(b.iter().copied()),
+            RvIt::B(n, l) => {
+                let rel = (at[l] as i64 - (code.len() as i64 + 4)) / 4;
+                code.extend(ins(n, "ENC_SOPP", &[("SIMM16", (rel as i16 as u16) as u64)], None));
+            }
+        }
+    }
+    code.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
+    code
+}
+
+/// Reductions as the retail pixel shaders place them - live pixels saved, s_wqm, a kill (cmpx, live &= ~exec),
+/// a region under s_and_saveexec / s_cbranch_execz with a min reduction and a loop of two or
+/// reductions (mask = live & saved EXEC).
+#[test]
+fn gpu_ps_reductions_in_branches_and_loops() {
+    use std::collections::BTreeMap;
+    use RvIt::*;
+    if !gpu_ready() {
+        return;
+    }
+    let mut bad = 0;
+    for wave64 in [true, false] {
+        let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+        let items = vec![
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None)),
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None)),
+            I(ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None)),
+            I(ins("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 62), ("SRC0", V + 12)], None)),
+            I(ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", 128)], None)),
+            I(ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", V + 15)], None)),
+            I(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 43), ("SSRC0", 128)], None)),
+            I(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 50), ("SSRC0", 128)], None)),
+            I(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 51), ("SSRC0", 128)], None)),
+            I(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 16), ("SSRC0", 126)], None)),
+            I(ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None)),
+            // the helper lanes' pixel numbers too
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None)),
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None)),
+            I(ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None)),
+            I(ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None)),
+            // kill the pixels with (number & 3) == 3
+            I(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)], None)),
+            I(ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 131), ("VSRC1", 12)], None)),
+            I(ins("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 131), ("VSRC1", 14)], None)),
+            I(ins(w("S_ANDN2_B64", "S_ANDN2_B32"), "ENC_SOP2", &[("SDST", 16), ("SSRC0", 16), ("SSRC1", 126)], None)),
+            B("S_CBRANCH_SCC0", "end"),
+            I(ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 2), ("SSRC0", 16)], None)),
+            I(ins(w("S_AND_B64", "S_AND_B32"), "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 2)], None)),
+            // the region: pixels with (number & 4) == 0
+            I(ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 132), ("VSRC1", 12)], None)),
+            I(ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 14)], None)),
+            I(ins(w("S_AND_SAVEEXEC_B64", "S_AND_SAVEEXEC_B32"), "ENC_SOP1", &[("SDST", 60), ("SSRC0", 106)], None)),
+            B("S_CBRANCH_EXECZ", "skip"),
+            I(whole_wave_reduction_as(wave64, "V_MIN_U32", 193, 13, Some(16), 40, 43)),
+            L("loop"),
+            I(ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 19), ("SRC0", 51), ("VSRC1", 13)], None)),
+            I(whole_wave_reduction_as(wave64, "V_OR_B32", 128, 19, Some(16), 40, 41)),
+            I(ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 50), ("SSRC0", 50), ("SSRC1", 41)], None)),
+            I(ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 51), ("SSRC0", 51), ("SSRC1", 129)], None)),
+            I(ins("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 51), ("SSRC1", 130)], None)),
+            B("S_CBRANCH_SCC1", "loop"),
+            L("skip"),
+            I(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 30), ("SRC0", 43)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 50)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 32), ("SRC0", 51)], None)),
+            I(ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 33), ("SRC0", 62), ("SRC1", 128 + 6), ("SRC2", V + 15)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 33), ("SRC0", V + 33)], None)),
+            I(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 30), ("VSRC1", 31), ("VSRC2", 32), ("VSRC3", 33), ("DONE", 1), ("VM", 1)], None)),
+            L("end"),
+        ];
+        let code = rv_assemble(&items);
+        {
+            let mut insts = Vec::new();
+            let mut off = 0;
+            while off + 4 <= code.len() {
+                let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+                off += d.len;
+                insts.push(d);
+            }
+            assert_eq!(super::reductions::find(&insts, wave64).len(), 2, "both recognised");
+        }
+        let shapes: [(&str, [[f32; 2]; 3]); 5] = [
+            ("whole target", [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]]),
+            ("3 quads", [[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]),
+            ("55 pixels", [[0.0, 0.0], [11.0, 0.0], [0.0, 11.0]]),
+            ("sliver", [[1.0, 1.0], [15.0, 2.2], [1.0, 2.2]]),
+            ("right", [[9.0, 9.0], [16.0, 9.0], [16.0, 16.0]]),
+        ];
+        for (shape, tri) in shapes {
+            let px = draw_console_as(None, Some(&code), &tri, wave64);
+            let mut waves: BTreeMap<u32, Vec<(u32, u32, [f32; 4])>> = BTreeMap::new();
+            for (id, p) in px.iter().enumerate().filter(|(_, p)| p[3] >= 0.0) {
+                let kl = p[3] as u32;
+                waves.entry(kl >> 6).or_default().push((id as u32, kl & 63, *p));
+            }
+            let mut wrong = 0;
+            let mut eg = String::new();
+            for (first, wv) in &waves {
+                assert!(wv.iter().all(|x| x.0 & 3 != 3), "a killed pixel was drawn");
+                let m: Vec<u32> = wv.iter().filter(|x| x.0 & 4 == 0).map(|x| x.0 + 1).collect();
+                let want = if m.is_empty() {
+                    [0, 0, 0]
+                } else {
+                    let or = m.iter().fold(0, |a, b| a | b);
+                    [*m.iter().min().unwrap(), or + (or << 1), 2]
+                };
+                for (id, lane, p) in wv {
+                    let got = [p[0] as u32, p[1] as u32, p[2] as u32];
+                    if got != want {
+                        wrong += 1;
+                        if eg.is_empty() {
+                            eg = format!("pixel {id} lane {lane} wave of {first} ({} pixels): got {got:x?} want {want:x?}", wv.len());
+                        }
+                    }
+                }
+            }
+            println!("wave64 {wave64} {shape}: waves {:?}, {wrong} wrong {eg}", waves.values().map(|w| w.len()).collect::<Vec<_>>());
+            bad += (wrong != 0) as usize;
+        }
+    }
+    assert_eq!(bad, 0);
+}

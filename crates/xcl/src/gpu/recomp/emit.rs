@@ -5157,6 +5157,16 @@ fn wave_reduction_fn(op: WaveOp, pixel: bool) -> String {
         let _ = writeln!(s, "    uint q = select(lanebit_at(m0, m1, lane_id), x, {id});");
     }
     let rows: Vec<String> = (0..4).map(|k| format!("{}(select(r == {k}u, q, {id}))", op.wave())).collect();
+    if pixel {
+        // wave operations leave helper lanes out (on the RTX 5070 Ti they return 0 there), but
+        // the console leaves the result in every lane, helpers included – and helpers feed the
+        // derivatives of what is computed from it: each lane takes its quad's live result
+        let _ = writeln!(s, "    uint r = WaveGetLaneIndex() >> 4;\n    uint4 t = uint4({});", rows.join(", "));
+        let _ = writeln!(s, "    uint4 h = IsHelperLane() ? (uint4){id} : t;");
+        let c = op.hlsl(&op.hlsl("QuadReadLaneAt(h, 0u)", "QuadReadLaneAt(h, 1u)"), &op.hlsl("QuadReadLaneAt(h, 2u)", "QuadReadLaneAt(h, 3u)"));
+        let _ = writeln!(s, "    return {c};\n}}");
+        return s;
+    }
     let _ = writeln!(s, "    uint r = WaveGetLaneIndex() >> 4;\n    return uint4({});\n}}", rows.join(", "));
     s
 }
