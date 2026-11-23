@@ -39,6 +39,22 @@ a [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderComp
 newer) and put them next to `xcl.exe`, or point `XCL_DXC_DIR` at their folder. `run.sh` takes a Linux path
 there and converts it.
 
+## Opus (the sound of GTA)
+
+GTA plays its sound through the console's audio processor, not XAudio2: with #294 its Opus packets go to the emulated
+decoder (xapu, `hle/acphal.rs`), whose PCM is played on the PC through XAudio2 (`hle/xaudio2.rs`). On Windows the decoder
+is the system's `MSOpusDecoder.dll`. **Wine / Proton has none** (only `mfplat.dll`), so XCL loads libopus
+(BSD-3-Clause) from an `opus.dll` at run time, like DXC. Without either, the decoder answers silence and the log says
+`xapu: no Opus decoder`. Build it with mingw-w64 (`cmake`, `make`, `curl`; downloads and checks the official release):
+
+```sh
+scripts/linux/build-opus.sh            # -> ~/.local/share/xcl-runtime/opus/opus.dll
+```
+
+and point `XCL_OPUS_DIR` at its folder (a Windows path: `Z:\home\you\.local\share\xcl-runtime\opus`), or copy it next to
+`xcl.exe`. `xcl.log` says which decoder is used (`Opus: decoder = libopus (…)`); `XCL_TRACE_APU=1` logs what a title sends
+to xapu / acphal.
+
 ## Wine
 
 XCL needs a Wine that tracks `MEM_WRITE_WATCH` memory with the kernel (`userfaultfd`, Wine's
