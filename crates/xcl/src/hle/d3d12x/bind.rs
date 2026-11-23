@@ -234,6 +234,24 @@ pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, i
     }
 }
 
+/// Prepare the graphics ABI for a console-specific indexed draw whose command emission is
+/// owned by the caller (for example, DrawIndexedX's temporary index-buffer binding).
+pub(super) unsafe fn prepare_indexed_draw(this: *mut c_void, indices: u32) -> bool {
+    DRAW_ARGS.with(|d| d.set((true, indices, 1, 0, 0)));
+    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    // A checked two-pass mesh pipeline needs explicit compute dispatch dimensions. Draw
+    // arguments are not equivalent, so this console-specific entry fails closed.
+    if super::real::two_pass_of(pso).is_some() {
+        count(DRAWS_SKIPPED);
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: DrawIndexedX with a two-pass pipeline skipped: dispatch dimensions are unavailable");
+        }
+        return false;
+    }
+    graphics_bound(this).is_some()
+}
+
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
 /// arguments are bound (None: the draw is skipped – a console pipeline without a
 /// translation, or no unified memory).
@@ -1099,6 +1117,41 @@ mod abi_tests {
         // skipped-dispatch counter, making this assertion mutation-sensitive to the slot wiring.
         unsafe { super::super::list_x::dispatch_x(list, 65_535, 0, 65_535, 0) };
         assert_eq!(COUNTS[DISPATCHES_SKIPPED].load(Ordering::SeqCst), skipped_before);
+        with(list, |state| assert!(state.uma.is_empty()));
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn console_draw_indexed_x_entry_rejects_two_pass_before_native_index_binding() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_5678usize;
+        let list = list_key as *mut c_void;
+        let metadata = super::super::real::TwoPassPso {
+            compute: 0,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        };
+        let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
+        with(list, |state| state.pso = list_key);
+        let skipped_before = COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst);
+
+        // This is the function installed in console command-list slot 81. A fake command-list
+        // pointer is intentional: two-pass rejection must happen before any native vtable call
+        // or temporary index-buffer binding. Removing the ABI preparation from the slot makes
+        // this test dereference the fake list instead of incrementing the skipped-draw count.
+        unsafe {
+            super::super::list_x::draw_indexed_x(
+                list,
+                0x1000,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT,
+                3,
+                0,
+            )
+        };
+        assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 1);
         with(list, |state| assert!(state.uma.is_empty()));
         STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
     }

@@ -1382,6 +1382,25 @@ pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+#[cfg(test)]
+pub(crate) struct TranslatedGraphicsTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for TranslatedGraphicsTestGuard {
+    fn drop(&mut self) {
+        if let Some(set) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_translated_graphics_for_test(pso: usize) -> TranslatedGraphicsTestGuard {
+    let inserted = TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    assert!(inserted, "test pipeline was already registered as translated graphics");
+    TranslatedGraphicsTestGuard(pso)
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -2483,6 +2502,25 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
     PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+#[cfg(test)]
+pub(crate) struct PsoRootTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for PsoRootTestGuard {
+    fn drop(&mut self) {
+        if let Some(map) = PSO_RS.lock().unwrap().as_mut() {
+            map.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_pso_root_for_test(pso: usize, root: usize) -> PsoRootTestGuard {
+    let old = PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, root);
+    assert!(old.is_none(), "test pipeline already has a root signature");
+    PsoRootTestGuard(pso)
 }
 
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).

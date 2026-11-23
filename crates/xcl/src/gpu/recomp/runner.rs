@@ -1363,6 +1363,120 @@ fn mesh_draw_split_impl(
     }
 }
 
+/// Synthetic live check for the production DrawIndexedX route. The left half uses slot 81's
+/// temporary index buffer; the right half uses the restored all-zero index buffer.
+#[cfg(test)]
+pub(super) fn routed_indexed_draw_smoke(vs: &[u8], ps: &[u8], constants: &[u32], size: u32, clear: [f32; 4]) -> Result<Vec<[f32; 4]>, String> {
+    let _serial = GPU.lock().unwrap();
+    unsafe {
+        if crate::hle::d3d12x::backend() != crate::hle::d3d12x::Backend::Real {
+            return Err("real D3D12 backend is unavailable".into());
+        }
+        let raw = crate::hle::d3d12x::real::device_raw();
+        let dev = ID3D12Device::from_raw_borrowed(&raw).ok_or("backend device")?.clone();
+        crate::hle::d3d12x::real::open_uma_for_test(&dev)?;
+        let rs = root_signature(&dev, true)?;
+        let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&rs),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = true.into();
+        pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(e)?;
+        let _translated = crate::hle::d3d12x::real::install_translated_graphics_for_test(pso.as_raw() as usize);
+        let _pso_root = crate::hle::d3d12x::real::install_pso_root_for_test(pso.as_raw() as usize, rs.as_raw() as usize);
+
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size as u64,
+            Height: size,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let cv = D3D12_CLEAR_VALUE { Format: tex.Format, Anonymous: D3D12_CLEAR_VALUE_0 { Color: clear } };
+        let mut rt = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, Some(&cv), &mut rt).map_err(e)?;
+        let rt = rt.ok_or("render target")?;
+        let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&rt, None, rtv);
+        let indices: [u16; 7] = [0, 0, 0, 0, 1, 2, 0];
+        let ib = buffer(&dev, std::mem::size_of_val(&indices) as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+        let mut mapped = std::ptr::null_mut();
+        ib.Map(0, None, Some(&mut mapped)).map_err(e)?;
+        std::ptr::copy_nonoverlapping(indices.as_ptr(), mapped as *mut u16, indices.len());
+        ib.Unmap(0, None);
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+        let readback = buffer(&dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
+        list.OMSetRenderTargets(1, Some(&rtv), false, None);
+        list.ClearRenderTargetView(rtv, &clear, None);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // The layout key models the title's console root signature; the translated PSO still
+        // binds XCL's ABI root signature from the cache.
+        let root = 0x7fff_8123usize;
+        let bytes = (constants.len() * 4) as u32;
+        let _layout = crate::hle::d3d12x::console_list::install_layout_for_test(root, crate::hle::d3d12x::console_list::Layout {
+            params: vec![crate::hle::d3d12x::console_list::Param::Constants { at: 0, count: constants.len() as u32 }],
+            size: bytes,
+            inline: bytes,
+            inline_gfx: bytes,
+        });
+        let _state = crate::hle::d3d12x::bind::install_dispatch_route_for_test(list.as_raw(), pso.as_raw() as usize);
+        crate::hle::d3d12x::bind::set_graphics_root_signature(list.as_raw(), root as *mut std::ffi::c_void);
+        crate::hle::d3d12x::bind::set_graphics_root_constants(list.as_raw(), 0, constants.len() as u32, constants.as_ptr(), 0);
+        let sentinel = D3D12_INDEX_BUFFER_VIEW { BufferLocation: ib.GetGPUVirtualAddress(), SizeInBytes: 6, Format: DXGI_FORMAT_R16_UINT };
+        crate::hle::d3d12x::list_x::ia_set_index_buffer_x(list.as_raw(), &sentinel);
+        let half = |left: u32| D3D12_VIEWPORT { TopLeftX: left as f32, TopLeftY: 0.0, Width: (size / 2) as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        list.RSSetViewports(&[half(0)]);
+        crate::hle::d3d12x::list_x::draw_indexed_x(list.as_raw(), ib.GetGPUVirtualAddress() + 8, DXGI_FORMAT_R16_UINT, 3, 0);
+        list.RSSetViewports(&[half(size / 2)]);
+        list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+        list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        queue.Signal(&fence, 1).map_err(e)?;
+        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+        fence.SetEventOnCompletion(1, ev).map_err(e)?;
+        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
+        let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
+        if fence.GetCompletedValue() < 1 { return Err("routed indexed draw timed out".into()); }
+        let mut q = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut q)).map_err(e)?;
+        let mut pixels = Vec::with_capacity((size * size) as usize);
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let c = (q as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 16) as *const f32;
+                pixels.push([*c, *c.add(1), *c.add(2), *c.add(3)]);
+            }
+        }
+        readback.Unmap(0, None);
+        Ok(pixels)
+    }
+}
+
 /// Process memory regions for `run_in_region` (see `gpu::uma`): the memory windows.
 struct Arena {
     pub windows: Vec<(*mut u8, usize)>,

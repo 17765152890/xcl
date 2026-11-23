@@ -1245,6 +1245,41 @@ fn gpu_graphics_vs_ps_draw() {
     }
 }
 
+#[test]
+fn gpu_draw_indexed_x_binds_graphics_arguments_and_restores_indices() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    let vs_hlsl = r#"
+RWByteAddressBuffer xcl_io : register(u0);
+struct O { float4 pos : SV_Position; float4 color : COLOR0; };
+O main(uint id : SV_VertexID) {
+    float2 p[3] = { float2(-1,-1), float2(-1,3), float2(3,-1) };
+    O o;
+    o.pos = float4(p[id], 0, 1);
+    o.color = asfloat(xcl_io.Load4(32));
+    return o;
+}"#;
+    let ps_hlsl = r#"
+float4 main(float4 pos : SV_Position, float4 color : COLOR0) : SV_Target { return color; }
+"#;
+    let vs = super::dxc::compile(vs_hlsl, "main", "vs_6_6", &[]).unwrap();
+    let ps = super::dxc::compile(ps_hlsl, "main", "ps_6_6", &[]).unwrap();
+    let color = [0.25f32, 0.5, 0.75, 1.0];
+    let constants: Vec<u32> = color.into_iter().map(f32::to_bits).collect();
+    let clear = [0.05, 0.1, 0.15, 1.0];
+    let pixels = runner::routed_indexed_draw_smoke(&vs, &ps, &constants, 16, clear).unwrap();
+    for y in 2..14usize {
+        for x in 1..7usize {
+            let got = pixels[y * 16 + x];
+            assert!(got.iter().zip(color).all(|(a, b)| (a - b).abs() < 1e-6), "routed pixel ({x},{y}) = {got:?}");
+        }
+        for x in 9..15usize {
+            assert_eq!(pixels[y * 16 + x], clear, "restored-index pixel ({x},{y})");
+        }
+    }
+}
+
 /// XCL image descriptor (T#, GFX10 layout): BASE_ADDRESS = SRV heap index, FORMAT, TYPE.
 fn tsharp(index: u32, format: u32, ty: u32) -> [u32; 8] {
     [index, format << 20, 0, ty << 28, 0, 0, 0, 0]

@@ -1546,7 +1546,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
 }
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
-pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
+pub(crate) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
@@ -1564,7 +1564,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
 
 /// command list #81 DrawIndexedX(index address, index format, index count, flags): one
 /// instance of `count` indices read from that address; the bound index buffer stays
-pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
+pub(crate) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     let stride = match format {
         DXGI_FORMAT_R16_UINT => 2,
@@ -1574,11 +1574,14 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     if count == 0 {
         return;
     }
+    if !super::bind::prepare_indexed_draw(this, count) {
+        return;
+    }
     prepare_draw(this);
+    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32)>(this, PC_DRAW_INDEXED)(this, count, 1, 0, 0, 0);
-    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     set_index_buffer(this, bound.as_ref());
 }
 
