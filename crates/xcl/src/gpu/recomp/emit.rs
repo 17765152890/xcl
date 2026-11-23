@@ -2402,16 +2402,22 @@ impl Em {
 
     /// Float result with output modifiers, as u32.
     fn fres(m: &Mods, e: &str) -> String {
-        let mut s = match m.omod {
+        format!("asuint({})", Self::out_mods(m, e))
+    }
+
+    /// The output modifiers on an f32 expression: omod, then clamp.
+    fn out_mods(m: &Mods, e: &str) -> String {
+        let s = match m.omod {
             1 => format!("(({e}) * 2.0f)"),
             2 => format!("(({e}) * 4.0f)"),
             3 => format!("(({e}) * 0.5f)"),
             _ => format!("({e})"),
         };
         if m.clamp {
-            s = format!("saturate({s})");
+            format!("saturate({s})")
+        } else {
+            s
         }
-        format!("asuint({s})")
     }
 
     /// u32 source expressions in operand order; SGPR-pair masks come as "lo|hi".
@@ -2570,6 +2576,28 @@ impl Em {
             // network passes are thousands of them, and the shift-and-multiply form made one pass
             // 1.5 MB of DXIL that the AMD driver could not compile (E_OUTOFMEMORY)
             "v_dot4c_i32_i8" => Some(format!("(uint)dot4add_i8packed({}, {}, (int){cur})", src(0), src(1))),
+            // with clamp the sum saturates: the products alone stay in range (a 16-bit pair
+            // product up to 2^31 is summed in 64 bits)
+            "v_dot2_i32_i16" if clamp => Some(format!(
+                "sat_i32((int64_t){} * (int64_t){} + (int64_t){} * (int64_t){} + (int64_t)(int){})",
+                si(0, false),
+                si(1, false),
+                si(0, true),
+                si(1, true),
+                src(2)
+            )),
+            "v_dot2_u32_u16" if clamp => Some(format!(
+                "sat_u32((uint64_t)({} * {}) + (uint64_t)({} * {}) + (uint64_t){})",
+                h(0, false),
+                h(1, false),
+                h(0, true),
+                h(1, true),
+                src(2)
+            )),
+            "v_dot4_u32_u8" if clamp => Some(format!("sat_u32((uint64_t)dot4add_u8packed({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
+            "v_dot4_i32_i8" if clamp => Some(format!("sat_i32((int64_t)dot4add_i8packed({}, {}, 0) + (int64_t)(int){})", src(0), src(1), src(2))),
+            "v_dot8_u32_u4" if clamp => Some(format!("sat_u32((uint64_t)dot8_u4({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
+            "v_dot8_i32_i4" if clamp => Some(format!("sat_i32((int64_t)(int)dot8_i4({}, {}, 0u) + (int64_t)(int){})", src(0), src(1), src(2))),
             "v_dot2_i32_i16" => Some(format!("(uint)({} * {} + {} * {} + (int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
             "v_dot2_u32_u16" => Some(format!("({} * {} + {} * {} + {})", h(0, false), h(1, false), h(0, true), h(1, true), src(2))),
             "v_dot4_u32_u8" => Some(format!("dot4add_u8packed({}, {}, {})", src(0), src(1), src(2))),
@@ -2593,6 +2621,13 @@ impl Em {
                 "v_pk_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
                 "v_pk_min_f16" => fr(format!("min({}, {})", fh(0, hi), fh(1, hi))),
                 "v_pk_max_f16" => fr(format!("max({}, {})", fh(0, hi), fh(1, hi))),
+                // integer clamp saturates each half
+                "v_pk_add_u16" if clamp => format!("min({a} + {b}, 0xFFFFu)"),
+                "v_pk_sub_u16" if clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
+                "v_pk_add_i16" if clamp => format!("((uint)clamp({} + {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi)),
+                "v_pk_sub_i16" if clamp => format!("((uint)clamp({} - {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi)),
+                "v_pk_mad_u16" if clamp => format!("min({a} * {b} + {c}, 0xFFFFu)"),
+                "v_pk_mad_i16" if clamp => format!("((uint)clamp({} * {} + {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi), si(2, hi)),
                 "v_pk_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
                 "v_pk_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
                 "v_pk_add_i16" => format!("((uint)({} + {}) & 0xFFFFu)", si(0, hi), si(1, hi)),
@@ -2941,7 +2976,7 @@ impl Em {
                     "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
                     "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
-                        self.line(&format!("uint {t} = asuint((float){});", f64v(0)));
+                        self.line(&format!("uint {t} = {};", Self::fres(&m, &format!("(float){}", f64v(0)))));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
@@ -2965,7 +3000,13 @@ impl Em {
                     }
                     _ => return Err("VALU 64-bit"),
                 };
-                let mut e = e;
+                // omod, then clamp (DXIL has a double saturate)
+                let mut e = match m.omod {
+                    1 => format!("(({e}) * 2.0)"),
+                    2 => format!("(({e}) * 4.0)"),
+                    3 => format!("(({e}) * 0.5)"),
+                    _ => e,
+                };
                 if m.clamp {
                     e = format!("saturate({e})");
                 }
@@ -3066,7 +3107,9 @@ impl Em {
                 fr(format!("f16tof32({h})"))
             }
             "v_cvt_f16_f32" => {
-                let h = to_f16_expr(self.dynamic_f16_rm, &fs(0));
+                // the modifiers in f32 before the rounding: the same f16 (scaling by a power of
+                // two is exact, and 0 and 1 are f16 values), except where the f16 is denormal
+                let h = to_f16_expr(self.dynamic_f16_rm, &Self::out_mods(&m, &fs(0)));
                 if m.opsel >> 3 & 1 == 1 {
                     format!("({cur} & 0xFFFFu) | ({h} << 16)")
                 } else if d.variant == Variant::Sdwa {
@@ -3153,6 +3196,10 @@ impl Em {
             "v_cubesc_f32" => fr(format!("cube_sc({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubetc_f32" => fr(format!("cube_tc({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubema_f32" => fr(format!("cube_ma({}, {}, {})", fs(0), fs(1), fs(2))),
+            // integer clamp saturates (VOP3 only)
+            "v_add_nc_u32" if m.clamp => format!("sat_u32((uint64_t){a} + (uint64_t){b})"),
+            "v_sub_nc_u32" if m.clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
+            "v_subrev_nc_u32" if m.clamp => format!("select({b} < {a}, 0u, {b} - {a})"),
             "v_add_nc_u32" => format!("{a} + {b}"),
             "v_sub_nc_u32" => format!("{a} - {b}"),
             "v_subrev_nc_u32" => format!("{b} - {a}"),
@@ -3177,6 +3224,7 @@ impl Em {
             "v_and_or_b32" => format!("({a} & {b}) | {c}"),
             "v_or3_b32" => format!("{a} | {b} | {c}"),
             "v_xor3_b32" => format!("{a} ^ {b} ^ {c}"),
+            "v_add3_u32" if m.clamp => format!("sat_u32((uint64_t){a} + (uint64_t){b} + (uint64_t){c})"),
             "v_add3_u32" => format!("{a} + {b} + {c}"),
             "v_xad_u32" => format!("({a} ^ {b}) + {c}"),
             "v_bfe_u32" => format!("bfe_u({a}, {b}, {c})"),
@@ -5168,6 +5216,7 @@ uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a
 uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
 uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
+uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
 uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }

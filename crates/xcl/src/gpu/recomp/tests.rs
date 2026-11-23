@@ -996,6 +996,103 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
+/// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
+/// unsigned adds, the packed 16-bit adds and the integer dot products.
+#[test]
+fn gpu_clamp_and_omod_per_instruction() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3P", f, None);
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // f64: v[1:2] = 0.1, v[3:4] = 0.2, v[5:6] = 1.25
+        v("V_ADD_F64", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 3), ("CLAMP", 1)]),
+        v("V_ADD_F64", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 3), ("OMOD", 1)]),
+        v("V_ADD_F64", &[("VDST", 14), ("SRC0", V + 5), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_CVT_F32_F64", &[("VDST", 16), ("SRC0", V + 5), ("CLAMP", 1)]),
+        v("V_CVT_F32_F64", &[("VDST", 17), ("SRC0", V + 5), ("OMOD", 3)]),
+        // f32 → f16: v7 = 3.0
+        v("V_CVT_F16_F32", &[("VDST", 18), ("SRC0", V + 7), ("CLAMP", 1)]),
+        v("V_CVT_F16_F32", &[("VDST", 19), ("SRC0", V + 7), ("OMOD", 1)]),
+        // unsigned: v8 = 0xFFFFFFF0, v9 = 0x20, v20 = 0x10
+        v("V_ADD_NC_U32", &[("VDST", 21), ("SRC0", V + 8), ("SRC1", V + 9), ("CLAMP", 1)]),
+        v("V_SUB_NC_U32", &[("VDST", 22), ("SRC0", V + 20), ("SRC1", V + 9), ("CLAMP", 1)]),
+        v("V_SUBREV_NC_U32", &[("VDST", 23), ("SRC0", V + 9), ("SRC1", V + 20), ("CLAMP", 1)]),
+        v("V_ADD3_U32", &[("VDST", 24), ("SRC0", V + 8), ("SRC1", V + 9), ("SRC2", V + 9), ("CLAMP", 1)]),
+        v("V_ADD_NC_U32", &[("VDST", 25), ("SRC0", V + 8), ("SRC1", V + 9)]), // no clamp: wraps
+        // packed 16-bit: v26 = (0xFFF0, 0x0005), v27 = (0x0020, 0x0002), v28 = (0x7FF0, 0x8010), v29 = (0x0020, 0xFFE0)
+        p("V_PK_ADD_U16", &[("VDST", 30), ("SRC0", V + 26), ("SRC1", V + 27), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        p("V_PK_SUB_U16", &[("VDST", 31), ("SRC0", V + 27), ("SRC1", V + 26), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        p("V_PK_ADD_I16", &[("VDST", 32), ("SRC0", V + 28), ("SRC1", V + 29), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        // halves of src1 swapped: (0x7FF0 − (−32), −32752 − 32)
+        p("V_PK_SUB_I16", &[("VDST", 33), ("SRC0", V + 28), ("SRC1", V + 29), ("OP_SEL", 2), ("OP_SEL_HI", 1), ("CLAMP", 1)]),
+        p("V_PK_MAD_U16", &[("VDST", 34), ("SRC0", V + 26), ("SRC1", V + 27), ("SRC2", V + 27), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)]),
+        p("V_PK_MAD_I16", &[("VDST", 35), ("SRC0", V + 28), ("SRC1", V + 27), ("SRC2", V + 29), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)]),
+        p("V_PK_ADD_U16", &[("VDST", 36), ("SRC0", V + 26), ("SRC1", V + 27), ("OP_SEL_HI", 3)]), // no clamp: wraps
+        // dot products: v37 = 0x7F7F7F7F, v38 = 0xFFFFFFFF, v39 = 0x7FFFFFF0, v40 = 0x80000010
+        p("V_DOT4_I32_I8", &[("VDST", 41), ("SRC0", V + 37), ("SRC1", V + 37), ("SRC2", V + 39), ("CLAMP", 1)]),
+        p("V_DOT4_I32_I8", &[("VDST", 42), ("SRC0", V + 37), ("SRC1", V + 38), ("SRC2", V + 40), ("CLAMP", 1)]),
+        p("V_DOT4_U32_U8", &[("VDST", 43), ("SRC0", V + 38), ("SRC1", V + 38), ("SRC2", V + 8), ("CLAMP", 1)]),
+        p("V_DOT8_I32_I4", &[("VDST", 44), ("SRC0", V + 37), ("SRC1", V + 37), ("SRC2", V + 39), ("CLAMP", 1)]),
+        p("V_DOT8_U32_U4", &[("VDST", 45), ("SRC0", V + 38), ("SRC1", V + 38), ("SRC2", V + 8), ("CLAMP", 1)]),
+        p("V_DOT2_I32_I16", &[("VDST", 46), ("SRC0", V + 28), ("SRC1", V + 28), ("SRC2", V + 39), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        p("V_DOT2_U32_U16", &[("VDST", 47), ("SRC0", V + 26), ("SRC1", V + 26), ("SRC2", V + 8), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        p("V_DOT4_I32_I8", &[("VDST", 48), ("SRC0", V + 37), ("SRC1", V + 37), ("SRC2", V + 39), ("OP_SEL_HI", 3)]), // no clamp: wraps
+    ]);
+    let d = |x: f64, r: &mut [u32], i: usize| {
+        r[i] = x.to_bits() as u32;
+        r[i + 1] = (x.to_bits() >> 32) as u32;
+    };
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        d(0.1, r, 1);
+        d(0.2, r, 3);
+        d(1.25, r, 5);
+        r[7] = f(3.0);
+        r[8] = 0xFFFF_FFF0;
+        r[9] = 0x20;
+        r[20] = 0x10;
+        r[26] = 0x0005_FFF0;
+        r[27] = 0x0002_0020;
+        r[28] = 0x8010_7FF0;
+        r[29] = 0xFFE0_0020;
+        r[37] = 0x7F7F_7F7F;
+        r[38] = 0xFFFF_FFFF;
+        r[39] = 0x7FFF_FFF0;
+        r[40] = 0x8000_0010;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let d64 = |v: &[u32], i: usize| f64::from_bits(v[i] as u64 | (v[i + 1] as u64) << 32);
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        assert_eq!(d64(v, 10), 0.1 + 0.2, "lane {l} v_add_f64 clamp keeps double precision");
+        assert_eq!(d64(v, 12), (0.1 + 0.2) * 2.0, "lane {l} v_add_f64 omod *2");
+        assert_eq!(d64(v, 14), 1.0, "lane {l} v_add_f64 clamp");
+        assert_eq!(f32::from_bits(v[16]), 1.0, "lane {l} v_cvt_f32_f64 clamp");
+        assert_eq!(f32::from_bits(v[17]), 0.625, "lane {l} v_cvt_f32_f64 omod /2");
+        assert_eq!(v[18] & 0xFFFF, 0x3C00, "lane {l} v_cvt_f16_f32 clamp");
+        assert_eq!(v[19] & 0xFFFF, 0x4600, "lane {l} v_cvt_f16_f32 omod *2");
+        assert_eq!(v[21..26], [0xFFFF_FFFF, 0, 0, 0xFFFF_FFFF, 0x10], "lane {l} add / sub / subrev / add3 u32 clamp, add without");
+        assert_eq!(v[30], 0x0007_FFFF, "lane {l} v_pk_add_u16 clamp");
+        assert_eq!(v[31], 0x0000_0000, "lane {l} v_pk_sub_u16 clamp");
+        assert_eq!(v[32], 0x8000_7FFF, "lane {l} v_pk_add_i16 clamp");
+        assert_eq!(v[33], 0x8000_7FFF, "lane {l} v_pk_sub_i16 clamp");
+        assert_eq!(v[34], 0x000C_FFFF, "lane {l} v_pk_mad_u16 clamp");
+        assert_eq!(v[35], 0x8000_7FFF, "lane {l} v_pk_mad_i16 clamp");
+        assert_eq!(v[36], 0x0007_0010, "lane {l} v_pk_add_u16 without clamp");
+        assert_eq!(v[41], 0x7FFF_FFFF, "lane {l} v_dot4_i32_i8 clamp high");
+        assert_eq!(v[42], 0x8000_0000, "lane {l} v_dot4_i32_i8 clamp low");
+        assert_eq!(v[43], 0xFFFF_FFFF, "lane {l} v_dot4_u32_u8 clamp");
+        assert_eq!(v[44], 0x7FFF_FFFF, "lane {l} v_dot8_i32_i4 clamp");
+        assert_eq!(v[45], 0xFFFF_FFFF, "lane {l} v_dot8_u32_u4 clamp");
+        assert_eq!(v[46], 0x7FFF_FFFF, "lane {l} v_dot2_i32_i16 clamp");
+        assert_eq!(v[47], 0xFFFF_FFFF, "lane {l} v_dot2_u32_u16 clamp");
+        assert_eq!(v[48], 0x7FFF_FFF0u32.wrapping_add(4 * 127 * 127), "lane {l} v_dot4_i32_i8 without clamp");
+    }
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {
