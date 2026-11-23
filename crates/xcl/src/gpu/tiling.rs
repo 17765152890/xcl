@@ -398,6 +398,17 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
+        if self.layout.mode == 0 && self.layout.base_xor == 0 && !out.is_empty() {
+            // Linear levels have contiguous elements within each 256-byte-pitched row.
+            let start = self.element_at(&l, 0, 0, slice);
+            let pitch = l.pitch.div_ceil(self.layout.block_w) * self.layout.block_bytes;
+            let rows = src.get(start..).unwrap_or_default().chunks(pitch);
+            for (from, to) in rows.zip(out.chunks_mut(l.width * e)) {
+                let bytes = from.len().min(to.len()) / e * e;
+                to[..bytes].copy_from_slice(&from[..bytes]);
+            }
+            return out;
+        }
         for y in 0..l.height {
             for x in 0..l.width {
                 let o = self.element_at(&l, x, y, slice);
@@ -594,6 +605,32 @@ mod tests {
         // mip 2 (25×7, padded from 30 / 4 → 8 rows of 64 px), mip 1 (50×15), mip 0 (100×30)
         assert_eq!((c.levels[2].height, c.levels[2].offset, c.levels[1].offset, c.levels[0].offset), (7, 0, 8 * 256, 8 * 256 + 15 * 256));
         assert_eq!(c.slice_bytes, 8 * 256 + 15 * 256 + 30 * 512);
+    }
+
+    #[test]
+    fn linear_detile_preserves_mip_pitch_and_zero_fills_incomplete_elements() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        for elem_log2 in 0..=4 {
+            let chain = Chain::new(Layout::new(0, elem_log2, cfg).unwrap(), 515, 9, 1, 3);
+            let src: Vec<u8> = (0..chain.slice_bytes).map(|i| ((i ^ (i >> 8)) % 251) as u8).collect();
+            let e = 1 << elem_log2;
+            for (i, l) in chain.levels.iter().enumerate() {
+                let row_two = chain.element_at(l, 0, 1, 2);
+                for end in [0, l.offset, row_two, row_two + 2 * e - 1, src.len()] {
+                    let src = &src[..end];
+                    let mut expected = vec![0; l.width * l.height * e];
+                    for y in 0..l.height {
+                        for x in 0..l.width {
+                            let at = chain.element_at(l, x, y, 2);
+                            if let Some(pixel) = src.get(at..at + e) {
+                                expected[(y * l.width + x) * e..][..e].copy_from_slice(pixel);
+                            }
+                        }
+                    }
+                    assert_eq!(chain.detile_level(src, i, 2), expected);
+                }
+            }
+        }
     }
 
     /// SW_256B_S with bytes: a 16×16 block stored row by row (addrlib's first nibble row)
