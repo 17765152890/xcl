@@ -74,7 +74,8 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            let target = rec.ExceptionInformation[1];
+            extra = format!(" ({op} at address {target:#x}{})", page_state(target));
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
@@ -243,6 +244,27 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
         a += 1;
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// `va`'s page as VirtualQuery sees it, for a crash line: "; page: <state> <protect>, region
+/// <base>+<size>, allocation <base>" (an access violation in memory a title reserved: was the
+/// page reserved only, committed without the access, or not there at all?)
+fn page_state(va: usize) -> String {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return "; page: VirtualQuery failed".into();
+    }
+    let state = match m.State {
+        MEM_COMMIT => "committed",
+        MEM_RESERVE => "reserved",
+        MEM_FREE => "free",
+        _ => "?",
+    };
+    format!(
+        "; page: {state} protect {:#x}, region {:#x}+{:#x}, allocation {:#x} (protect {:#x}), type {:#x}",
+        m.Protect, m.BaseAddress as usize, m.RegionSize, m.AllocationBase as usize, m.AllocationProtect, m.Type
+    )
 }
 
 fn is_writable(va: usize, bytes: usize) -> bool {
