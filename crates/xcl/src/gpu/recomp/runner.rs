@@ -1230,11 +1230,13 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     }
 }
 
-/// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 4 GiB − 64 KiB –
-/// a raw view of exactly 4 GiB does not fit a 32-bit byte size (AMD's V# NUM_RECORDS, NVIDIA's
-/// view size: `aperture_tests`), and a window's last tile is never handed out.
+/// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 2^30 − 1 dwords,
+/// the largest byte size a 32-bit field holds (AMD's V# NUM_RECORDS). The sparse windows hand
+/// out their last 64 KiB tile – a view of 4 GiB − 64 KiB left it unreachable (zeros, dropped
+/// stores); this one misses only the window's last dword. On an RTX 3090 a view of exactly 2^30
+/// dwords works too (`aperture_tests::e1c_window_view_last_tile`); AMD is not measured.
 pub fn raw_window_uav(bytes: u64) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    let bytes = bytes.min((1u64 << 32) - 0x1_0000);
+    let bytes = bytes.min((1u64 << 32) - 4);
     D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_UAV_DIMENSION_BUFFER,

@@ -307,14 +307,15 @@ fn gpu_aperture_structured_rows_above_4_gib() {
 }
 
 /// The heap-window form (`Options::heap_windows`) on a real sparse window: a 4 GiB reserved
-/// buffer seen through `runner::raw_window_uav` (4 GiB − 64 KiB) reaches its last usable tile.
+/// buffer seen through `runner::raw_window_uav` reaches its last tile, which the sparse windows
+/// hand out (a reservation across two windows covers it), up to its last dword but one.
 #[test]
 fn gpu_raw_window_view_reaches_its_top() {
     let Some((dev, name)) = device() else { return };
     if super::dxc::location().is_err() {
         return;
     }
-    let top = (4 * GIB) - 2 * TILE; // the last tile the view covers
+    let top = (4 * GIB) - TILE; // the window's last tile
     let src = r#"
 #define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), UAV(u0)"
 RWByteAddressBuffer outb : register(u0);
@@ -322,11 +323,13 @@ RWByteAddressBuffer outb : register(u0);
 [numthreads(64, 1, 1)]
 void main(uint l : SV_GroupThreadID) {
     RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(0u)];
-    w.Store(0xFFFE0000u + 4u * l, 0x5A000000u | l);
+    w.Store(0xFFFF0000u + 4u * l, 0x5A000000u | l);
     w.Store(4u * l, 0xA5000000u | l);
+    if (l < 63u) w.Store(0xFFFFFF00u + 4u * l, 0x3C000000u | l);
     DeviceMemoryBarrier();
-    outb.Store(8u * l, w.Load(0xFFFE0000u + 4u * l));
+    outb.Store(8u * l, w.Load(0xFFFF0000u + 4u * l));
     outb.Store(8u * l + 4u, w.Load(4u * l));
+    outb.Store(512u + 4u * l, l < 63u ? w.Load(0xFFFFFF00u + 4u * l) : 0u);
 }
 "#;
     unsafe {
@@ -365,8 +368,8 @@ void main(uint l : SV_GroupThreadID) {
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
             .unwrap();
         dev.CreateUnorderedAccessView(&win, None::<&ID3D12Resource>, Some(&super::runner::raw_window_uav(4 * GIB)), dh.GetCPUDescriptorHandleForHeapStart());
-        let out = buf(&dev, 512, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-        let rb = buf(&dev, 512 + 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+        let out = buf(&dev, 768, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        let rb = buf(&dev, 768 + 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
         list.SetDescriptorHeaps(&[Some(dh.clone())]);
@@ -377,8 +380,8 @@ void main(uint l : SV_GroupThreadID) {
             transition(&win, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         ]);
-        list.CopyBufferRegion(&rb, 0, &out, 0, 512);
-        list.CopyBufferRegion(&rb, 512, &win, top, 256);
+        list.CopyBufferRegion(&rb, 0, &out, 0, 768);
+        list.CopyBufferRegion(&rb, 768, &win, top, 256);
         list.Close().unwrap();
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
@@ -386,12 +389,15 @@ void main(uint l : SV_GroupThreadID) {
         crate::gpu::fence::wait(&fence, 1, &dev, None, 20_000).map_err(|e| format!("{e}")).unwrap();
         let mut q = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut q)).unwrap();
-        let w = std::slice::from_raw_parts(q as *const u32, 192).to_vec();
+        let w = std::slice::from_raw_parts(q as *const u32, 256).to_vec();
         rb.Unmap(0, None);
         for l in 0..64usize {
             assert_eq!(w[2 * l], 0x5A00_0000 | l as u32, "{name}: lane {l}, the window's top tile through the heap view");
             assert_eq!(w[2 * l + 1], 0xA500_0000 | l as u32, "{name}: lane {l}, the window's first tile");
-            assert_eq!(w[128 + l], 0x5A00_0000 | l as u32, "{name}: lane {l}, the top tile in memory");
+            assert_eq!(w[192 + l], 0x5A00_0000 | l as u32, "{name}: lane {l}, the top tile in memory");
+            if l < 63 {
+                assert_eq!(w[128 + l], 0x3C00_0000 | l as u32, "{name}: lane {l}, the window's last dwords");
+            }
         }
     }
 }
@@ -747,5 +753,128 @@ void main(uint l : SV_GroupThreadID) {
         println!("4 GiB - 64 KiB raw view, top tile: {}", if win_ok { "ok" } else { "WRONG" });
         println!("1 GiB raw slice at FirstElement 5 GiB: read back {}, 32-bit alias tile {}", if slice_ok { "ok" } else { "WRONG" }, if alias_clean { "untouched" } else { "WRITTEN (the slice wrapped at 4 GiB)" });
         println!("first words: window {:#x}, slice {:#x}, alias {:#x}", w[0], w[64], alias[0]);
+    }
+}
+
+/// Experiment E1c, run alone (debug layer): can a heap view reach a sparse window's last
+/// 64 KiB tile, which the windows hand out? Over a 4 GiB reserved window with only its last
+/// tile mapped: (0) the 4 GiB - 64 KiB view, (1) 2^30 - 1 elements (4 GiB - 4 bytes, the
+/// largest byte size a 32-bit field holds), (2) exactly 2^30 elements, (3) a 64 KiB view of
+/// the last tile alone. Each slot is written and read at the start of the tile and at its
+/// last dwords.
+/// `cargo test --release -p xcl --lib e1c_window_view_last_tile -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn e1c_window_view_last_tile() {
+    unsafe {
+        match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+            Ok(d) => d.EnableDebugLayer(),
+            Err(e) => {
+                println!("no debug layer: {e}");
+                return;
+            }
+        }
+    }
+    let Some((dev, name)) = device() else { return };
+    let src = r#"
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), UAV(u0), RootConstants(num32BitConstants=4, b0)"
+RWByteAddressBuffer outb : register(u0);
+cbuffer C : register(b0) { uint slot; uint at; uint tag; uint pad; };
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint l : SV_GroupThreadID) {
+    RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(slot)];
+    w.Store(at + 4u * l, tag | l);
+    DeviceMemoryBarrier();
+    outb.Store(4u * l, w.Load(at + 4u * l));
+}
+"#;
+    unsafe {
+        let dxil = super::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+        let pso: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() }, ..Default::default() })
+            .unwrap();
+        let q: ID3D12InfoQueue = dev.cast().expect("info queue (debug layer on)");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 4 * GIB,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut r).unwrap();
+        let win = r.unwrap();
+        let mut heap: Option<ID3D12Heap> = None;
+        dev.CreateHeap(&D3D12_HEAP_DESC { SizeInBytes: TILE, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, Alignment: 0, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS }, &mut heap).unwrap();
+        let heap = heap.unwrap();
+        let c = D3D12_TILED_RESOURCE_COORDINATE { X: ((4 * GIB - TILE) / TILE) as u32, ..Default::default() };
+        let s = D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() };
+        queue.UpdateTileMappings(&win, 1, Some(&c), Some(&s), &heap, 1, Some(&D3D12_TILE_RANGE_FLAG_NONE), Some(&0), Some(&1), D3D12_TILE_MAPPING_FLAG_NONE);
+        let dh: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 4, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
+            .unwrap();
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        let h0 = dh.GetCPUDescriptorHandleForHeapStart();
+        let view = |first: u64, n: u32| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { FirstElement: first, NumElements: n, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW } },
+        };
+        let views = [view(0, ((4 * GIB - TILE) / 4) as u32), view(0, (1u32 << 30) - 1), view(0, 1u32 << 30), view((4 * GIB - TILE) / 4, (TILE / 4) as u32)];
+        let mut created = Vec::new();
+        for (k, v) in views.iter().enumerate() {
+            let before = q.GetNumStoredMessages();
+            dev.CreateUnorderedAccessView(&win, None::<&ID3D12Resource>, Some(v), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h0.ptr + k * inc });
+            created.push(q.GetNumStoredMessages() - before);
+        }
+        // (slot, offset in the view): the first dwords of the tile, then its last dwords
+        let top = 0xFFFF_0000u32;
+        let runs: Vec<(u32, u32)> = (0..3u32).flat_map(|k| [(k, top), (k, 0xFFFF_FF00)]).chain([(3, 0), (3, 0xFF00)]).collect();
+        let out = buf(&dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        let rb = buf(&dev, 256 * runs.len() as u64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
+        list.SetDescriptorHeaps(&[Some(dh.clone())]);
+        list.SetComputeRootSignature(&rs);
+        list.SetComputeRootUnorderedAccessView(0, out.GetGPUVirtualAddress());
+        for (i, &(slot, at)) in runs.iter().enumerate() {
+            list.SetComputeRoot32BitConstants(1, 3, [slot, at, (0x10 + i as u32) << 24].as_ptr() as _, 0);
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&rb, 256 * i as u64, &out, 0, 256);
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        }
+        list.Close().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        queue.Signal(&fence, 1).unwrap();
+        crate::gpu::fence::wait(&fence, 1, &dev, None, 20_000).map_err(|e| format!("{e}")).unwrap();
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).unwrap();
+        let w = std::slice::from_raw_parts(p as *const u32, 64 * runs.len()).to_vec();
+        rb.Unmap(0, None);
+        let names = ["4 GiB - 64 KiB", "2^30 - 1 elements", "2^30 elements", "last tile alone"];
+        println!("{name}: debug-layer messages at creation per view: {created:?}");
+        for (i, &(slot, at)) in runs.iter().enumerate() {
+            let good = (0..64).filter(|&l| w[64 * i + l] == ((0x10 + i as u32) << 24) | l as u32).count();
+            println!("  {:<18} at {at:#010x}: {good}/64 lanes read back", names[slot as usize]);
+        }
+        let n = q.GetNumStoredMessages();
+        for i in 0..n.min(10) {
+            let mut len = 0usize;
+            let _ = q.GetMessage(i, None, &mut len);
+            let mut b = vec![0u8; len];
+            let m = b.as_mut_ptr() as *mut D3D12_MESSAGE;
+            if q.GetMessage(i, Some(m), &mut len).is_ok() {
+                println!("  [{:?}] {}", (*m).Severity, std::ffi::CStr::from_ptr((*m).pDescription as _).to_string_lossy());
+            }
+        }
     }
 }
