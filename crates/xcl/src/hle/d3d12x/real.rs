@@ -1834,6 +1834,8 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateCommandQueue", dev_create_command_queue as usize),
             ("CheckFeatureSupport", dev_check_feature_support as usize),
             ("GetCustomHeapProperties", dev_get_custom_heap_properties as usize),
+            ("GetResourceAllocationInfo", dev_get_resource_allocation_info as usize),
+            ("GetAdapterLuid", dev_get_adapter_luid as usize),
             ("CreateCommandAllocator", dev_create_command_allocator as usize),
             ("CreateGraphicsPipelineState", dev_create_graphics_pso as usize),
             ("CreateComputePipelineState", dev_create_compute_pso as usize),
@@ -2029,6 +2031,31 @@ unsafe extern "system" fn dev_get_custom_heap_properties(a0: usize, a1: usize, a
         return a0;
     }
     f(a0 as *mut c_void, a1, a2, a3)
+}
+
+/// `GetResourceAllocationInfo` (#25): `(this, ret, visibleMask, count, descs)`, the same title
+/// calls it with the result pointer first and the device second (see `dev_get_custom_heap_properties`).
+unsafe extern "system" fn dev_get_resource_allocation_info(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    type F = unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> usize;
+    let device = device_raw() as usize;
+    let f: F = std::mem::transmute(orig_fn(device as *mut c_void, slot_of(device as *mut c_void, "GetResourceAllocationInfo")));
+    if a0 != device && a1 == device && a0 != 0 {
+        f(device as *mut c_void, a0, a2, a3, a4);
+        return a0;
+    }
+    f(a0 as *mut c_void, a1, a2, a3, a4)
+}
+
+/// `GetAdapterLuid` (#43): `(this, ret)`, likewise.
+unsafe extern "system" fn dev_get_adapter_luid(a0: usize, a1: usize) -> usize {
+    type F = unsafe extern "system" fn(*mut c_void, usize) -> usize;
+    let device = device_raw() as usize;
+    let f: F = std::mem::transmute(orig_fn(device as *mut c_void, slot_of(device as *mut c_void, "GetAdapterLuid")));
+    if a0 != device && a1 == device && a0 != 0 {
+        f(device as *mut c_void, a0);
+        return a0;
+    }
+    f(a0 as *mut c_void, a1)
 }
 
 unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {

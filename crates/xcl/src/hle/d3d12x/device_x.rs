@@ -62,7 +62,14 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
         0 | 100 | 10000 => d[1], // NORMAL, HIGH, GLOBAL_REALTIME
         _ => 100,
     };
-    [pc_list_type(d[0]), priority, d[2], if d[3] == 0 { 0 } else { 1 }]
+    // the PC knows one flag (DISABLE_GPU_TIMEOUT = 1); the console's others (a 2026 title passes
+    // 2 for a compute queue) make the PC's CreateCommandQueue fail with E_INVALIDARG
+    const PC_FLAGS: u32 = 1;
+    if d[2] & !PC_FLAGS != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_info!("D3D12.X: console command queue flags {:#x} (type {}) – the PC takes only {PC_FLAGS:#x}", d[2], d[0]));
+    }
+    [pc_list_type(d[0]), priority, d[2] & PC_FLAGS, if d[3] == 0 { 0 } else { 1 }]
 }
 
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
