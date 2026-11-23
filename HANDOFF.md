@@ -1775,6 +1775,21 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   4 GiB window – a redesign of how shaders reach title memory.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
+- **Retail GTA 6 bring-up (Series 1.0.2.1, `RockstarGamesInc.28872443D20A7`) – First-run report analysis & fixes (2026-11-23)**:
+  - First-run outcome: game boots, VFS loads package RPFs, 8 game DLLs load (0 unresolved imports, `XMemIsToolsMemAvailable` stubbed),
+    D3D12.X device on AMD Radeon RX 6600 (8146 MiB VRAM), UMA 512 MB (66112 KB used), 4,518 unique shaders seen (4,407 xbox-native),
+    16,131,755 RDNA2 instructions decoded (0 undecoded dwords), 50,597 pipelines translated, 2 presents before crash at `game_scarlett_master.exe+0x2215c35`.
+  - **Crash at `+0x2215c35` (write at address 0x0)**:
+    - Root cause: title calls `xg_xs.dll: XGTextureAddressComputer::#10` 179 times during startup (`+0x344287`). The method was an auto-generated stub returning `E_NOTIMPL` (`0x80004001`). The game expected subresource layout or subresource offset, leaving internal texture descriptor pointers null (`rbx=0`), leading to deterministic write to null right after the 2nd present.
+    - Fix (`hle/xg.rs`): routed slots 10 & 11 in `vtbl()` to `get_subresource_info`, which supports both `GetSubresourceLayout(plane, sub, outLayout)` (writing the 0x70-byte `XG_SUBRESOURCE_LAYOUT` struct) and `GetSubresourceOffsetBytes(plane, sub) / (sub)` returning the byte offset in `rax`. Added `subresource_offset`, `write_subresource_layout`, and unit test `subresource_layout_and_offset`.
+  - **620 Rejected Graphics PSOs (`0x80070057; topology type 3, 2 render targets, DSV format 118`)**:
+    - Root cause: format 118 is `DXGI_FORMAT_D16_UNORM_S8_UINT` in the Xbox GDK. Desktop PC D3D12 drivers (including AMD RDNA2) reject this format as `E_INVALIDARG` (`0x80070057`) when passed in `D3D12_GRAPHICS_PIPELINE_STATE_DESC.DSVFormat`.
+    - Fix (`hle/d3d12x/real.rs`): in `pc_topology_type()`, remapped `DSVFormat == 118` to `DXGI_FORMAT_D24_UNORM_S8_UINT` (45), which PC hardware supports. In `translated_graphics_pso()`, added an automatic fallback retry with `DXGI_FORMAT_D32_FLOAT_S8X24_UINT` (20) if the driver rejects format 45.
+  - **Command Queue Slot #35 (5 calls from `+0x248268f`)**:
+    - Extended `queue_slots!` macro to include slot 35 (14..=35), routing calls through `queue_dispatch` with proper frame pacing and logging.
+  - **Mesh pipeline stream disambiguation (`hle/d3d12x/real.rs`)**:
+    - Handled console stream AS slot (24) holding MS containers (`MSNC_VS_TransformUnlit_*`, NGG) by falling back to MS when AS is rejected or MS subobject is absent.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`

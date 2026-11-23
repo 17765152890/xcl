@@ -2968,7 +2968,11 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    if hr < 0 && copy.DSVFormat.0 == 45 {
+        copy.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(20);
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    }
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -3258,7 +3262,11 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     pc_topology_type(&mut copy);
-    let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    let mut hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    if hr2 < 0 && copy.DSVFormat.0 == 45 {
+        copy.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(20);
+        hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    }
     note_fallback("graphics PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
         hr2
@@ -3628,6 +3636,11 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
+    }
+    // Format 118 is DXGI_FORMAT_D16_UNORM_S8_UINT on Xbox GDK, which desktop PC drivers reject (0x80070057).
+    // Remap to DXGI_FORMAT_D24_UNORM_S8_UINT (45) which is supported on PC hardware.
+    if g.DSVFormat.0 == 118 {
+        g.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(45);
     }
 }
 
