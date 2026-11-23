@@ -4098,3 +4098,51 @@ fn mesh_wave32_rejects_cross_half_operations() {
     assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
     assert!(split.complete(), "{:?}", split.unsupported_why);
 }
+
+#[test]
+fn s_round_mode_default_is_ignored_non_default_is_unsupported() {
+    // S_ROUND_MODE with SIMM16 = 0: selects Round to Nearest Even (default).
+    // Should be safely NOOPed and recorded in ignored.
+    let code_default = prog(&[("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0)], None)]);
+    let t_default = translate(&code_default, &Options::default()).unwrap();
+    assert!(t_default.complete(), "{:?}", t_default.unsupported_why);
+    assert_eq!(t_default.ignored.get("s_round_mode"), Some(&1));
+
+    // S_ROUND_MODE with SIMM16 = 1 (or any non-zero): directed rounding.
+    // Must be recorded as unsupported so non-default round modes are visibly reported.
+    let code_nondefault = prog(&[("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)], None)]);
+    let t_nondefault = translate(&code_nondefault, &Options::default()).unwrap();
+    assert_eq!(t_nondefault.unsupported.get("s_round_mode"), Some(&1));
+    assert!(t_nondefault.unsupported_why.contains_key("s_round_mode: non-default round mode 0x1"));
+}
+
+#[test]
+fn mad_nf_and_mad_nf16_non_fused_intermediate_rounding() {
+    let code = prog(&[
+        // v3 = v_mad_f32(v0, v1, v2) (console-only non-fused multiply-add)
+        ("V_MAD_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("mad_nf("), "V_MAD_F32 must emit mad_nf");
+    assert!(t.hlsl.contains("float mad_nf16(float a, float b, float c)"), "HLSL must define mad_nf16");
+    assert!(t.hlsl.contains("precise float p = f16tof32(f32tof16(a * b));"), "mad_nf16 must round intermediate product to f16");
+
+    if !gpu_ready() {
+        return;
+    }
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        // v_mad_f32 golden vector (issue #73):
+        // a = max finite f32 (0x7F7FFFFF), b = 1.0 + 2^-23 (0x3F800001), c = -max finite f32 (0xFF7FFFFF).
+        // Non-fused: intermediate product a * b overflows to +inf (0x7F800000), then +inf + c = +inf.
+        // Fused: evaluates with infinite precision, (a * (1 + 2^-23) - a) = a * 2^-23 = 0x73FFFFFF (finite).
+        r[0] = 0x7F7F_FFFF;
+        r[1] = 0x3F80_0001;
+        r[2] = 0xFF7F_FFFF;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        assert_eq!(r.vgpr[l][3], 0x7F80_0000, "lane {l}: v_mad_f32 must evaluate non-fused (overflow to +inf)");
+    }
+}

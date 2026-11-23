@@ -48,7 +48,7 @@ pub(super) struct Em {
 const NOOPS: &[&str] = &[
     "s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr",
     "s_inst_prefetch", "s_clause", "s_code_end", "s_setprio", "s_sleep", "s_icache_inv", "s_dcache_inv", "s_gl1_inv", "s_ttracedata",
-    "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_round_mode", "s_setreg_imm32_b32", "s_setreg_b32", "s_sendmsg", "s_sendmsghalt",
+    "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_setreg_imm32_b32", "s_setreg_b32", "s_sendmsg", "s_sendmsghalt",
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
 
@@ -615,6 +615,17 @@ impl Em {
             "s_barrier" => {
                 if matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
                     self.line("GroupMemoryBarrierWithGroupSync();");
+                }
+                Flow::Next
+            }
+            "s_round_mode" => {
+                let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
+                if simm == 0 {
+                    // 0 = Round to Nearest Even (the default D3D / IEEE-754 mode).
+                    // Setting the default rounding mode is a safe no-op.
+                    *self.ignored.entry(name.to_string()).or_default() += 1;
+                } else {
+                    self.unsupported(d, &format!("non-default round mode {simm:#x}"));
                 }
                 Flow::Next
             }
@@ -2374,7 +2385,7 @@ impl Em {
             "v_frexp_mant_f16" => fr(format!("frexp_mant({})", fh(0))),
             "v_frexp_exp_i16_f16" => format!("((uint)frexp_exp({}) & 0xFFFFu)", fh(0)),
             "v_cndmask_b16" => return Err("VALU 16-bit"),
-            "v_mad_f16" => fr(format!("mad_nf({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_mad_f16" => fr(format!("mad_nf16({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0), fh(1))),
             "v_fmamk_f16" => fr(format!("mad({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
             "v_fmaak_f16" => fr(format!("mad({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
@@ -4532,6 +4543,7 @@ uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, se
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
+float mad_nf16(float a, float b, float c) { precise float p = f16tof32(f32tof16(a * b)); precise float r = f16tof32(f32tof16(p + c)); return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
