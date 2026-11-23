@@ -1607,6 +1607,21 @@ type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u
 /// command list #10 Reset(allocator, initial pipeline): updates allocator/pipeline and clears
 /// per-recording state (queries, index buffer, depth bias, pending waits, written ranges)
 pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    // Reset is transactional from XCL's point of view.  The runtime may reject a reset (for
+    // example while the list is still open); in that case the old recording and every object
+    // keeping its resources alive still belong to the list.
+    let ext = *(this as *const usize);
+    let resolved = super::pso_async::resolve_for_bind(pso);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
+    // The PC runtime writes its own vtable into a copy list again on Reset: keep XCL's even
+    // when Reset fails, but do not otherwise commit any state on failure.
+    if *(this as *const usize) != ext {
+        *(this as *mut usize) = ext;
+    }
+    if hr < 0 {
+        return hr;
+    }
+
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -1626,14 +1641,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::bind::reset(this, alloc, pso);
-    // the PC runtime writes its own vtable into a copy list again on Reset: keep XCL's
-    let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
-    if *(this as *const usize) != ext {
-        *(this as *mut usize) = ext;
-    }
-    if hr >= 0 && !is_bundle && pso != 0 {
+    if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
                 if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
@@ -2028,6 +2036,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
+    static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn reset_test_native(this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        *(this as *mut usize) = RESET_TEST_REPLACEMENT_VT.load(Ordering::SeqCst) as usize;
+        RESET_TEST_HR.load(Ordering::SeqCst) as i32
+    }
+
     #[test]
     fn nested_occlusion_queries_end_the_outer_one_early() {
         let ty = D3D12_QUERY_TYPE_OCCLUSION;
@@ -2236,6 +2252,84 @@ mod tests {
             assert!(!s.pso_dirty);
         }
         on_release(key);
+    }
+
+    #[test]
+    fn reset_commits_state_only_after_native_success_and_always_restores_vtable() {
+        // `orig_fn` expects an adopted vtable whose preceding word points at the native table.
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = reset_test_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let replacement = 0x1234_5678usize;
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+
+        unsafe { on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        {
+            let mut g = LISTS.lock().unwrap();
+            let s = g.as_mut().unwrap().get_mut(&key).unwrap();
+            s.allocator = 0x111;
+            s.bound_pso = 0x222;
+            s.depth_bias = Some(DepthBias::new(-3.5, 0.25, 2.0));
+            s.native_bias = DepthBias::new(-4.5, 0.5, 3.0);
+            s.pso_dirty = true;
+            s.using_fallback_pso = true;
+            s.index_buffer = Some(D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: 0x5000,
+                SizeInBytes: 12,
+                Format: DXGI_FORMAT_R32_UINT,
+            });
+            s.depth_bounds = Some((0.25, 0.75));
+            s.written_ranges.push((0x6000, 0x6010));
+        }
+        super::super::bind::seed_reset_state_for_test(list, 0x111, 0x222, vec![0x4444]);
+        RESET_TEST_REPLACEMENT_VT.store(replacement as u64, Ordering::SeqCst);
+
+        // Native failure may rewrite the vtable, but must not mutate XCL's recording state or
+        // transfer its ABI allocations to the old allocator.
+        RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
+        assert!(unsafe { reset_x(list, 0x333, 0x555) } < 0);
+        assert_eq!(object[0], ext);
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&key).unwrap();
+            assert_eq!((s.allocator, s.bound_pso), (0x111, 0x222));
+            assert_eq!(s.depth_bias, Some(DepthBias::new(-3.5, 0.25, 2.0)));
+            assert_eq!(s.native_bias, DepthBias::new(-4.5, 0.5, 3.0));
+            assert!(s.pso_dirty && s.using_fallback_pso);
+            assert_eq!(s.index_buffer.as_ref().unwrap().BufferLocation, 0x5000);
+            assert_eq!(s.depth_bounds, Some((0.25, 0.75)));
+            assert_eq!(s.written_ranges, vec![(0x6000, 0x6010)]);
+        }
+        assert_eq!(
+            super::super::bind::reset_state_for_test(list),
+            (0x111, 0x222, vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![0x4444])
+        );
+        assert!(super::super::console_list::take_pending_for_test(0x111).is_empty());
+
+        // The same native call succeeding commits the new recording once and transfers the old
+        // allocation exactly once.
+        RESET_TEST_HR.store(0, Ordering::SeqCst);
+        assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
+        assert_eq!(object[0], ext);
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&key).unwrap();
+            assert_eq!((s.allocator, s.bound_pso), (0x333, 0x555));
+            assert!(s.depth_bias.is_none() && s.index_buffer.is_none() && s.depth_bounds.is_none());
+            assert!(!s.pso_dirty && !s.using_fallback_pso && s.written_ranges.is_empty());
+        }
+        assert_eq!(
+            super::super::bind::reset_state_for_test(list),
+            (0x333, 0x555, Vec::new(), Vec::new(), Vec::new())
+        );
+        assert_eq!(super::super::console_list::take_pending_for_test(0x111), vec![0x4444]);
+        assert!(super::super::console_list::take_pending_for_test(0x111).is_empty());
+
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        super::super::bind::remove_state_for_test(list);
     }
 
     #[test]

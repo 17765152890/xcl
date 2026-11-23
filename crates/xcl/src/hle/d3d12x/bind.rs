@@ -122,6 +122,29 @@ pub(super) fn forget(list: *mut c_void) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso: usize, uma: Vec<usize>) {
+    with(list, |s| {
+        s.allocator = allocator;
+        s.pso = pso;
+        s.layout = Some(std::sync::Arc::new(console_list::Layout::default()));
+        s.args = vec![1, 2, 3, 4];
+        s.layout_gfx = Some(std::sync::Arc::new(console_list::Layout::default()));
+        s.args_gfx = vec![5, 6, 7, 8];
+        s.uma = uma;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>, Vec<u8>, Vec<usize>) {
+    with(list, |s| (s.allocator, s.pso, s.args.clone(), s.args_gfx.clone(), s.uma.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn remove_state_for_test(list: *mut c_void) {
+    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+}
+
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
 fn put_in(list: *mut c_void, gfx: bool, i: u32, offset: u32, bytes: &[u8]) {
     with(list, |s| {
