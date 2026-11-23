@@ -8,7 +8,9 @@
 //!   if / else, loops with the back edge at their end (also entered in the middle: rotated),
 //!   and any other forward jump – loop breaks, jumps past a join, s_endpgm before the end –
 //!   as a skip flag (`xcl_skip_<target>`: set at the jump, the code up to the target runs
-//!   under `if (!flag)`, loops `break`); retail pack: 90% of the programs need no `pc`,
+//!   under `if (!flag)`, loops `break`); retail pack: 88% of the programs; the general form
+//!   (`structure`: dominator tree, loops, blocks left by `break`) takes all but 21 of the rest
+//!   (irreducible ones, and ES + GS pairs, keep the `pc` chain),
 //! * SGPRs, VCC, EXEC, M0 and SCC are ordinary variables that every lane computes alike
 //!   (uniform); lane masks produced by vector instructions come from `WaveActiveBallot`,
 //! * VGPRs are per-lane variables; vector writes are masked by the lane's EXEC bit,
@@ -59,6 +61,7 @@ pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
+mod structure;
 #[cfg(test)]
 mod tests;
 pub mod upper_lanes;
@@ -1379,10 +1382,26 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
-        if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
+        let structured = gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none();
+        // `XCL_RECOMP_GENERAL=1` (tests: `structure::GENERAL_ONLY`): the general form for
+        // every program with branches
+        let general_only = std::env::var_os("XCL_RECOMP_GENERAL").is_some() || structure::general_only();
+        let general = |em: &mut emit::Em, code: &mut String, blocks: &mut usize| match structure::structure(&ctx, em, blocks) {
+            Ok(s) => {
+                *code = s;
+                true
+            }
+            Err(e) => {
+                why(0, &e);
+                false
+            }
+        };
+        if structured && !general_only && structurable(&ctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
+        } else if structured && general(&mut em, &mut code, &mut blocks) {
+            // what `structurable` rejects in the general structured form (`structure`)
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
