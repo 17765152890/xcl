@@ -9,6 +9,7 @@
 pub mod log;
 pub mod manifest;
 pub mod config;
+pub mod amd_insn;
 pub mod disasm;
 pub mod eh;
 pub mod gpu;

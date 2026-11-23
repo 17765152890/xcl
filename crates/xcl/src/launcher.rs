@@ -367,6 +367,10 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     }
+    let amd_only = crate::amd_insn::missing();
+    if !amd_only.is_empty() {
+        println!("  cpu:   {} emulated (AMD-only instructions of the console's CPU)", amd_only.join(", "));
+    }
 
     let mut cmdline = quote(&exe.to_string_lossy());
     for a in args {
