@@ -8,7 +8,7 @@
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{dxc, interface, translate, Mode, Options};
+use super::{dxc, interface, Mode, Options};
 use crate::gpu::xbox;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +75,14 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
     Ok(Compiled { dxil, samplers: t.static_samplers })
 }
 
+/// A console compute shader as signed DXIL; `wave32`: the adapter has no 64-lane waves, so a
+/// wave64 program runs as two wave32 halves (refused when it needs both halves at once).
+pub fn console_compute_to_dxil(blob: &[u8], wave32: bool) -> Result<Compiled, String> {
+    let (t, profile) = console_translation_with(blob, Stage::Compute, 0, wave32)?;
+    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    Ok(Compiled { dxil, samplers: t.static_samplers })
+}
+
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
 fn sample_at_lod0(hlsl: &str) -> String {
     let mut out = String::with_capacity(hlsl.len());
@@ -134,6 +142,10 @@ pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static st
 }
 
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(super::Translation, &'static str), String> {
+    console_translation_with(blob, stage, sampler_base, false)
+}
+
+fn console_translation_with(blob: &[u8], stage: Stage, sampler_base: u32, compute_wave32: bool) -> Result<(super::Translation, &'static str), String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {
@@ -155,7 +167,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
+    let t = super::translate_compute(code, Options { mode, wave64: super::detect_wave64(code), compute_wave32, static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));

@@ -2687,9 +2687,18 @@ fn gpu_compute_mode_dispatch_abi() {
     if !gpu_ready() {
         return;
     }
-    use super::{dxc, CsInterface};
-    let cs = CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 };
-    let p = prog(&[
+    let t = translate(&dispatch_abi_program(), &Options { mode: Mode::Compute(dispatch_abi_cs()), wave64: true, ..Default::default() }).unwrap();
+    check_dispatch_abi(&t);
+}
+
+fn dispatch_abi_cs() -> super::CsInterface {
+    super::CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 }
+}
+
+/// 128 threads (two waves): each writes its id, and through LDS + s_barrier the id of the
+/// thread at the mirrored index in the other wave.
+fn dispatch_abi_program() -> Vec<u8> {
+    prog(&[
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 132), ("VSRC1", 1)], None), // y · 16
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 2), ("VSRC1", 0)], None), // index in group
         ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 2), ("SSRC1", 132)], None), // group x · 16
@@ -2711,10 +2720,12 @@ fn gpu_compute_mode_dispatch_abi() {
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 0), ("VSRC1", 9)], None), // + output base
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
-    ]);
-    let t = translate(&p, &Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() }).unwrap();
+    ])
+}
+
+fn check_dispatch_abi(t: &super::Translation) {
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let (w, h, base) = (32usize, 24usize, 0x100usize);
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
@@ -2729,6 +2740,63 @@ fn gpu_compute_mode_dispatch_abi() {
             assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
         }
     }
+}
+
+/// The same wave64 compute program on an adapter without 64-lane waves (NVIDIA): each wave
+/// runs as two native wave32 halves, and the result is the same.
+#[test]
+fn gpu_compute_wave64_as_wave32_halves() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    let opt = Options { mode: Mode::Compute(dispatch_abi_cs()), wave64: true, compute_wave32: true, ..Default::default() };
+    let t = super::translate_compute(&dispatch_abi_program(), opt).unwrap();
+    assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("xcl_logical_wave64 = true"), "{}", t.hlsl);
+    check_dispatch_abi(&t);
+}
+
+/// EXEC per half in a split wave64 compute program: v_cmpx keeps lanes 0..39, so the high
+/// half (lanes 32..63) keeps 8 lanes, which it reads from its own word of the mask.
+#[test]
+fn gpu_compute_wave32_halves_keep_their_exec_bits() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let p = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None), // v0 · 4
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)], None),     // + output base (s0)
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 129), ("VSRC1", 0)], None), // v0 + 1
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)),         // exec = v0 < 40
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D)], None),
+    ]);
+    let opt = Options { mode: Mode::Compute(cs), wave64: true, compute_wave32: true, ..Default::default() };
+    let t = super::translate_compute(&p, opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let base = 0x100usize;
+    let mut io = vec![0u32; 128];
+    io[0] = base as u32;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 64 * 4) / 4]).unwrap();
+    for l in 0..64 {
+        assert_eq!(out[base / 4 + l], if l < 40 { l as u32 + 1 } else { 0 }, "lane {l}");
+    }
+}
+
+/// A split wave64 compute program that needs the mask of the whole wave is refused, as split
+/// geometry and mesh programs are; with 64-lane waves it translates.
+#[test]
+fn split_compute_refuses_cross_half_semantics() {
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let p = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 138), ("VSRC1", 0)], None),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)], None), // lanes in vcc
+    ]);
+    let opt = Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() };
+    assert!(super::translate_compute(&p, opt.clone()).is_ok());
+    let e = super::translate_compute(&p, Options { compute_wave32: true, ..opt }).err().expect("split compute must refuse");
+    assert!(e.contains("compute program requires unsupported cross-half wave64 semantics") && e.contains("whole-wave mask reduction"), "{e}");
 }
 
 /// A wave32 program in a 64-lane hardware wave (what VS / PS may get from the driver): the

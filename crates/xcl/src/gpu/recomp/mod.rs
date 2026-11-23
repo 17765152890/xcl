@@ -469,6 +469,8 @@ pub struct Options {
     pub geometry_wave32: bool,
     /// mesh mode: run a logical wave64 mesh program as two native wave32 halves
     pub mesh_wave32: bool,
+    /// compute mode: run a logical wave64 compute program as two native wave32 halves
+    pub compute_wave32: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -483,7 +485,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, compute_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -1181,6 +1183,18 @@ pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, mesh_wave32: b
         }
     }
     translate(code, &Options { mode: Mode::Mesh(ms), wave64, mesh_wave32, ..Default::default() })
+}
+
+/// Translate a compute program; a wave64 program split into wave32 halves (an adapter without
+/// 64-lane waves) is refused when it needs cross-half semantics, as for split mesh programs.
+pub fn translate_compute(code: &[u8], opt: Options) -> Result<Translation, String> {
+    if opt.wave64 && opt.compute_wave32 {
+        let hazards = geometry_wave32_hazards(code);
+        if !hazards.is_empty() {
+            return Err(format!("compute program requires unsupported cross-half wave64 semantics: {hazards:?}"));
+        }
+    }
+    translate(code, &opt)
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.

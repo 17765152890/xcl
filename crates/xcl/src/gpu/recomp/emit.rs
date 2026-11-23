@@ -3569,15 +3569,21 @@ impl Em {
             }
             Mode::Compute(cs) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
+                let split_wave32 = self.opt.wave64 && self.opt.compute_wave32;
+                let native_lanes = if split_wave32 { 32 } else { lanes };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let [x, y, z] = cs.threads;
                 let _ = writeln!(
                     h,
-                    "[WaveSize({lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                    "[WaveSize({native_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
-                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                if split_wave32 {
+                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                } else {
+                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                }
                 load_sgprs(&mut h);
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;

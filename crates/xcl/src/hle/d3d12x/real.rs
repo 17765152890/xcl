@@ -2532,7 +2532,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_compute_to_dxil, is_console};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -2541,7 +2541,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if !is_console(cs) {
         return None;
     }
-    let compiled = match console_to_dxil(cs, Stage::Compute, 0) {
+    let compiled = match console_compute_to_dxil(cs, geometry_wave32_required(this)) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
