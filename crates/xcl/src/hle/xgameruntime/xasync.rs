@@ -116,6 +116,9 @@ pub struct State {
     identity: usize,
     /// For XAsyncRun.
     work: usize,
+    /// Keeps XCL's `begin_with` / `begin_with_fixups` payload alive as long as any `Arc<State>`
+    /// exists (eliminating concurrent/unwind UAF when `PC_ASYNC == 0`).
+    _owned_payload: Option<Arc<Payload>>,
     inner: Mutex<Inner>,
     cv: Condvar,
 }
@@ -263,17 +266,14 @@ impl Drop for BeginCleanup {
     }
 }
 
-pub unsafe extern "system-unwind" fn XAsyncBegin(
+unsafe fn xasync_begin_inner(
     b: *mut XAsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
     _identity_name: *const u8,
     provider: usize,
+    owned_payload: Option<Arc<Payload>>,
 ) -> HRESULT {
-    if let Some((o, f)) = pc(7) {
-        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
-        return f(o, b, context, identity, _identity_name, provider);
-    }
     if b.is_null() || provider == 0 {
         return E_INVALIDARG;
     }
@@ -283,6 +283,7 @@ pub unsafe extern "system-unwind" fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         work: 0,
+        _owned_payload: owned_payload,
         inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
         cv: Condvar::new(),
     });
@@ -296,6 +297,20 @@ pub unsafe extern "system-unwind" fn XAsyncBegin(
         XAsyncComplete(b, hr, 0);
     }
     S_OK
+}
+
+pub unsafe extern "system-unwind" fn XAsyncBegin(
+    b: *mut XAsyncBlock,
+    context: *mut c_void,
+    identity: *const c_void,
+    identity_name: *const u8,
+    provider: usize,
+) -> HRESULT {
+    if let Some((o, f)) = pc(7) {
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, context, identity, identity_name, provider);
+    }
+    xasync_begin_inner(b, context, identity, identity_name, provider, None)
 }
 
 pub unsafe extern "system-unwind" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
@@ -571,6 +586,7 @@ pub unsafe extern "system-unwind" fn XAsyncRun(b: *mut XAsyncBlock, work: usize)
         context: 0,
         identity: 0,
         work,
+        _owned_payload: None,
         inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
         cv: Condvar::new(),
     });
@@ -600,6 +616,7 @@ struct Payload {
     result: Mutex<Option<Result<PayloadBuf, HRESULT>>>,
     work: Mutex<Option<Box<dyn FnOnce() -> Result<PayloadBuf, HRESULT> + Send>>>,
     cleaned_up: AtomicBool,
+    owned_by_pc: bool,
 }
 
 unsafe extern "system-unwind" fn payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
@@ -635,8 +652,15 @@ unsafe extern "system-unwind" fn payload_provider(op: u32, data: *const XAsyncPr
             S_OK
         }
         OP_CLEANUP => {
-            if !p.cleaned_up.swap(true, Ordering::AcqRel) {
-                drop(Arc::from_raw(d.context as *const Payload));
+            if p.owned_by_pc {
+                if !p.cleaned_up.swap(true, Ordering::AcqRel) {
+                    drop(Arc::from_raw(d.context as *const Payload));
+                }
+            } else {
+                // Release captured work/result buffers promptly while keeping `Payload` itself
+                // alive until every `Arc<State>` drops (UAF-safe across concurrent workers).
+                *p.work.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *p.result.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             S_OK
         }
@@ -657,41 +681,32 @@ pub unsafe fn begin_with_fixups<F>(b: *mut XAsyncBlock, identity: usize, work: F
 where
     F: FnOnce() -> Result<PayloadBuf, HRESULT> + Send + 'static,
 {
+    if let Some((o, f)) = pc(7) {
+        let p = Arc::into_raw(Arc::new(Payload {
+            result: Mutex::new(None),
+            work: Mutex::new(Some(Box::new(work))),
+            cleaned_up: AtomicBool::new(false),
+            owned_by_pc: true,
+        }));
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
+        let hr = f(o, b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize);
+        if hr < 0 {
+            // SAFETY: The PC runtime rejected `XAsyncBegin` synchronously before adopting `p`.
+            let payload = &*p;
+            if !payload.cleaned_up.swap(true, Ordering::AcqRel) {
+                drop(Arc::from_raw(p));
+            }
+        }
+        return hr;
+    }
     let payload = Arc::new(Payload {
         result: Mutex::new(None),
         work: Mutex::new(Some(Box::new(work))),
         cleaned_up: AtomicBool::new(false),
+        owned_by_pc: false,
     });
-    let ptr = Arc::into_raw(Arc::clone(&payload));
-    // Reclaim the `Arc::into_raw` ownership ref if `XAsyncBegin` returns an error or unwinds
-    // without leaving `b` active in `ACTIVE` and without `OP_CLEANUP` having already freed it.
-    struct PayloadGuard {
-        payload: Arc<Payload>,
-        ptr: *const Payload,
-        b: *mut XAsyncBlock,
-        armed: bool,
-    }
-    impl Drop for PayloadGuard {
-        fn drop(&mut self) {
-            if !self.armed {
-                return;
-            }
-            let still_active = active_map()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(self.b as usize))
-                .is_some_and(|cur| cur.context == self.ptr as usize);
-            if !still_active && !self.payload.cleaned_up.swap(true, Ordering::AcqRel) {
-                unsafe { drop(Arc::from_raw(self.ptr)) };
-            }
-        }
-    }
-    let mut guard = PayloadGuard { payload, ptr, b, armed: true };
-    let hr = XAsyncBegin(b, ptr as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize);
-    if hr >= 0 {
-        guard.armed = false;
-    }
-    hr
+    let ctx = Arc::as_ptr(&payload) as *mut c_void;
+    xasync_begin_inner(b, ctx, identity as *const c_void, std::ptr::null(), payload_provider as usize, Some(payload))
 }
 
 #[cfg(test)]

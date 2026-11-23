@@ -694,7 +694,7 @@ struct Waiter {
     wait: usize,
 }
 
-unsafe extern "system-unwind" fn waiter_fired(ctx: *mut c_void, _timed_out: bool) {
+unsafe extern "system" fn waiter_fired(ctx: *mut c_void, _timed_out: bool) {
     let w = &*(ctx as *const Waiter);
     if !w.queue.is_terminated() {
         let _ = submit_now(&w.queue, w.port, w.item);
@@ -719,10 +719,7 @@ pub unsafe extern "system" fn XTaskQueueRegisterWaiter(
     }
     let w = Box::into_raw(Box::new(Waiter { queue: q, port, item: Item { cb, ctx: ctx as usize }, wait: 0 }));
     let mut wh = std::ptr::null_mut();
-    // SAFETY: `extern "system-unwind"` and `extern "system"` share the identical Win64 ABI.
-    let cb_fn: unsafe extern "system" fn(*mut c_void, bool) =
-        std::mem::transmute::<unsafe extern "system-unwind" fn(*mut c_void, bool), _>(waiter_fired);
-    if RegisterWaitForSingleObject(&mut wh, handle, Some(cb_fn), w as *const c_void, INFINITE, WT_EXECUTEDEFAULT) == 0 {
+    if RegisterWaitForSingleObject(&mut wh, handle, Some(waiter_fired), w as *const c_void, INFINITE, WT_EXECUTEDEFAULT) == 0 {
         drop(Box::from_raw(w));
         return crate::util::E_FAIL;
     }
