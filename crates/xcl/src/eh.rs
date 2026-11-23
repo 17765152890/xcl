@@ -300,6 +300,15 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             ];
             *regs[r as usize & 15] = cpu;
         }
+        // SSE4a on the low quadword of an XMM register (the exception's context has them all)
+        ConsoleOnly::Insertq { dst, src, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            x[dst as usize & 15].Low = crate::insn::insertq(x[dst as usize & 15].Low, x[src as usize & 15].Low, len, idx);
+        }
+        ConsoleOnly::Extrq { dst, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            x[dst as usize & 15].Low = crate::insn::extrq(x[dst as usize & 15].Low, len, idx);
+        }
     }
     ctx.Rip += len as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION
