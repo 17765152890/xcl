@@ -676,6 +676,19 @@ pub fn pc_format(f: u32) -> u32 {
     }
 }
 
+/// A copy of the clear value with its format as the PC's (`pc_format`), when that differs.
+unsafe fn pc_clear_value(clear: *const c_void) -> Option<D3D12_CLEAR_VALUE> {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, std::mem::size_of::<D3D12_CLEAR_VALUE>()) {
+        return None;
+    }
+    let mut c = (clear as *const D3D12_CLEAR_VALUE).read_unaligned();
+    let f = pc_format(c.Format.0 as u32);
+    (f != c.Format.0 as u32).then(|| {
+        c.Format.0 = f as i32;
+        c
+    })
+}
+
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
 /// returned through a hidden pointer. Called the C way – (return buffer, device, …), XDefiant –
 /// or the C++ way – (device, return buffer, …): whichever argument is the device is `this`.
@@ -790,6 +803,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
+    // its clear value in the PC's format too (`pc_format`): D16S8 (118) against the resource's
+    // D24S8 was refused (GTA VI's 1024x1024 depth buffers, E_INVALIDARG, then its assertion)
+    let clear_pc = pc_clear_value(clear);
+    let clear = clear_pc.as_ref().map_or(clear, |c| c as *const D3D12_CLEAR_VALUE as *const c_void);
     // a depth buffer is no UAV on the PC (`pc_resource_desc`): its unordered-access initial state
     // (GTA VI's 768x768x6 shadow maps: 0x8) is refused – it starts as a depth target
     if u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) & 0x2 != 0 && state & 0x8 != 0 {

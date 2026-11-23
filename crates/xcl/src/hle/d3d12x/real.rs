@@ -1627,6 +1627,19 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
+    let mut pc_view = pc_view_desc(desc);
+    if let (Some(rd), Some(mut v)) = (ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()), pc_view.or_else(|| desc.as_ref().copied())) {
+        if let Some((format, plane)) = depth_srv_format(rd.Format.0 as u32, v.Format.0 as u32) {
+            v.Format.0 = format as i32;
+            match v.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE2D => v.Anonymous.Texture2D.PlaneSlice = plane,
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => v.Anonymous.Texture2DArray.PlaneSlice = plane,
+                _ => {}
+            }
+            pc_view = Some(v);
+        }
+    }
+    let desc = pc_view.as_ref().map_or(desc, |v| v as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
@@ -1803,6 +1816,11 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             }
             let mut d = desc.as_ref().copied().unwrap_or(D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION(resource_dim_to_view(&rd) as i32), ..Default::default() });
             d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+            match d.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.PlaneSlice = 0,
+                _ => {}
+            }
             null_desc = d;
             (std::ptr::null_mut(), std::ptr::null_mut(), &null_desc as *const D3D12_UNORDERED_ACCESS_VIEW_DESC)
         }
@@ -1849,6 +1867,12 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
         };
+        // (of a depth buffer: the PC format of its depth or stencil plane, `depth_srv_format`)
+        let mut srv = srv;
+        if let Some((format, plane)) = depth_srv_format(rd.Format.0 as u32, srv.Format.0 as u32) {
+            srv.Format.0 = format as i32;
+            srv.Anonymous.Texture2D.PlaneSlice = plane;
+        }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, res, &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
@@ -1999,6 +2023,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
+            ("CreateDepthStencilView", dev_create_dsv as usize),
             ("CreateCommittedResource", dev_create_committed_resource as usize),
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
@@ -3945,6 +3970,8 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
+    let pc_view = pc_view_desc(desc as *const D3D12_RENDER_TARGET_VIEW_DESC);
+    let desc = pc_view.as_ref().map_or(desc, |v| v as *const D3D12_RENDER_TARGET_VIEW_DESC as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
@@ -3954,6 +3981,45 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
             crate::xlog_info!("frame trace: CreateRenderTargetView {handle:#x} → {res:p} {d:?}");
         }
     }
+}
+
+/// CreateDepthStencilView with the PC's format (`device_x::pc_format`): GTA VI's D16S8 views
+/// (118) of its depth buffers, which are D24S8 on the PC, were invalid and the device was
+/// removed (~55 s in).
+unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
+    let pc_view = pc_view_desc(desc);
+    f(this, res, pc_view.as_ref().map_or(desc, |v| v as *const _), handle)
+}
+
+/// The SRV format (and plane) the PC takes for a view of a depth + stencil resource: the console
+/// reads the depth of a D32S8 (R32G8X24) as R32_FLOAT, of a D24S8 (D16S8 on the console) as
+/// R16_UNORM, its stencil as R8_UINT – each invalid on the PC (GTA VI: the device was removed).
+fn depth_srv_format(resource: u32, view: u32) -> Option<(u32, u32)> {
+    let stencil = matches!(view, 62 | 22 | 47 | 120);
+    let r = match (resource, stencil) {
+        (19 | 20, false) => (21, 0),
+        (19 | 20, true) => (22, 1),
+        (44 | 45, false) => (46, 0),
+        (44 | 45, true) => (47, 1),
+        _ => return None,
+    };
+    (r != (view, if stencil { 1 } else { 0 }) || r.0 != view).then_some(r)
+}
+
+/// A copy of a view desc (its DXGI_FORMAT first) with the PC's format, when that differs.
+unsafe fn pc_view_desc<T: Copy>(desc: *const T) -> Option<T> {
+    if desc.is_null() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<T>()) {
+        return None;
+    }
+    let mut v = desc.read_unaligned();
+    let at = &mut v as *mut T as *mut u32;
+    let f = super::device_x::pc_format(*at);
+    (f != *at).then(|| {
+        *at = f;
+        v
+    })
 }
 
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
@@ -4712,5 +4778,21 @@ mod stream_tests {
         pc.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
         let desc: [usize; 2] = [pc.0.len(), pc.0.as_ptr() as usize];
         assert!(unsafe { pc_stream_types(desc.as_ptr() as *const c_void) }.is_none());
+
+mod depth_view_tests {
+    use super::depth_srv_format;
+
+    #[test]
+    fn console_depth_views_become_pc_ones() {
+        // D32S8 (R32G8X24_TYPELESS): depth as R32_FLOAT_X8X24_TYPELESS, stencil plane 1
+        assert_eq!(depth_srv_format(19, 41), Some((21, 0)));
+        assert_eq!(depth_srv_format(20, 62), Some((22, 1)));
+        // D24S8 (the console's D16S8): depth R24_UNORM_X8_TYPELESS, stencil X24_TYPELESS_G8_UINT
+        assert_eq!(depth_srv_format(45, 56), Some((46, 0)));
+        assert_eq!(depth_srv_format(45, 62), Some((47, 1)));
+        assert_eq!(depth_srv_format(45, 119), Some((46, 0)));
+        // already the PC's, or not a depth resource: unchanged
+        assert_eq!(depth_srv_format(45, 46), None);
+        assert_eq!(depth_srv_format(28, 28), None);
     }
 }
