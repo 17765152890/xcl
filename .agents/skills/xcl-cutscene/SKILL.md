@@ -4,7 +4,8 @@ description: >-
   Advance a legally unpacked Xbox Series title through XCL until the first intro
   cutscene plays. Use when the user names a retail title, a first-boot goal, an
   intro movie, or GTA, and the work is compatibility (imports, files, GPU,
-  video, audio), not obtaining or decrypting the game.
+  video, audio), not obtaining or decrypting the game. Also use when the user
+  asks for one startup or playability blocker at a time.
 ---
 
 # First intro cutscene
@@ -17,6 +18,12 @@ that title's files.
 The user owns the unpacked files and runs them. Do not decrypt packages, strip
 signatures, or discuss how to obtain a build. If the input is not a normal x64
 PE, `xcl inspect` already reports that; stop there.
+
+## One blocker
+
+Before coding, reproduce the blocker on current `main`. State the furthest screen reached: launcher, account picker, settings, main menu, in-game, or the first intro cutscene.
+
+One minimal, generic fix, with a focused test that does not need the title's files. No speculative stubs. No title name in the branch, the docs, or the commit. No protected-content workaround. No broad refactor. After the fix, rerun and say whether the screen or the failure changed. Upstream that change, then take the next blocker.
 
 ## What "cutscene" requires
 

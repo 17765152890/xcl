@@ -4,10 +4,21 @@ description: >-
   Read XCL report.json and choose the next fix, and run the project's tests
   and title smoke. Use when the user pastes a report or log, asks what is
   blocking a title, or asks to run cargo test, scripts/test.ps1, scripts/smoke.ps1,
-  or XCL_SAMPLE_* checks.
+  or XCL_SAMPLE_* checks. Also use when writing a report or PR about how
+  far a title got.
 ---
 
 # Reports and tests
+
+Every report or PR about a title run includes all of these. Do not guess a missing item.
+
+- Exact commit (`git rev-parse HEAD`)
+- GPU, CPU, RAM, and driver
+- How far the run got: launcher, account picker, settings, main menu, in-game, or the first intro cutscene
+- Exact launch command and the environment variables that were set
+- The precise failure: API or method, HRESULT or exception, log lines, and the call site when one exists
+- A screenshot or frame capture of the furthest screen reached (`XCL_FRAME_DUMP` is the capture XCL already writes; a present count is not a picture)
+- After a fix: a rerun on that same commit's successor, and whether the screen or the failure changed
 
 `report.rs` writes `report.json` on every run. It is the to-do list. Fields:
 

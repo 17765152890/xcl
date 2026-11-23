@@ -42,7 +42,8 @@ Open that directory's `SKILL.md` before editing the subsystem.
 
 ## Shared rules
 
-- A missing import is a logging stub (`stubs.rs`, `crates/xcl/data/stubdb.toml`), not a load failure.
+- One concrete startup or playability blocker at a time. Reproduce it on current `main` and name the furthest screen before writing code. What a report must include is in `xcl-cutscene` and `xcl-report`.
+- A missing import is a logging stub (`stubs.rs`, `crates/xcl/data/stubdb.toml`), not a load failure. A stub that returns success so a title gets past a screen it has not actually reached is a speculative stub. Do not add one.
 - Do not invent console layouts. Use public docs, existing tables, or a user-supplied report.
 - Do not hand-edit generated files: `gpu/rdna2_spec.rs` (`scripts/gen_rdna2.py`), `gpu/tiling_tables.rs` (`scripts/gen_tiling.py`), `hle/d3d12_layout.rs` (`scripts/gen_d3d12_layout.py`), `hle/xgameruntime/gdk_table.rs` (`scripts/gen_gdk_table.py`). Each header says so.
 - WinDurango is reference only. AnyPS5 ports need a provenance note (`THIRD_PARTY.md`).
