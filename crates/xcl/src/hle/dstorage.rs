@@ -853,10 +853,15 @@ fn decode_bc1(src: &[u8], n: usize) -> Result<Vec<u8>, HRESULT> {
     }
     static TABLES: OnceLock<(bcpack::bc1::Window, bcpack::bc1::QuadTable)> = OnceLock::new();
     let (window, quads) = TABLES.get_or_init(|| (bcpack::bc1::Window::default_table(), bcpack::bc1::QuadTable::default_table()));
-    let decoded = bcpack::bc1::decode(src, n / 8, window, quads).map_err(|e| {
+    let lanes = bcpack::bc1::decode_symbols(src, n / 8).map_err(|e| {
         warn_once("BCPack BC1 decode", format_args!("{e}"));
         E_DECOMPRESSION
     })?;
+    if lanes.lane(1).iter().any(|&symbol| symbol != 0) {
+        warn_once("BCPack BC1 lane 1", format_args!("nonzero symbols have unknown semantics"));
+        return Err(E_DECOMPRESSION);
+    }
+    let decoded = bcpack::bc1::assemble(&lanes, window, quads);
     if decoded.unfitted_blocks != 0 {
         warn_once("BCPack BC1 window", format_args!("{} blocks use unfitted endpoint entries", decoded.unfitted_blocks));
         return Err(E_DECOMPRESSION);
@@ -2282,6 +2287,17 @@ mod tests {
         assert_eq!(decode_bc1(&packed, 0), Err(E_DESTINATION_SIZE));
         let r = Request::parse(&request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, 0x1000, 7, 0x2000, 0, packed.len() as u32));
         assert_eq!(r.check_with_bc1(true, true), Err(E_DESTINATION_SIZE));
+    }
+
+    #[test]
+    fn bc1_rejects_unknown_lane_one_symbols() {
+        use bcpack::bc1::BC1_ALPHABET_BITS;
+        use bcpack::encode::{encode_lanes, Fragment};
+        let lanes: Vec<_> = (0..12).map(|i| {
+            vec![Fragment { symbols: vec![if i == 1 { 1 } else { 0 }], q: 0, z: 0 }]
+        }).collect();
+        let packed = encode_lanes(&BC1_ALPHABET_BITS, &lanes).unwrap();
+        assert_eq!(decode_bc1(&packed, 8), Err(E_DECOMPRESSION));
     }
 
     #[test]

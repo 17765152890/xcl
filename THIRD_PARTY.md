@@ -14,6 +14,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 Â
 | [WinDurango](https://github.com/WinDurango/WinDurango) | LGPL-3.0 | no code; d3d12_x.dll export numbers (facts) in `crates/xcl/data/stubdb.toml` | reference only |
 | [libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | no code; XTaskQueue/XAsync contract | specification |
 | [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) and [silicon-rans](https://github.com/microsoft/silicon-rans) | MIT | experimental BCPack BC1 decoder and entropy tables | pinned Rust dependency; notices below |
+| [bcpack-decoder](https://github.com/Tim0219800/bcpack-decoder) | MIT | no code; BC1 lane 1 semantics | format reference |
 | Windows XGameRuntime (`System32\xgameruntime.dll`) | system | class GUIDs and slot order of the GDK thunk protocol in `hle/xgameruntime/api.rs` (facts, determined by analysis); APIs XCL does not implement are forwarded to it at runtime | interoperability; not distributed |
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
 | Rust crates (`Cargo.lock`) | MIT / BSD-2 / Zlib / Unlicense (or with an MIT alternative) | build dependencies | statically linked |
