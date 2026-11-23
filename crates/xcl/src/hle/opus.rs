@@ -1424,6 +1424,7 @@ pub(crate) mod tests {
     fn decodes_a_game_sound() {
         let Ok(path) = std::env::var("XCL_SAMPLE_AWC") else {
             println!("XCL_SAMPLE_AWC not set – skipping");
+            crate::gpu::recomp::runner::skip_sample("XCL_SAMPLE_AWC");
             return;
         };
         if !is_available() {

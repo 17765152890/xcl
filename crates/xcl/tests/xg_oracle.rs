@@ -10,14 +10,18 @@ use xcl::pe::ExportTarget;
 
 fn console() -> Option<&'static Arc<MappedModule>> {
     static M: OnceLock<Option<Arc<MappedModule>>> = OnceLock::new();
-    M.get_or_init(|| {
+    let module = M.get_or_init(|| {
         let path = PathBuf::from(std::env::var_os("XCL_SAMPLE_XG")?);
         xcl::stubs::init_db(&Default::default());
         xcl::hle::init(&xcl::config::Config::default());
         let _ = xcl::eh::install_pc_hook();
         Some(xcl::loader::load_game_dll(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
     })
-    .as_ref()
+    .as_ref();
+    if module.is_none() {
+        xcl::gpu::recomp::runner::skip_sample("XCL_SAMPLE_XG");
+    }
+    module
 }
 
 fn proc(m: &MappedModule, name: &str) -> usize {

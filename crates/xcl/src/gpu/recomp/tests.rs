@@ -1346,6 +1346,7 @@ fn gpu_grouped_loads_bounds_and_inactive_lanes() {
 fn gpu_retail_vs_blit_gen_amb_cube() {
     let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else {
         println!("XCL_SAMPLE_RPF not set – skipping");
+        runner::skip_sample("XCL_SAMPLE_RPF");
         return;
     };
     if !gpu_ready() {

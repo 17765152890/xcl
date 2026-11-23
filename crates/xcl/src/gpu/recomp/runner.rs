@@ -421,6 +421,15 @@ pub fn skip_test(reason: &str) {
     let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
 }
 
+/// A test missing opt-in sample data still passes in libtest. Report it outside libtest's
+/// capture, separately from GPU skips: XCL_REQUIRE_GPU must not require game files.
+pub fn skip_sample(variable: &str) {
+    use std::io::Write;
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("?");
+    let _ = writeln!(std::io::stderr(), "SKIPPED_SAMPLE {test}: {variable} not set");
+}
+
 /// Run a compiled kernel (DXIL) with `state` and flat memory `mem`.
 pub fn run(dxil: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
     run_with(dxil, state, mem, &[], &[])

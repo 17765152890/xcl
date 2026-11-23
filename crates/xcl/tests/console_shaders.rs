@@ -17,7 +17,10 @@ type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *
 
 /// The console compiler (None: `XCL_SAMPLE_DXC` not set).
 fn console_compiler() -> Option<IDxcCompiler3> {
-    let path = std::env::var("XCL_SAMPLE_DXC").ok()?;
+    let Ok(path) = std::env::var("XCL_SAMPLE_DXC") else {
+        runner::skip_sample("XCL_SAMPLE_DXC");
+        return None;
+    };
     let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
     unsafe {
         // its back end is loaded by name when it compiles: loaded first from the same directory

@@ -630,6 +630,7 @@ mod tests {
     fn retail_ttpf_textures_detile_with_their_mip_chains() {
         let Ok(path) = std::env::var("XCL_SAMPLE_TTPF") else {
             println!("XCL_SAMPLE_TTPF not set – skipping");
+            crate::gpu::recomp::runner::skip_sample("XCL_SAMPLE_TTPF");
             return;
         };
         let a = Ttpf::open(&path);

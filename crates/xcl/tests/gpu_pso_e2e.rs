@@ -53,6 +53,7 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::Mutex
     let data = PACK.get_or_init(|| std::env::var("XCL_SAMPLE_RPF").ok().and_then(|p| std::fs::read(p).ok())).as_ref();
     let Some(data) = data else {
         println!("XCL_SAMPLE_RPF not set – skipping");
+        runner::skip_sample("XCL_SAMPLE_RPF");
         return None;
     };
     if xcl::gpu::recomp::dxc::location().is_err() {

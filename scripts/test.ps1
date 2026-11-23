@@ -10,14 +10,20 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $ErrorActionPreference = 'Continue'
 $skipped = @()
+$sampleSkipped = @()
 cargo test --workspace -- --test-threads=4 2>&1 | ForEach-Object {
     $line = "$_"
     if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
+    if ($line -match '^SKIPPED_SAMPLE \S+: (.+)$') { $sampleSkipped += $Matches[1] }
     Write-Host $line
 }
 $code = $LASTEXITCODE
 if ($skipped) {
     $counts = $skipped | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) ($($_.Name))" }
     Write-Host "GPU tests skipped on this adapter: $($counts -join ', ')"
+}
+if ($sampleSkipped) {
+    $counts = $sampleSkipped | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) ($($_.Name))" }
+    Write-Host "Tests skipped for missing samples (included in libtest passed): $($sampleSkipped.Count): $($counts -join ', ')"
 }
 exit $code

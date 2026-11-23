@@ -1129,6 +1129,7 @@ mod tests {
     fn retail_pack_sample() {
         let Ok(p) = std::env::var("XCL_SAMPLE_RPF") else {
             println!("XCL_SAMPLE_RPF not set – skipping");
+            crate::gpu::recomp::runner::skip_sample("XCL_SAMPLE_RPF");
             return;
         };
         let data = std::fs::read(&p).unwrap();

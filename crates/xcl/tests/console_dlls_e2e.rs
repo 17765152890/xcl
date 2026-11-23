@@ -10,7 +10,7 @@ use xcl::pe::ExportTarget;
 
 fn setup() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| {
+    let dir = DIR.get_or_init(|| {
         let dir = PathBuf::from(std::env::var_os("XCL_SAMPLE_DLLS")?);
         let gb: usize = std::env::var("XCL_TEST_MEM_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         cap_memory(gb << 30);
@@ -21,7 +21,12 @@ fn setup() -> Option<&'static PathBuf> {
         xcl::eh::install_crash_handler();
         Some(dir)
     })
-    .as_ref()
+    .as_ref();
+    // Report for every test, including callers after the cached None was initialised.
+    if dir.is_none() {
+        xcl::gpu::recomp::runner::skip_sample("XCL_SAMPLE_DLLS");
+    }
+    dir
 }
 
 /// Limit this test process's committed memory: a runaway shader compile (DXC / driver) on
@@ -203,7 +208,10 @@ fn xbox_bvh_builder_prebuild_sizes() {
 #[test]
 fn bink2_console_dll_decodes_a_game_movie() {
     let Some(dir) = setup() else { return };
-    let Some(movie) = std::env::var_os("XCL_SAMPLE_BK2") else { return };
+    let Some(movie) = std::env::var_os("XCL_SAMPLE_BK2") else {
+        xcl::gpu::recomp::runner::skip_sample("XCL_SAMPLE_BK2");
+        return;
+    };
     let m = load(dir, "Bink2Scarlett.dll");
     unsafe {
         let open: extern "C" fn(*const u8, u32) -> *mut u32 = std::mem::transmute(proc(&m, "BinkOpen"));
@@ -276,7 +284,10 @@ fn pages(n: usize) -> &'static mut [u8] {
 #[test]
 fn xbox_bvh_builder_rehydrates_game_geometry() {
     let Some(dir) = setup() else { return };
-    let Some(pack) = std::env::var_os("XCL_SAMPLE_BVH4") else { return };
+    let Some(pack) = std::env::var_os("XCL_SAMPLE_BVH4") else {
+        xcl::gpu::recomp::runner::skip_sample("XCL_SAMPLE_BVH4");
+        return;
+    };
     let m = load(dir, "XboxBvhBuilder.dll");
     let chunk = {
         use std::io::{Read, Seek, SeekFrom};
