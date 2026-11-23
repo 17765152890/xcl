@@ -49,10 +49,23 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
     if lazy && commit(page) {
-        EXCEPTION_CONTINUE_EXECUTION
-    } else {
-        EXCEPTION_CONTINUE_SEARCH
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
+    // Two threads touching one lazy page at once: the first commits it, the second faulted
+    // before that and finds it no longer lazy – the access is retried on the committed page
+    // (a retail game: two threads building objects in one page, both crashed on writes to
+    // memory committed read-write by the time the crash was logged).
+    if matches!(r.ExceptionInformation[0], 0 | 1) && committed_rw(page) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// `page` is committed read-write (a read or write there cannot fault again).
+unsafe fn committed_rw(page: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    VirtualQuery(page as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == MEM_COMMIT && m.Protect == PAGE_READWRITE
 }
 
 /// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
@@ -103,6 +116,40 @@ mod tests {
             ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Threads touching the same lazy pages at once all go on (the ones that lose the race to
+    /// commit a page retry on it instead of crashing).
+    #[test]
+    fn threads_racing_on_a_lazy_page_all_go_on() {
+        unsafe {
+            const N: usize = 64;
+            let r = VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            for k in 0..N {
+                mark(r + k * PAGE);
+            }
+            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8u32)
+                .map(|t| {
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        for k in 0..N {
+                            std::ptr::write_volatile((r + k * PAGE + 8 * t as usize) as *mut u32, t + 1);
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            for k in 0..N {
+                for t in 0..8u32 {
+                    assert_eq!(std::ptr::read_volatile((r + k * PAGE + 8 * t as usize) as *const u32), t + 1);
+                }
+            }
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
     }
