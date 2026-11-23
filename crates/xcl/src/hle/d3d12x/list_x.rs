@@ -876,15 +876,16 @@ fn note_write(list: usize, va: u64, size: u64) {
 unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     for w in waits {
-        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 4) {
+        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
             crate::xlog_warn!(
-                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x})",
+                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
                 w.width * 8,
                 WAIT_TIMEOUT.as_millis(),
                 w.va,
                 w.comparison,
                 w.value,
-                w.mask
+                w.mask,
+                w.read_value()
             );
         }
     }
@@ -1200,9 +1201,13 @@ pub(super) unsafe extern "system" fn wait32_x(this: *mut c_void, va: u64, compar
     wait_memory(this, va, 4, comparison, value as u64, mask as u64, "Wait32BitValueX");
 }
 
-/// command list #72 Wait64BitValueX(address, comparison, value, mask, flags)
-pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, mask: u64, _flags: u32) {
-    wait_memory(this, va, 8, comparison, value, mask, "Wait64BitValueX");
+/// command list #72 Wait64BitValueX(address, comparison, value, flags): the whole 64-bit value
+/// is compared. What comes after the value is not a mask: GTA VI passes a 32-bit 1 there (the
+/// upper half of the stack slot is whatever was left in it – 0x231_0000_0001), and read as a
+/// mask its waits for a counter at 2 ≥ 1, 4 ≥ 2 … never held: each timed out (2 s a frame, the
+/// game stood still after its first cinematic).
+pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u64, _more: u32) {
+    wait_memory(this, va, 8, comparison, value, u64::MAX, "Wait64BitValueX");
 }
 
 /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
