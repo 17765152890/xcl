@@ -2993,6 +2993,24 @@ pub fn two_pass_count() -> usize {
     TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
 }
 
+#[cfg(test)]
+pub(crate) struct TwoPassTestGuard(usize);
+
+#[cfg(test)]
+impl Drop for TwoPassTestGuard {
+    fn drop(&mut self) {
+        let removed = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&self.0));
+        drop(removed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_two_pass_for_test(pso: usize, metadata: TwoPassPso) -> TwoPassTestGuard {
+    let previous = TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, std::sync::Arc::new(metadata));
+    assert!(previous.is_none(), "test pipeline key is already registered");
+    TwoPassTestGuard(pso)
+}
+
 /// A pipeline state stream being written: subobjects aligned as D3D12 expects
 /// (type, payload at 4 or 8, size rounded to 8).
 #[derive(Default)]

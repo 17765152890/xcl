@@ -558,6 +558,73 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchXRoute {
+    TwoPass(crate::gpu::recomp::pso::TwoPassPlan),
+    Compute,
+    Skip,
+}
+
+fn dispatch_x_route(metadata: Option<&super::real::TwoPassPso>, translated_compute: bool, groups: [u32; 3]) -> Result<DispatchXRoute, String> {
+    const MAX_GROUPS_PER_DIMENSION: u32 = 65_535;
+    if groups.iter().any(|&groups| groups > MAX_GROUPS_PER_DIMENSION) {
+        return Err("DispatchX group count exceeds the D3D12 per-dimension limit".into());
+    }
+    if let Some(metadata) = metadata {
+        let record_dwords = u32::try_from(metadata.record.record_dwords()).map_err(|_| "two-pass record size exceeds u32")?;
+        let plan = crate::gpu::recomp::pso::TwoPassPlan::checked(groups, record_dwords, metadata.mesh_groups_per_record)?;
+        if plan.mesh_groups > MAX_GROUPS_PER_DIMENSION {
+            return Err("two-pass mesh group count exceeds the D3D12 DispatchMesh limit".into());
+        }
+        return Ok(DispatchXRoute::TwoPass(plan));
+    }
+    Ok(if translated_compute { DispatchXRoute::Compute } else { DispatchXRoute::Skip })
+}
+
+/// Console DispatchX. Mesh/geometry pipelines created as checked two-pass pipelines use the
+/// explicit compute -> UAV barrier -> pass-through mesh sequence; ordinary compute pipelines
+/// retain the Dispatch path above.
+pub(super) unsafe fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let held_pso = with(this, |s| s.pso);
+    let real_pso = super::pso_async::resolve_wait(held_pso);
+    let metadata = super::real::two_pass_of(real_pso);
+    let route = dispatch_x_route(metadata.as_deref(), super::real::is_translated_compute(real_pso), [x, y, z]);
+    match route {
+        Ok(DispatchXRoute::Compute) | Ok(DispatchXRoute::Skip) => dispatch(this, x, y, z),
+        Ok(DispatchXRoute::TwoPass(plan)) => {
+            if plan.total_groups == 0 { return; }
+            let result = (|| -> Result<(), String> {
+                let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).ok_or("command list")?;
+                // Validate the required interface before allocating an ABI record, so a cast
+                // failure cannot consume command-list arena space.
+                let _: ID3D12GraphicsCommandList6 = list.cast().map_err(|_| "two-pass recording requires ID3D12GraphicsCommandList6")?;
+                let bindings = prepare_two_pass_abi(this, &plan)?.ok_or("non-empty two-pass plan produced no ABI bindings")?;
+                if !record_two_pass(list, metadata.as_deref(), real_pso, &plan, Some(&bindings))? {
+                    return Err("non-empty two-pass submission recorded no commands".into());
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => count(DISPATCHES),
+                Err(e) => {
+                    count(DISPATCHES_SKIPPED);
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                        crate::xlog_warn!("D3D12.X: DispatchX with a two-pass pipeline skipped: {e}");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            count(DISPATCHES_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: DispatchX plan rejected: {e}");
+            }
+        }
+    }
+}
+
 /// `XCL_TRACE_FRAME`: a full-screen dispatch (enough groups to cover a 4K target in tiles of up
 /// to 128 pixels) – what its root arguments say. A bindless title passes the indices of its
 /// descriptors in root constants and constant buffers: every small value there is looked up
@@ -685,7 +752,6 @@ const DEFAULT_RESULT_BYTES: usize = 256;
 /// Allocate one ABI record for a checked two-pass plan. Empty dispatches allocate nothing;
 /// callers may bind the returned record first as compute and then as graphics without
 /// allocating or changing its result buffer.
-#[allow(dead_code)] // consumed by the explicit two-pass recorder once its command contract exists
 pub(super) unsafe fn prepare_two_pass_abi(this: *mut c_void, plan: &crate::gpu::recomp::pso::TwoPassPlan) -> Result<Option<AbiBindings>, String> {
     if plan.total_groups == 0 {
         return Ok(None);
@@ -832,9 +898,8 @@ unsafe fn bind_prepared_abi_with_root(
     Ok(())
 }
 
-/// Record an explicitly planned two-pass submission. This is intentionally dormant: draw
-/// interception does not call it, and callers must provide both the plan and prepared ABI.
-#[allow(dead_code)] // deliberately dormant; ordinary draw interception must not call this
+/// Record an explicitly planned two-pass submission. DispatchX supplies the checked plan and
+/// prepared ABI; ordinary draw interception intentionally does not infer dispatch dimensions.
 pub(super) unsafe fn record_two_pass(
     list: &ID3D12GraphicsCommandList,
     metadata: Option<&super::real::TwoPassPso>,
@@ -866,7 +931,7 @@ pub(super) unsafe fn record_two_pass(
     Ok(true)
 }
 
-/// Test-only bridge which keeps the live GPU runner on the exact dormant recording path.
+/// Test-only bridge which keeps the live GPU runner on the exact production recording path.
 /// The borrowed D3D12 objects remain owned by the runner.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
@@ -896,6 +961,8 @@ pub(crate) unsafe fn record_two_pass_for_test(
 #[cfg(test)]
 mod abi_tests {
     use super::*;
+
+    static DISPATCH_X_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn abi_views_preserve_available_windows_and_repeat_the_first() {
@@ -941,6 +1008,73 @@ mod abi_tests {
             mesh_groups_per_record: 2,
             kind: "test",
         })
+    }
+
+    #[test]
+    fn dispatch_x_prefers_two_pass_metadata_over_compute_classification() {
+        let metadata = two_pass_metadata();
+        let expected = crate::gpu::recomp::pso::TwoPassPlan::checked([2, 3, 1], 4, 2).unwrap();
+        assert_eq!(dispatch_x_route(Some(&metadata), true, [2, 3, 1]).unwrap(), DispatchXRoute::TwoPass(expected));
+        assert_eq!(dispatch_x_route(None, true, [2, 3, 1]).unwrap(), DispatchXRoute::Compute);
+        assert_eq!(dispatch_x_route(None, false, [2, 3, 1]).unwrap(), DispatchXRoute::Skip);
+    }
+
+    #[test]
+    fn dispatch_x_zero_groups_are_a_checked_noop_and_overflow_fails_before_recording() {
+        let metadata = two_pass_metadata();
+        let DispatchXRoute::TwoPass(empty) = dispatch_x_route(Some(&metadata), false, [65_535, 0, 65_535]).unwrap() else {
+            panic!("two-pass metadata must select the two-pass route")
+        };
+        assert_eq!((empty.total_groups, empty.result_bytes, empty.mesh_groups), (0, 0, 0));
+        assert!(dispatch_x_route(Some(&metadata), false, [65_536, 0, 1]).is_err());
+        assert!(dispatch_x_route(Some(&metadata), false, [u32::MAX, 2, 1]).is_err());
+    }
+
+    #[test]
+    fn dispatch_x_enforces_compute_and_mesh_group_boundaries() {
+        let mut metadata = two_pass_metadata();
+        metadata.mesh_groups_per_record = 1;
+        let DispatchXRoute::TwoPass(at_limit) = dispatch_x_route(Some(&metadata), false, [65_535, 1, 1]).unwrap() else {
+            panic!("expected a two-pass route")
+        };
+        assert_eq!(at_limit.mesh_groups, 65_535);
+        assert!(dispatch_x_route(Some(&metadata), false, [65_536, 1, 1]).is_err());
+
+        metadata.mesh_groups_per_record = 2;
+        let DispatchXRoute::TwoPass(below_mesh_limit) = dispatch_x_route(Some(&metadata), false, [32_767, 1, 1]).unwrap() else {
+            panic!("expected a two-pass route")
+        };
+        assert_eq!(below_mesh_limit.mesh_groups, 65_534);
+        assert!(dispatch_x_route(Some(&metadata), false, [32_768, 1, 1]).is_err());
+    }
+
+    #[test]
+    fn console_dispatch_x_entry_uses_registered_two_pass_metadata_without_allocating_for_zero_groups() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_1234usize;
+        let list = list_key as *mut c_void;
+        let metadata = super::super::real::TwoPassPso {
+            compute: 0,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        };
+        let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
+        with(list, |state| state.pso = list_key);
+        assert!(super::super::real::two_pass_of(list_key).is_some());
+        let skipped_before = COUNTS[DISPATCHES_SKIPPED].load(Ordering::SeqCst);
+
+        // This is the function installed in console command-list slot 78. The zero Y count
+        // proves the real entry performs registry lookup and checked routing, then exits before
+        // borrowing a native command list or allocating its shared ABI/result record. Ordinary
+        // compute routing would classify the synthetic PSO as untranslated and increment the
+        // skipped-dispatch counter, making this assertion mutation-sensitive to the slot wiring.
+        unsafe { super::super::list_x::dispatch_x(list, 65_535, 0, 65_535, 0) };
+        assert_eq!(COUNTS[DISPATCHES_SKIPPED].load(Ordering::SeqCst), skipped_before);
+        with(list, |state| assert!(state.uma.is_empty()));
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
     }
 
     #[test]

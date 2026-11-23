@@ -1133,7 +1133,7 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 
 /// command list #78 DispatchX(x, y, z, flags)
 pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    super::bind::dispatch(this, x, y, z);
+    super::bind::dispatch_x(this, x, y, z);
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
