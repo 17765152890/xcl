@@ -1,8 +1,9 @@
 # The description a pull request needs before it can be merged (CONTRIBUTING.md, "What a PR
 # needs to be merged"): the Tested / Not tested / AI use sections, and – when it changes the
 # runtime (crates/xcl/src outside tests) – two `xcl-smoke` blocks from scripts/smoke.ps1, one of
-# them made on the PR's head commit with no uncommitted changes. Runs again when the description
-# is edited or a commit is pushed.
+# them made on the PR's head commit with no uncommitted changes. AI use must not name a small or
+# open-weight model (CONTRIBUTING.md, "AI-assisted contributions"). Runs again when the
+# description is edited or a commit is pushed.
 name: PR checks
 
 on:
@@ -29,7 +30,7 @@ jobs:
           gh api "repos/$REPO/pulls/$NUMBER/files" --paginate --jq '.[].filename' > files.txt
           python3 - <<'EOF'
           import os, re, sys
-          body = os.environ.get("BODY") or ""
+          body = (os.environ.get("BODY") or "").replace("\r\n", "\n")
           head = os.environ["HEAD"]
           files = open("files.txt").read().split()
           problems = []
@@ -50,6 +51,12 @@ jobs:
                   for n in re.findall(key + r": (\d+)", body):
                       if int(n) > 0:
                           problems.append(f"a regression run shows {key}: {n}")
+          # small / open-weight models are not accepted (CONTRIBUTING.md, "AI-assisted contributions")
+          ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
+          banned = re.findall(r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)", ai.group(1), re.I) if ai else []
+          if banned:
+              problems.append("**AI use** names a model this repository does not accept for code ("
+                              + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")
           if problems:
               print("This PR cannot be merged yet (see CONTRIBUTING.md, 'What a PR needs to be merged'):")
               for p in problems:
