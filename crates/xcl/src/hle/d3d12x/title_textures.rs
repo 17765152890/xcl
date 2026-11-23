@@ -869,7 +869,8 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false };
+            let bytes = tex.size() as usize;
+            let mut e = Entry { device: 0, va: at, bytes, src: mirror_source(at), in_gpu_view: true, seq: 0, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -994,7 +995,7 @@ mod tests {
         };
         let (small, big) = (make(64, 64), make(256, 256));
         let (big_bytes, slots, base) = (big.size() as usize, 16usize, 0x2_0000_0000usize);
-        let entry = |dev: usize, va: usize, tex: &Arc<xg::Texture>, seq: u64| Entry { device: dev, va, bytes: tex.size() as usize, tex: Arc::clone(tex), states: vec![SRV], pending: true, gpu_written: false, seq };
+        let entry = |dev: usize, va: usize, tex: &Arc<xg::Texture>, seq: u64| Entry { device: dev, va, bytes: tex.size() as usize, src: va, in_gpu_view: false, tex: Arc::clone(tex), states: vec![SRV], pending: true, gpu_written: false, seq };
         let mut reg = Registry::new();
         for i in 0..500usize {
             let (retired, delta) = reg.insert(0xB000 + i, entry(1, base + (i % slots) * big_bytes, if i % 3 == 0 { &big } else { &small }, i as u64));
