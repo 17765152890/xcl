@@ -147,6 +147,22 @@ Arguments after the game folder go to `xcl run`. The title's data and logs are i
 `drive_c/users/<user>/AppData/Local/XCL/<title>/` (`logs/xcl.log`, `logs/report.json`). A run left behind
 is stopped with `WINEPREFIX=~/xcl-prefix "$PROTON/files/bin/wineserver" -k`.
 
+## Regression runs
+
+`scripts/smoke.ps1` (the regression run CONTRIBUTING.md asks of a PR that changes the runtime) needs
+Windows. `scripts/linux/smoke.sh` is the same run under Wine: it runs the title for a fixed time with
+`XCL_RUN_SECONDS`, reads XCL's log and prints the same `xcl-smoke` block, once from `main` and once
+from the PR's head commit:
+
+```sh
+scripts/linux/smoke.sh "$PROTON" ~/xcl-prefix /path/to/unpacked/game 60
+```
+
+Say in the PR that the blocks come from `smoke.sh` under Wine. The `gpu:` line comes from XCL's log.
+`SMOKE_GRACE` (default 120 s, as `smoke.ps1`) is how long past the run's time it may take before it is
+killed: under Wine XCL's end takes about 15 s after `XCL_RUN_SECONDS` (its end watchdog), and
+`PR checks` refuses a block that says `killed`.
+
 ## Start-up check
 
 Under Wine `xcl run` also checks the libraries it got and prints the result with the other start-up checks
