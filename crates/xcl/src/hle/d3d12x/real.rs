@@ -1571,6 +1571,11 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
                 u.free(p);
             }
         }
+    } else if n == super::title_textures::inflight_dest_refs(this as usize) {
+        // Title dropped its last ref while XCL's async Uploader still holds `n` internal refs for
+        // in-flight copies: detach from `title_textures` now so shadowed textures uncover/remap
+        // immediately; `vram::forget` will run once `Uploader` drops its refs (`n -> 0`).
+        super::title_textures::forget(this as usize);
     }
     n
 }
@@ -2639,6 +2644,9 @@ macro_rules! creator {
             }
             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
                 adopt(*ppv, $kind);
+                if matches!($kind, Kind::CommandQueue) {
+                    super::title_textures::forget_queue(*ppv as usize);
+                }
             }
             hr
         }
@@ -4550,6 +4558,7 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::title_textures::forget_queue(this as usize);
     }
     n
 }

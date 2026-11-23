@@ -661,9 +661,15 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     }
     let _refresh = REFRESH.lock().unwrap();
     own_work(|| refresh_once(queue));
+    if !sync_uploads() {
+        wait_for_uploads(queue);
+    }
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {
+    if !sync_uploads() {
+        recycle_uploaders();
+    }
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -855,10 +861,41 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
-            super::vram::before_execute(&queue);
+        // Wait for any tile mappings on this device BEFORE locking UPLOADERS or submitting copies.
+        super::vram::before_execute(&queue);
+        let r = if sync_uploads() {
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        } else {
+            let need_new = !UPLOADERS.lock().unwrap().contains_key(&device);
+            let created = if need_new {
+                match texture::Uploader::new(dev) {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        warn(&e);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut released = texture::Released::default();
+            let mut unused = None;
+            let res = {
+                let mut ups = UPLOADERS.lock().unwrap();
+                if let Some(u) = created {
+                    if ups.contains_key(&device) {
+                        unused = Some(u);
+                    } else {
+                        ups.insert(device, u);
+                    }
+                }
+                ups.get_mut(&device).unwrap().upload_deferred(&queue, &batch, &mut released)
+            };
+            drop(unused);
+            drop(released);
+            res
+        };
+        match r {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
@@ -867,6 +904,71 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             Err(e) => warn(&e),
         }
+    }
+}
+
+/// `XCL_SYNC_UPLOADS=1`: wait on the CPU after each upload batch (the pre-`Uploader` path).
+fn sync_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SYNC_UPLOADS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Per-device async texture uploaders (`texture::Uploader`).
+static UPLOADERS: Mutex<BTreeMap<usize, texture::Uploader>> = Mutex::new(BTreeMap::new());
+/// Consuming title queue → last upload fence value it GPU-waited for.
+static UPLOAD_WAITED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+/// Number of COM references currently held by async `Uploader`s for in-flight copies to `res`.
+pub(super) fn inflight_dest_refs(res: usize) -> u32 {
+    texture::inflight_dest_refs(res)
+}
+
+/// Fence and value of the latest async texture upload submitted on `device` (`None` if none yet).
+/// Acquires only `UPLOADERS` (leaf lock) so callers like `vram::Pages` can read it before locking
+/// `PAGES` without lock-order inversion.
+pub(super) fn upload_fence_for(device: usize) -> Option<(ID3D12Fence, u64)> {
+    let ups = UPLOADERS.lock().unwrap();
+    ups.get(&device).and_then(|up| {
+        let (fence, value) = up.done_at();
+        (value > 0).then(|| (fence.clone(), value))
+    })
+}
+
+/// Reclaim completed destination refs, staging buffers, and excess idle allocators across all
+/// active uploaders, dropping retired COM objects outside the `UPLOADERS` lock.
+unsafe fn recycle_uploaders() {
+    let mut released = texture::Released::default();
+    {
+        let mut ups = UPLOADERS.lock().unwrap();
+        for up in ups.values_mut() {
+            let _ = up.recycle_deferred(&mut released);
+        }
+    }
+    drop(released);
+}
+
+/// Drop wait tracking for a released command queue so pointer reuse cannot skip a future wait.
+pub(super) fn forget_queue(queue: usize) {
+    UPLOAD_WAITED.lock().unwrap().remove(&queue);
+}
+
+/// Before the title submits work on `queue`, order it on the GPU after all texture uploads
+/// submitted so far on `queue`'s own device (waiting on a fence from another device would stall
+/// `queue` forever in multi-device test processes).
+unsafe fn wait_for_uploads(queue: *mut c_void) {
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    if UPLOADERS.lock().unwrap().is_empty() {
+        return;
+    }
+    let mut dev: Option<ID3D12Device> = None;
+    if q.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let Some((fence, value)) = upload_fence_for(dev.as_raw() as usize) else { return };
+    let prev = UPLOAD_WAITED.lock().unwrap().get(&(queue as usize)).copied().unwrap_or(0);
+    if prev < value && q.Wait(&fence, value).is_ok() {
+        UPLOAD_WAITED.lock().unwrap().insert(queue as usize, value);
     }
 }
 
@@ -1710,6 +1812,152 @@ mod tests {
                 }
                 drop(res);
             }
+            uma.free(base);
+        }
+    }
+
+    /// Regression test for async `Uploader`: dropping an overlapping placed texture while
+    /// `Uploader::dests` still holds an unrecycled internal COM ref must immediately detach it
+    /// from `TEXTURES`, uncover and remap the shadowed texture (ordering `pages.queue` after
+    /// `upload_q`), and allow subsequent rewrites to upload into the uncovered texture cleanly.
+    #[test]
+    fn async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else {
+                println!("SKIPPED async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed: no adapter");
+                return;
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                println!("SKIPPED async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed: software adapter");
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else {
+                println!("SKIPPED async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed: no D3D12 device");
+                return;
+            };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                println!("SKIPPED async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed: tiled tier < 2");
+                return;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(uma) = crate::gpu::uma::get() else {
+                println!("SKIPPED async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed: no UMA");
+                return;
+            };
+            let Some(base) = uma.alloc(2 << 20, 0x1_0000).map(|p| p as usize) else {
+                println!("SKIPPED async_drop_of_overlapping_placed_texture_uncovers_and_remaps_shadowed: UMA alloc failed");
+                return;
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_tex = |va: usize, desc: &[u8; 0x38]| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+                assert!(super::super::vram::is_placed_texture(p as usize));
+                ID3D12Resource::from_raw(p)
+            };
+            let fill_tiled = |va: usize, desc: &[u8; 0x38], seed: u8| {
+                let tex = xg::Texture::new(desc).unwrap();
+                let s = tex.texels().unwrap();
+                let bytes = std::slice::from_raw_parts_mut(va as *mut u8, tex.size() as usize);
+                bytes.fill(0);
+                let l = &s.chain.levels[0];
+                let pat: Vec<u8> = (0..l.width * l.height * s.bpe as usize).map(|k| seed.wrapping_add((k * 17) as u8)).collect();
+                s.chain.tile_level(bytes, 0, 0, &pat);
+            };
+            let read_sub0 = |r: &ID3D12Resource| -> Vec<u8> {
+                let rd = r.GetDesc();
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+                dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+                let mut rb: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+                let rb = rb.unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+                for y in 0..rows as usize {
+                    out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+                }
+                rb.Unmap(0, None);
+                out
+            };
+
+            let old_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 1 MiB
+            let new_desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB
+
+            // 1. Place and asynchronously upload old_res, then place & upload overlapping new_res
+            // (which shadows and unmaps old_res).
+            let old_res = place_tex(base, &old_desc);
+            let old_raw = old_res.as_raw() as usize;
+            fill_tiled(base, &old_desc, 0xAA);
+            refresh(queue.as_raw());
+
+            let new_res = place_tex(base + 0x4_0000, &new_desc);
+            let new_raw = new_res.as_raw() as usize;
+            fill_tiled(base + 0x4_0000, &new_desc, 0x55);
+            refresh(queue.as_raw());
+
+            // 2. Drop new_res IMMEDIATELY (no CPU wait or readback beforehand) while async
+            // Uploader::dests still holds an internal COM ref to new_res!
+            if !sync_uploads() {
+                assert!(inflight_dest_refs(new_raw) >= 1, "new_res must still be held by Uploader::dests before drop");
+            }
+            drop(new_res);
+
+            // new_res must be detached immediately and old_res reactivated & remapped.
+            {
+                let t = TEXTURES.lock().unwrap();
+                assert!(!t.by_res.contains_key(&new_raw) && !t.shadowed.contains_key(&new_raw), "dropped texture remained in TEXTURES");
+                let old_entry = t.by_res.get(&old_raw).expect("shadowed texture must be reactivated immediately");
+                assert!(!old_entry.unmapped, "reactivated texture must be remapped");
+            }
+
+            // 3. Rewrite old_res and verify pixels match intact (ordering pages.queue after upload_q).
+            fill_tiled(base, &old_desc, 0xD4);
+            refresh(queue.as_raw());
+            let want = subresources(base, &xg::Texture::new(&old_desc).unwrap()).swap_remove(0).data;
+            assert_eq!(read_sub0(&old_res), want, "uncovered texture must upload and preserve rewritten pixels");
+
+            // 4. Another refresh after GPU completion reclaims completed dests even when todo is empty.
+            drop(old_res);
+            refresh(queue.as_raw());
+            assert_eq!(inflight_dest_refs(new_raw), 0, "completed dest ref must be reclaimed by recycle()");
+            assert_eq!(inflight_dest_refs(old_raw), 0, "dropped old_res dest ref must be reclaimed by recycle()");
+
+            super::super::vram::sweep_idle_for_test(dev.as_raw() as usize);
             uma.free(base);
         }
     }

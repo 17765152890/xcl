@@ -206,6 +206,8 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// last async texture upload `(fence_raw, value)` waited on by `self.queue`
+    uploads_waited: (usize, u64),
 }
 
 // D3D12 objects are free-threaded
@@ -237,7 +239,19 @@ impl Pages {
             extra_pages: std::collections::HashMap::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            uploads_waited: (0, 0),
         })
+    }
+
+    /// Order `self.queue` after the async texture uploader fence `(fence, value)` before mutating
+    /// tile mappings on an existing resource (`unmap_superseded` / `remap_if_unmapped`).
+    unsafe fn wait_uploads(&mut self, fence: &ID3D12Fence, value: u64) {
+        let key = fence.as_raw() as usize;
+        if value > 0 && (self.uploads_waited.0 != key || self.uploads_waited.1 < value) {
+            if self.queue.Wait(fence, value).is_ok() {
+                self.uploads_waited = (key, value);
+            }
+        }
     }
 
     fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
@@ -504,21 +518,34 @@ unsafe fn place_on_pages(
 /// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     let key = res.as_raw() as usize;
+    let mut dev: Option<ID3D12Device> = None;
+    let dev_key = res.GetDevice(&mut dev).ok().and_then(|()| dev).map(|d| d.as_raw() as usize);
+    let upload_wait = dev_key.and_then(super::title_textures::upload_fence_for);
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
-    for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.get_mut(&key) else { continue };
-        if !t.mapped {
-            return;
-        }
-        let total = t.total;
-        let used = std::mem::take(&mut t.used);
-        let used_extra = std::mem::take(&mut t.used_extra);
-        t.mapped = false;
-        pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
+    let pages = match dev_key {
+        Some(dk) => match g.get_mut(&dk).and_then(Option::as_mut) {
+            Some(p) => p,
+            None => return,
+        },
+        None => match g.values_mut().flatten().find(|p| p.targets.contains_key(&key)) {
+            Some(p) => p,
+            None => return,
+        },
+    };
+    let Some(t) = pages.targets.get_mut(&key) else { return };
+    if !t.mapped {
         return;
     }
+    let total = t.total;
+    let used = std::mem::take(&mut t.used);
+    let used_extra = std::mem::take(&mut t.used_extra);
+    t.mapped = false;
+    if let Some((fence, val)) = upload_wait {
+        pages.wait_uploads(&fence, val);
+    }
+    pages.unmap(res, total);
+    pages.release_tiles(used, used_extra, now, true);
 }
 
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
@@ -528,14 +555,19 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         return false;
     }
     let Some(dev) = dev else { return false };
+    let dev_key = dev.as_raw() as usize;
+    let upload_wait = super::title_textures::upload_fence_for(dev_key);
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
+    let Some(Some(pages)) = g.get_mut(&dev_key) else { return false };
     let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
         return false;
     };
     if mapped {
         return true;
+    }
+    if let Some((fence, val)) = upload_wait {
+        pages.wait_uploads(&fence, val);
     }
     let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
         return false;
@@ -585,6 +617,14 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     let Some(Some(p)) = g.get(&device) else { return (0, 0) };
     ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+}
+
+#[cfg(test)]
+pub(super) fn sweep_idle_for_test(device: usize) {
+    let mut g = PAGES.lock().unwrap();
+    if let Some(Some(p)) = g.get_mut(&device) {
+        p.sweep(std::time::Instant::now() + IDLE + std::time::Duration::from_secs(1));
+    }
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`

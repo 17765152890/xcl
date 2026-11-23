@@ -225,6 +225,414 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     Ok(failed)
 }
 
+/// COM objects retired by `Uploader` that callers should drop outside any locks (such as
+/// `UPLOADERS`), preventing `Release()` hooks from re-entering while locks are held.
+#[derive(Default)]
+pub struct Released {
+    resources: Vec<ID3D12Resource>,
+    allocs: Vec<ID3D12CommandAllocator>,
+    lists: Vec<ID3D12GraphicsCommandList>,
+}
+
+static INFLIGHT_DEST_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INFLIGHT_DESTS: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> = std::sync::Mutex::new(None);
+
+fn inc_inflight_dest(res: usize) {
+    let mut g = INFLIGHT_DESTS.lock().unwrap();
+    let count = g.get_or_insert_with(std::collections::HashMap::new).entry(res).or_insert(0);
+    *count += 1;
+    INFLIGHT_DEST_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+fn dec_inflight_dest(res: usize) {
+    let mut g = INFLIGHT_DESTS.lock().unwrap();
+    if let Some(m) = g.as_mut() {
+        if let Some(c) = m.get_mut(&res) {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&res);
+            }
+            INFLIGHT_DEST_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Number of COM references currently held by active `Uploader` instances for in-flight copies
+/// targeting raw `ID3D12Resource` pointer `res`.
+pub fn inflight_dest_refs(res: usize) -> u32 {
+    if INFLIGHT_DEST_TOTAL.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return 0;
+    }
+    INFLIGHT_DESTS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or(0)
+}
+
+/// Reusable asynchronous texture uploader for one device: one command list, allocators and
+/// staging upload buffers recycled once the GPU passes their fence value, and a single fence
+/// that consuming queues wait on via `ID3D12CommandQueue::Wait` instead of stalling the CPU.
+pub struct Uploader {
+    dev: ID3D12Device,
+    fence: ID3D12Fence,
+    value: u64,
+    /// Closed command list reused across batches (`None` before first use or after a close error).
+    list: Option<ID3D12GraphicsCommandList>,
+    /// Command allocators and the fence value their last submission signals.
+    allocs: std::collections::VecDeque<(ID3D12CommandAllocator, u64)>,
+    /// Staging upload buffers currently in flight: `(fence_value, buffer, bytes)`.
+    busy: std::collections::VecDeque<(u64, ID3D12Resource, u64)>,
+    /// Destination textures held alive until the GPU finishes copying into them (a title may
+    /// drop its own reference while the async copy is still in flight).
+    dests: std::collections::VecDeque<(u64, ID3D12Resource)>,
+    /// Recycled staging upload buffers ready for reuse, oldest first: `(bytes, buffer)`.
+    free: Vec<(u64, ID3D12Resource)>,
+    free_bytes: u64,
+    /// Objects from submissions where `queue.Signal` failed after `ExecuteCommandLists`: kept
+    /// out of the FIFO queues so they never head-of-line block later batches.
+    pinned_bufs: Vec<ID3D12Resource>,
+    pinned_dests: Vec<ID3D12Resource>,
+    pinned_allocs: Vec<ID3D12CommandAllocator>,
+}
+
+// SAFETY: D3D12 device, fence, command list, allocator, and resource interfaces are free-threaded;
+// all mutation goes through `&mut self`.
+unsafe impl Send for Uploader {}
+
+/// Minimum staging buffer size for small mid-frame uploads (glyph/UI updates).
+const UPLOADER_MIN_CHUNK: u64 = 4 << 20;
+/// Maximum staging buffer size for multi-texture packing chunks.
+const UPLOADER_MAX_CHUNK: u64 = 64 << 20;
+/// Oversized one-off buffers above this size are not retained in the idle pool.
+const UPLOADER_MAX_RETAIN: u64 = 128 << 20;
+/// Maximum total bytes of idle staging buffers retained for reuse.
+const UPLOADER_FREE_CAP: u64 = 256 << 20;
+/// Maximum idle command allocators retained after a loading burst.
+const UPLOADER_MAX_IDLE_ALLOCS: usize = 4;
+/// D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
+const PLACEMENT_ALIGN: u64 = 512;
+
+fn pick_free_buffer<T>(free: &[(u64, T)], min_bytes: u64) -> Option<usize> {
+    let cap = min_bytes.saturating_mul(2);
+    free.iter()
+        .enumerate()
+        .filter(|(_, (bytes, _))| *bytes >= min_bytes && *bytes <= cap)
+        .min_by_key(|(_, (bytes, _))| *bytes)
+        .map(|(i, _)| i)
+}
+
+fn chunk_alloc_size(size: u64, remaining_batch: u64) -> u64 {
+    let target = remaining_batch.clamp(UPLOADER_MIN_CHUNK, UPLOADER_MAX_CHUNK);
+    let min_bytes = size.max(target);
+    if min_bytes <= UPLOADER_MAX_RETAIN {
+        min_bytes.checked_next_power_of_two().unwrap_or(min_bytes)
+    } else {
+        min_bytes.checked_next_multiple_of(1 << 20).unwrap_or(min_bytes)
+    }
+}
+
+fn return_free_buffer<T>(free: &mut Vec<(u64, T)>, free_bytes: &mut u64, buf: T, bytes: u64, evicted: &mut Vec<T>) {
+    if bytes > UPLOADER_MAX_RETAIN || bytes > UPLOADER_FREE_CAP {
+        evicted.push(buf);
+        return;
+    }
+    while free_bytes.saturating_add(bytes) > UPLOADER_FREE_CAP {
+        // Evict the largest idle buffer (oldest first on ties) so oversized buffers cannot starve normal reuse.
+        let Some((idx, _)) = free
+            .iter()
+            .enumerate()
+            .max_by(|(ia, (ba, _)), (ib, (bb, _))| ba.cmp(bb).then_with(|| ib.cmp(ia)))
+        else {
+            break;
+        };
+        let (ebytes, ebuf) = free.remove(idx);
+        *free_bytes -= ebytes;
+        evicted.push(ebuf);
+    }
+    if free_bytes.saturating_add(bytes) <= UPLOADER_FREE_CAP {
+        *free_bytes += bytes;
+        free.push((bytes, buf));
+    } else {
+        evicted.push(buf);
+    }
+}
+
+fn estimate_upload_bytes(subs: &[Subresource]) -> u64 {
+    subs.iter().fold(0u64, |acc, s| {
+        let pitch = (s.row_bytes as u64).checked_next_multiple_of(256).unwrap_or(u64::MAX);
+        let sub = pitch
+            .saturating_mul(s.rows as u64)
+            .saturating_mul(s.depth as u64)
+            .checked_next_multiple_of(PLACEMENT_ALIGN)
+            .unwrap_or(u64::MAX);
+        acc.saturating_add(sub)
+    })
+}
+
+fn next_staging_offset(used: u64, size: u64, capacity: u64) -> Option<(u64, u64)> {
+    let aligned = used.checked_next_multiple_of(PLACEMENT_ALIGN)?;
+    let end = aligned.checked_add(size)?;
+    (end <= capacity).then_some((aligned, end))
+}
+
+struct ActiveChunk {
+    buf: ID3D12Resource,
+    ptr: *mut u8,
+    cap: u64,
+    used: u64,
+}
+
+impl Uploader {
+    pub unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+        Ok(Uploader {
+            dev: dev.clone(),
+            fence,
+            value: 0,
+            list: None,
+            allocs: Default::default(),
+            busy: Default::default(),
+            dests: Default::default(),
+            free: Vec::new(),
+            free_bytes: 0,
+            pinned_bufs: Vec::new(),
+            pinned_dests: Vec::new(),
+            pinned_allocs: Vec::new(),
+        })
+    }
+
+    /// Fence and value that consuming queues must GPU-wait on to observe all uploads submitted so far.
+    pub fn done_at(&self) -> (&ID3D12Fence, u64) {
+        (&self.fence, self.value)
+    }
+
+    /// Reclaim completed destination refs, staging buffers, and excess idle allocators, appending
+    /// COM objects to drop into `released` so callers can drop them outside any locks.
+    pub unsafe fn recycle_deferred(&mut self, released: &mut Released) -> Result<u64, String> {
+        let done = fence::completed_value(&self.fence, &self.dev).map_err(|e| format!("texture copy: {e}"))?;
+        while self.dests.front().is_some_and(|(v, _)| *v <= done) {
+            let (_, res) = self.dests.pop_front().unwrap();
+            dec_inflight_dest(windows::core::Interface::as_raw(&res) as usize);
+            released.resources.push(res);
+        }
+        while self.busy.front().is_some_and(|(v, _, _)| *v <= done) {
+            let (_, buf, bytes) = self.busy.pop_front().unwrap();
+            return_free_buffer(&mut self.free, &mut self.free_bytes, buf, bytes, &mut released.resources);
+        }
+        let idle_allocs = self.allocs.iter().take_while(|(_, v)| *v <= done).count();
+        for _ in UPLOADER_MAX_IDLE_ALLOCS..idle_allocs {
+            if let Some((alloc, _)) = self.allocs.pop_front() {
+                released.allocs.push(alloc);
+            }
+        }
+        Ok(done)
+    }
+
+    unsafe fn take_mapped(
+        dev: &ID3D12Device,
+        free: &mut Vec<(u64, ID3D12Resource)>,
+        free_bytes: &mut u64,
+        size: u64,
+        remaining_batch: u64,
+        released: &mut Released,
+    ) -> Result<ActiveChunk, String> {
+        let target = remaining_batch.clamp(UPLOADER_MIN_CHUNK, UPLOADER_MAX_CHUNK);
+        let min_bytes = size.max(target);
+        let (buf, cap) = if let Some(i) = pick_free_buffer(free, min_bytes) {
+            let (bytes, buf) = free.remove(i);
+            *free_bytes -= bytes;
+            (buf, bytes)
+        } else {
+            let bytes = chunk_alloc_size(size, remaining_batch);
+            (buffer(dev, bytes)?, bytes)
+        };
+        let no_read = D3D12_RANGE { Begin: 0, End: 0 };
+        let mut p = std::ptr::null_mut();
+        if let Err(e) = buf.Map(0, Some(&no_read), Some(&mut p)) {
+            released.resources.push(buf);
+            return Err(err(e));
+        }
+        Ok(ActiveChunk { buf, ptr: p as *mut u8, cap, used: 0 })
+    }
+
+    unsafe fn finish_chunk(
+        chunk: ActiveChunk,
+        used: &mut Vec<(ID3D12Resource, u64)>,
+        free: &mut Vec<(u64, ID3D12Resource)>,
+        free_bytes: &mut u64,
+        released: &mut Released,
+    ) {
+        let written = D3D12_RANGE { Begin: 0, End: usize::try_from(chunk.used).unwrap_or(usize::MAX) };
+        chunk.buf.Unmap(0, Some(&written));
+        if chunk.used > 0 {
+            used.push((chunk.buf, chunk.cap));
+        } else {
+            return_free_buffer(free, free_bytes, chunk.buf, chunk.cap, &mut released.resources);
+        }
+    }
+
+    /// Record and submit a batch of texture uploads asynchronously on `queue` without stalling
+    /// the CPU. Consuming queues must GPU-wait on `done_at()` before sampling the targets.
+    pub unsafe fn upload(
+        &mut self,
+        queue: &ID3D12CommandQueue,
+        items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+    ) -> Result<Vec<(usize, String)>, String> {
+        let mut released = Released::default();
+        let r = self.upload_deferred(queue, items, &mut released);
+        drop(released);
+        r
+    }
+
+    /// Like `upload`, but appends all retired COM objects into `released` so callers holding an
+    /// outer lock can drop them after releasing the lock.
+    pub unsafe fn upload_deferred(
+        &mut self,
+        queue: &ID3D12CommandQueue,
+        items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+        released: &mut Released,
+    ) -> Result<Vec<(usize, String)>, String> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let done = self.recycle_deferred(released)?;
+        let alloc = match self.allocs.front() {
+            Some((_, v)) if *v <= done => {
+                let (a, _) = self.allocs.pop_front().unwrap();
+                if let Err(e) = a.Reset() {
+                    released.allocs.push(a);
+                    return Err(err(e));
+                }
+                a
+            }
+            _ => self.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?,
+        };
+        let list = match self.list.take() {
+            Some(l) => {
+                if let Err(e) = l.Reset(&alloc, None) {
+                    self.allocs.push_front((alloc, done));
+                    released.lists.push(l);
+                    return Err(err(e));
+                }
+                l
+            }
+            None => match self.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.allocs.push_front((alloc, done));
+                    return Err(err(e));
+                }
+            },
+        };
+        let item_ests: Vec<u64> = items.iter().map(|(_, subs, _)| estimate_upload_bytes(subs)).collect();
+        let mut remaining_est: u64 = item_ests.iter().copied().fold(0u64, u64::saturating_add);
+        let mut used: Vec<(ID3D12Resource, u64)> = Vec::new();
+        let mut dests: Vec<ID3D12Resource> = Vec::new();
+        let mut failed = Vec::new();
+        let mut cur: Option<ActiveChunk> = None;
+        for (k, ((res, subs, states), &est)) in items.iter().zip(&item_ests).enumerate() {
+            let (dev, free, free_bytes) = (&self.dev, &mut self.free, &mut self.free_bytes);
+            let r = record_upload_mapped(dev, &list, res, subs, states, states, &mut |size| {
+                let fit = cur.as_ref().and_then(|c| next_staging_offset(c.used, size, c.cap));
+                if fit.is_none() {
+                    if let Some(c) = cur.take() {
+                        Self::finish_chunk(c, &mut used, free, free_bytes, released);
+                    }
+                    cur = Some(Self::take_mapped(dev, free, free_bytes, size, remaining_est, released)?);
+                }
+                let c = cur.as_mut().unwrap();
+                let (at, end) = next_staging_offset(c.used, size, c.cap).ok_or_else(|| format!("texture staging size overflow ({size} B)"))?;
+                let at_usize = usize::try_from(at).map_err(|_| format!("texture staging offset overflow ({at} B)"))?;
+                c.used = end;
+                Ok((windows::core::Interface::as_raw(&c.buf), at, c.ptr.add(at_usize)))
+            });
+            remaining_est = remaining_est.saturating_sub(est);
+            match r {
+                Ok(()) => dests.push(res.clone()),
+                Err(e) => failed.push((k, e)),
+            }
+        }
+        if let Some(c) = cur.take() {
+            Self::finish_chunk(c, &mut used, &mut self.free, &mut self.free_bytes, released);
+        }
+        if dests.is_empty() {
+            // Nothing succeeded: close the empty list so it and the allocator can be reused without submitting.
+            if list.Close().is_ok() {
+                self.list = Some(list);
+                self.allocs.push_front((alloc, done));
+            } else {
+                released.lists.push(list);
+                released.allocs.push(alloc);
+            }
+            for (b, bytes) in used {
+                return_free_buffer(&mut self.free, &mut self.free_bytes, b, bytes, &mut released.resources);
+            }
+            return Ok(failed);
+        }
+        if let Err(e) = list.Close() {
+            released.lists.push(list);
+            released.allocs.push(alloc);
+            for (b, bytes) in used {
+                return_free_buffer(&mut self.free, &mut self.free_bytes, b, bytes, &mut released.resources);
+            }
+            released.resources.extend(dests);
+            return Err(err(e));
+        }
+        self.list = Some(list.clone());
+        let cl: ID3D12CommandList = match windows::core::Interface::cast(&list) {
+            Ok(cl) => cl,
+            Err(e) => {
+                self.allocs.push_front((alloc, done));
+                for (b, bytes) in used {
+                    return_free_buffer(&mut self.free, &mut self.free_bytes, b, bytes, &mut released.resources);
+                }
+                released.resources.extend(dests);
+                return Err(err(e));
+            }
+        };
+        queue.ExecuteCommandLists(&[Some(cl)]);
+        let next = self.value + 1;
+        if let Err(e) = queue.Signal(&self.fence, next) {
+            // The list is already submitted: pin its allocator, staging buffers, and targets in
+            // dedicated vectors so they stay alive without head-of-line blocking the FIFO queues.
+            for (b, _) in used {
+                self.pinned_bufs.push(b);
+            }
+            for res in dests {
+                inc_inflight_dest(windows::core::Interface::as_raw(&res) as usize);
+                self.pinned_dests.push(res);
+            }
+            self.pinned_allocs.push(alloc);
+            return Err(err(e));
+        }
+        self.value = next;
+        for (b, bytes) in used {
+            self.busy.push_back((next, b, bytes));
+        }
+        for res in dests {
+            inc_inflight_dest(windows::core::Interface::as_raw(&res) as usize);
+            self.dests.push_back((next, res));
+        }
+        self.allocs.push_back((alloc, next));
+        Ok(failed)
+    }
+}
+
+impl Drop for Uploader {
+    fn drop(&mut self) {
+        if self.value > 0 {
+            unsafe {
+                let _ = fence::wait(&self.fence, self.value, &self.dev, None, 10_000);
+            }
+        }
+        for (_, res) in self.dests.drain(..) {
+            dec_inflight_dest(windows::core::Interface::as_raw(&res) as usize);
+            drop(res);
+        }
+        for res in self.pinned_dests.drain(..) {
+            dec_inflight_dest(windows::core::Interface::as_raw(&res) as usize);
+            drop(res);
+        }
+    }
+}
+
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
 /// the staging buffer returned must live until the list has run.
 pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> Result<ID3D12Resource, String> {
@@ -242,6 +650,44 @@ pub unsafe fn record_upload_states(
     before: &[D3D12_RESOURCE_STATES],
     after: &[D3D12_RESOURCE_STATES],
 ) -> Result<ID3D12Resource, String> {
+    let mut mapped: Option<(ID3D12Resource, usize)> = None;
+    let r = record_upload_mapped(dev, list, res, subs, before, after, &mut |size| {
+        let len = usize::try_from(size).map_err(|_| format!("texture staging size overflow ({size} B)"))?;
+        let up = buffer(dev, size)?;
+        let no_read = D3D12_RANGE { Begin: 0, End: 0 };
+        let mut p = std::ptr::null_mut();
+        up.Map(0, Some(&no_read), Some(&mut p)).map_err(err)?;
+        let raw = windows::core::Interface::as_raw(&up);
+        mapped = Some((up, len));
+        Ok((raw, 0, p as *mut u8))
+    });
+    match (r, mapped) {
+        (Ok(()), Some((up, len))) => {
+            let written = D3D12_RANGE { Begin: 0, End: len };
+            up.Unmap(0, Some(&written));
+            Ok(up)
+        }
+        (Err(e), Some((up, _))) => {
+            let none = D3D12_RANGE { Begin: 0, End: 0 };
+            up.Unmap(0, Some(&none));
+            Err(e)
+        }
+        (Err(e), None) => Err(e),
+        (Ok(()), None) => Err("texture upload staging buffer missing".into()),
+    }
+}
+
+/// `record_upload_states` with caller-supplied mapped staging memory: `staging(size)` returns
+/// `(raw_buffer, base_offset, mapped_dst_ptr)` with at least `size` writable bytes at `mapped_dst_ptr`.
+unsafe fn record_upload_mapped(
+    dev: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    res: &ID3D12Resource,
+    subs: &[Subresource],
+    before: &[D3D12_RESOURCE_STATES],
+    after: &[D3D12_RESOURCE_STATES],
+    staging: &mut dyn FnMut(u64) -> Result<(*mut std::ffi::c_void, u64, *mut u8), String>,
+) -> Result<(), String> {
     validate_subresources(subs)?;
     let rd = res.GetDesc();
     let n = subs.len();
@@ -256,6 +702,10 @@ pub unsafe fn record_upload_states(
     let mut row_bytes = vec![0u64; n];
     let mut total = 0u64;
     dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+    if total == 0 || total == u64::MAX {
+        return Err(format!("invalid copyable footprint size ({total})"));
+    }
+    let total_usize = usize::try_from(total).map_err(|_| format!("texture staging size overflow ({total} B)"))?;
     for (i, ((s, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
         if s.rows != nrows as usize || s.depth != fp.Footprint.Depth as usize || s.row_bytes != nbytes as usize {
             return Err(format!(
@@ -263,23 +713,42 @@ pub unsafe fn record_upload_states(
                 s.row_bytes, s.rows, s.depth, nbytes, nrows, fp.Footprint.Depth
             ));
         }
+        let rel = usize::try_from(fp.Offset).map_err(|_| "texture staging offset overflow")?;
+        let pitch = fp.Footprint.RowPitch as usize;
+        let row = s.row_bytes.min(pitch);
+        let depth = (fp.Footprint.Depth as usize).min(s.depth);
+        let nr = (nrows as usize).min(s.rows);
+        if depth > 0 && nr > 0 && row > 0 {
+            let slice_pitch = pitch.checked_mul(nrows as usize).ok_or("texture staging slice pitch overflow")?;
+            let end = (depth - 1)
+                .checked_mul(slice_pitch)
+                .and_then(|o| o.checked_add((nr - 1).checked_mul(pitch)?))
+                .and_then(|o| o.checked_add(row))
+                .and_then(|o| o.checked_add(rel))
+                .ok_or("texture staging offset overflow")?;
+            if end > total_usize {
+                return Err(format!("texture staging write ({end} B) exceeds footprint ({total_usize} B)"));
+            }
+        }
     }
-    let up = buffer(dev, total)?;
-    let mut p = std::ptr::null_mut();
-    up.Map(0, None, Some(&mut p)).map_err(err)?;
-    for ((s, fp), &nrows) in subs.iter().zip(&fps).zip(&rows) {
+    let (up_raw, base, dst_base) = staging(total)?;
+    base.checked_add(total).ok_or("texture staging offset overflow")?;
+    let up = windows::core::Interface::from_raw_borrowed(&up_raw)
+        .ok_or_else(|| "texture staging buffer is null".to_string())?;
+    for ((s, fp), &nrows) in subs.iter().zip(fps.iter_mut()).zip(&rows) {
+        let rel = fp.Offset as usize;
+        fp.Offset = fp.Offset.checked_add(base).ok_or("texture staging offset overflow")?;
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
         // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
         let slice_pitch = pitch * nrows as usize;
         for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
             for y in 0..(nrows as usize).min(s.rows) {
-                let at = fp.Offset as usize + z * slice_pitch + y * pitch;
-                std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), (p as *mut u8).add(at), row);
+                let at = rel + z * slice_pitch + y * pitch;
+                std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), dst_base.add(at), row);
             }
         }
     }
-    up.Unmap(0, None);
     let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
     if !to_copy.is_empty() {
         list.ResourceBarrier(&to_copy);
@@ -290,14 +759,18 @@ pub unsafe fn record_upload_states(
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 },
         };
-        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy::<ID3D12Resource, _>(up),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+        };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
     }
     let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
     if !back.is_empty() {
         list.ResourceBarrier(&back);
     }
-    Ok(up)
+    Ok(())
 }
 
 /// The transitions of `r`'s `n` subresources from `from` to `to` (each one state for all, or one
@@ -889,6 +1362,234 @@ mod tests {
                     (src.first() == Some(&0x78)).then(|| miniz_oxide::inflate::decompress_to_vec_zlib(src).ok().map(std::rc::Rc::new)).flatten()
                 })
                 .clone()
+        }
+    }
+
+    #[test]
+    fn uploader_staging_alignment_and_overflow() {
+        assert_eq!(next_staging_offset(0, 1024, UPLOADER_MIN_CHUNK), Some((0, 1024)));
+        assert_eq!(next_staging_offset(1, 512, UPLOADER_MIN_CHUNK), Some((512, 1024)));
+        assert_eq!(next_staging_offset(512, 512, 1024), Some((512, 1024)));
+        assert_eq!(next_staging_offset(513, 512, 1024), None);
+        assert_eq!(next_staging_offset(u64::MAX - 10, 64, u64::MAX), None);
+        assert_eq!(next_staging_offset(512, u64::MAX, u64::MAX), None);
+
+        // Dynamic chunk sizing: small batches use 4 MiB, large batches cap at 64 MiB, and
+        // oversized one-off textures above UPLOADER_MAX_RETAIN round to 1 MiB instead of doubling.
+        assert_eq!(chunk_alloc_size(64 << 10, 64 << 10), UPLOADER_MIN_CHUNK);
+        assert_eq!(chunk_alloc_size(64 << 10, 12 << 20), 16 << 20);
+        assert_eq!(chunk_alloc_size(64 << 10, 200 << 20), UPLOADER_MAX_CHUNK);
+        assert_eq!(chunk_alloc_size(150 << 20, 150 << 20), 150 << 20);
+        assert_eq!(chunk_alloc_size((150 << 20) + 1, (150 << 20) + 1), 151 << 20);
+    }
+
+    #[test]
+    fn uploader_free_pool_rejects_oversized_and_evicts_largest() {
+        let mut free: Vec<(u64, u32)> = Vec::new();
+        let mut free_bytes = 0u64;
+        let mut evicted = Vec::new();
+
+        // Oversized one-off buffer (> UPLOADER_MAX_RETAIN and > UPLOADER_FREE_CAP) is never retained.
+        return_free_buffer(&mut free, &mut free_bytes, 1, 300 << 20, &mut evicted);
+        assert_eq!(evicted, vec![1]);
+        assert!(free.is_empty());
+        assert_eq!(free_bytes, 0);
+
+        // Even when two 128 MiB buffers completely fill UPLOADER_FREE_CAP (256 MiB), returning a
+        // normal 4 MiB buffer evicts the oldest 128 MiB buffer so normal reuse is never starved.
+        return_free_buffer(&mut free, &mut free_bytes, 10, 128 << 20, &mut evicted);
+        return_free_buffer(&mut free, &mut free_bytes, 11, 128 << 20, &mut evicted);
+        assert_eq!(free_bytes, UPLOADER_FREE_CAP);
+        assert_eq!(pick_free_buffer(&free, UPLOADER_MIN_CHUNK), None);
+
+        return_free_buffer(&mut free, &mut free_bytes, 20, UPLOADER_MIN_CHUNK, &mut evicted);
+        assert_eq!(evicted, vec![1, 10], "oldest 128 MiB buffer should be evicted");
+        assert_eq!(free_bytes, (128 << 20) + UPLOADER_MIN_CHUNK);
+        let picked = pick_free_buffer(&free, UPLOADER_MIN_CHUNK).expect("4 MiB buffer must be reusable");
+        assert_eq!(free[picked], (UPLOADER_MIN_CHUNK, 20));
+    }
+
+    #[test]
+    fn inflight_dest_refs_tracks_multiple_holds() {
+        // Distinct sentinel addresses (never dereferenced).
+        let (a, b) = (0x7E57_DEAD_1000usize, 0x7E57_DEAD_2000usize);
+        assert_eq!(inflight_dest_refs(a), 0);
+        assert_eq!(inflight_dest_refs(b), 0);
+        inc_inflight_dest(a);
+        inc_inflight_dest(a);
+        inc_inflight_dest(b);
+        assert_eq!(inflight_dest_refs(a), 2);
+        assert_eq!(inflight_dest_refs(b), 1);
+        dec_inflight_dest(a);
+        assert_eq!(inflight_dest_refs(a), 1);
+        dec_inflight_dest(a);
+        assert_eq!(inflight_dest_refs(a), 0);
+        dec_inflight_dest(b);
+        assert_eq!(inflight_dest_refs(b), 0);
+    }
+
+    /// Async `Uploader`: packs multiple textures into one shared staging buffer, syncs a
+    /// separate consuming queue through its fence without a CPU wait, keeps a caller-dropped
+    /// destination alive until GPU completion, reuses staging buffers and allocators after
+    /// completion, and recovers cleanly from partial or full validation failures.
+    #[test]
+    fn gpu_uploader_reuses_staging_syncs_via_fence_and_holds_dropped_targets() {
+        let Some((dev, upload_q)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let title_q: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let mut up = Uploader::new(&dev).unwrap();
+            assert_eq!(up.done_at().1, 0);
+
+            let make_tex = |w: u64, h: u32, mips: u16, fill: u8| -> (ID3D12Resource, Vec<Subresource>) {
+                let rd = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: w,
+                    Height: h,
+                    DepthOrArraySize: 1,
+                    MipLevels: mips,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &rd,
+                    SHADER_READ,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                let mut subs = Vec::new();
+                for m in 0..mips as usize {
+                    let mw = ((w as usize) >> m).max(1);
+                    let mh = ((h as usize) >> m).max(1);
+                    let mut data = vec![0u8; mw * mh * 4];
+                    for (idx, px) in data.chunks_exact_mut(4).enumerate() {
+                        px[0] = fill.wrapping_add(m as u8);
+                        px[1] = (idx & 0xFF) as u8;
+                        px[2] = ((idx >> 8) & 0xFF) as u8;
+                        px[3] = 0xFF;
+                    }
+                    subs.push(Subresource { depth: 1, rows: mh, row_bytes: mw * 4, data });
+                }
+                (r.unwrap(), subs)
+            };
+
+            // Batch 1: two distinct textures + one caller-dropped texture share one 4 MiB staging buffer.
+            let (tex_a, subs_a) = make_tex(64, 64, 3, 0x10);
+            let (tex_b, subs_b) = make_tex(128, 32, 1, 0x80);
+            let (tex_ephemeral, subs_ephemeral) = make_tex(32, 32, 1, 0xCC);
+            let tex_a_raw = windows::core::Interface::as_raw(&tex_a) as usize;
+            let tex_eph_raw = windows::core::Interface::as_raw(&tex_ephemeral) as usize;
+            let failed = up
+                .upload(
+                    &upload_q,
+                    &[
+                        (tex_a.clone(), subs_a.clone(), vec![SHADER_READ]),
+                        (tex_b.clone(), subs_b.clone(), vec![SHADER_READ]),
+                        (tex_ephemeral, subs_ephemeral, vec![SHADER_READ]),
+                    ],
+                )
+                .unwrap();
+            assert!(failed.is_empty());
+            assert_eq!(up.done_at().1, 1);
+            assert_eq!(up.busy.len(), 1, "all 3 textures should pack into one shared staging chunk");
+            assert_eq!(up.busy[0].2, UPLOADER_MIN_CHUNK, "small batch should allocate 4 MiB chunk, not 64 MiB");
+            assert_eq!(up.dests.len(), 3, "all 3 destination textures must be retained until GPU completion");
+            assert_eq!(inflight_dest_refs(tex_a_raw), 1);
+            assert_eq!(inflight_dest_refs(tex_eph_raw), 1);
+            assert_eq!(up.allocs.len(), 1);
+
+            // Consuming queue waits on the uploader's fence (no CPU wait on upload_q before submit).
+            let (fence, val) = up.done_at();
+            title_q.Wait(fence, val).unwrap();
+            let got_a = read_back(&dev, &title_q, &tex_a, &subs_a);
+            let got_b = read_back(&dev, &title_q, &tex_b, &subs_b);
+            assert_eq!(got_a, subs_a);
+            assert_eq!(got_b, subs_b);
+
+            // Batch 2 (after batch 1 completed on GPU): reuses both the staging buffer and the allocator.
+            let (tex_c, subs_c) = make_tex(64, 64, 1, 0x55);
+            let tex_c_raw = windows::core::Interface::as_raw(&tex_c) as usize;
+            let failed = up
+                .upload(
+                    &upload_q,
+                    &[
+                        // One invalid item (wrong subresource count) paired with one valid item.
+                        (tex_a.clone(), vec![], vec![SHADER_READ]),
+                        (tex_c.clone(), subs_c.clone(), vec![SHADER_READ]),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].0, 0);
+            assert_eq!(up.done_at().1, 2);
+            assert_eq!(up.busy.len(), 1, "completed staging buffer should be recycled and reused");
+            assert_eq!(up.free.len(), 0, "recycled staging buffer should have been taken back for batch 2");
+            assert_eq!(up.allocs.len(), 1, "completed allocator should be reused");
+            assert_eq!(up.dests.len(), 1, "only valid uploaded targets are retained");
+            assert_eq!(inflight_dest_refs(tex_a_raw), 0, "completed batch 1 dests must release tracking");
+            assert_eq!(inflight_dest_refs(tex_eph_raw), 0);
+            assert_eq!(inflight_dest_refs(tex_c_raw), 1);
+
+            let (fence, val) = up.done_at();
+            title_q.Wait(fence, val).unwrap();
+            assert_eq!(read_back(&dev, &title_q, &tex_c, &subs_c), subs_c);
+
+            // Batch 3: all-invalid batch does not submit or advance fence, and leaves uploader reusable.
+            let failed = up.upload(&upload_q, &[(tex_c.clone(), vec![], vec![SHADER_READ])]).unwrap();
+            assert_eq!(failed.len(), 1);
+            assert_eq!(up.done_at().1, 2);
+            assert_eq!(inflight_dest_refs(tex_c_raw), 0);
+
+            // Batch 4 after all-invalid batch still works cleanly.
+            let (tex_d, subs_d) = make_tex(32, 32, 1, 0x99);
+            let tex_d_raw = windows::core::Interface::as_raw(&tex_d) as usize;
+            let failed = up.upload(&upload_q, &[(tex_d.clone(), subs_d.clone(), vec![SHADER_READ])]).unwrap();
+            assert!(failed.is_empty());
+            assert_eq!(up.done_at().1, 3);
+            assert_eq!(inflight_dest_refs(tex_d_raw), 1);
+            let (fence, val) = up.done_at();
+            title_q.Wait(fence, val).unwrap();
+            assert_eq!(read_back(&dev, &title_q, &tex_d, &subs_d), subs_d);
+
+            // Verify idle allocator cap & oversized buffer non-starvation on the live Uploader:
+            let big_stub = buffer(&dev, 4096).unwrap();
+            up.busy.push_back((0, big_stub, 300 << 20));
+            for _ in 0..(UPLOADER_MAX_IDLE_ALLOCS + 3) {
+                let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                up.allocs.push_front((a, 0));
+            }
+            let mut released = Released::default();
+            up.recycle_deferred(&mut released).unwrap();
+            assert!(up.free.iter().all(|(b, _)| *b <= UPLOADER_MAX_RETAIN), "oversized buffer must not enter free pool");
+            assert_eq!(up.allocs.len(), UPLOADER_MAX_IDLE_ALLOCS, "idle allocators must be capped");
+            assert!(released.allocs.len() >= 3);
+            drop(released);
+
+            // Subsequent normal batch still reuses the pooled 4 MiB staging buffer cleanly.
+            let failed = up.upload(&upload_q, &[(tex_d.clone(), subs_d.clone(), vec![SHADER_READ])]).unwrap();
+            assert!(failed.is_empty());
+            assert_eq!(up.free.len(), 0, "pooled 4 MiB buffer must be reused after oversized buffer");
+            assert_eq!(up.busy.len(), 1);
+            assert_eq!(inflight_dest_refs(tex_d_raw), 1);
+
+            // Dropping Uploader without calling recycle() must drain both `dests` and `pinned_dests` tracking.
+            inc_inflight_dest(tex_a_raw);
+            up.pinned_dests.push(tex_a.clone());
+            assert_eq!(inflight_dest_refs(tex_a_raw), 1);
+            drop(up);
+            assert_eq!(inflight_dest_refs(tex_d_raw), 0, "Drop must drain dests inflight tracking");
+            assert_eq!(inflight_dest_refs(tex_a_raw), 0, "Drop must drain pinned_dests inflight tracking");
         }
     }
 }
