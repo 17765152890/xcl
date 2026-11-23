@@ -13,6 +13,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 Â
 | [LLVM](https://github.com/llvm/llvm-project) | Apache-2.0 WITH LLVM-exception | `tests/data/llvm-amdgpu/*` (test data, not part of the program); GFX10 buffer format values (`UfmtSymbolicGFX10`) in `gpu/recomp/emit.rs` | test vectors; hardware facts |
 | [WinDurango](https://github.com/WinDurango/WinDurango) | LGPL-3.0 | no code; d3d12_x.dll export numbers (facts) in `crates/xcl/data/stubdb.toml` | reference only |
 | [libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | no code; XTaskQueue/XAsync contract | specification |
+| [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) and [silicon-rans](https://github.com/microsoft/silicon-rans) | MIT | experimental BCPack BC1 decoder and entropy tables | pinned Rust dependency; notices below |
 | Windows XGameRuntime (`System32\xgameruntime.dll`) | system | class GUIDs and slot order of the GDK thunk protocol in `hle/xgameruntime/api.rs` (facts, determined by analysis); APIs XCL does not implement are forwarded to it at runtime | interoperability; not distributed |
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
 | Rust crates (`Cargo.lock`) | MIT / BSD-2 / Zlib / Unlicense (or with an MIT alternative) | build dependencies | statically linked |
@@ -22,3 +23,28 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 Â
 When adding dependencies: compatible with GPL-2.0-only are MIT, BSD, Zlib, ISC, Unlicense, LGPL-2.1(+),
 GPL-2.0(+), MPL-2.0 (via its Secondary License clause). Incompatible: Apache-2.0 without an alternative,
 GPL-3.0, LGPL-3.0, AGPL.
+
+## BCPack notices
+
+bcpack-rs: Copyright (c) 2026 Ahmet Dedeler. Its rANS decoder and tables derive from
+silicon-rans: Copyright (c) Microsoft Corporation. Both are used under the MIT license:
+
+```
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

@@ -129,6 +129,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   window stays open until Enter.
 - The window title shows active shader compilation and pipeline builds; pipelines deferred until
   first use are not counted as active.
+- Experimental BCPack BC1 decoding can be enabled with `XCL_DSTORAGE_BCPACK_BC1=1`. Its fitted
+  tables can produce inaccurate textures, and BC2–BC7 remain unsupported; this does not guarantee
+  a game will render or run.
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
