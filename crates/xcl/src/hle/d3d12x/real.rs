@@ -1785,8 +1785,31 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
-    f(this, res, counter, desc, slot.pc_uav);
+    // a resource the PC has without unordered access (a console depth buffer that is also a UAV,
+    // `device_x::pc_resource_desc`): a null view of the same dimension – the view of it the
+    // driver was handed removed the device once a dispatch used it (GTA VI, ~25 s in)
+    let null_desc;
+    let (res_pc, counter, desc_pc) = match ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()) {
+        Some(rd) if rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_info!(
+                    "D3D12.X: UAV of a resource without unordered access ({}x{}, format {}, flags {:#x}) – a null view",
+                    rd.Width,
+                    rd.Height,
+                    rd.Format.0,
+                    rd.Flags.0
+                );
+            }
+            let mut d = desc.as_ref().copied().unwrap_or(D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION(resource_dim_to_view(&rd) as i32), ..Default::default() });
+            d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+            null_desc = d;
+            (std::ptr::null_mut(), std::ptr::null_mut(), &null_desc as *const D3D12_UNORDERED_ACCESS_VIEW_DESC)
+        }
+        _ => (res, counter, desc),
+    };
+    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res_pc, counter, desc_pc, cpu) };
+    f(this, res_pc, counter, desc_pc, slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
