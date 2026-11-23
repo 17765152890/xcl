@@ -1852,3 +1852,144 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 5. Smaller: whole-wave reductions in partial waves (325 PS with a min reduction, every GPU), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.
+
+## The Mac port on upstream 9ab7d76 (branch `mac4`, 2026-11-24; CrossOver, D3DMetal, Rosetta 2)
+The local Mac port (branch `mac3`, 40 commits on 956a476) carried onto the newest upstream – a port, not a rebase:
+upstream's own versions were taken wherever it has one, and each local change is kept, replaced or dropped below.
+"Native host": the host's D3D12 is in no PE module (`gpu::shader::NATIVE_HOST_MEMORY`, set when the device is adopted);
+"Mac host": Wine on Darwin (`util::mac_host`, known from the start of the run; `XCL_MAC_HOST=1` / `0`).
+
+- **Kept, as they were (host basics).** Network off unless `XCL_NETWORK=1` (`hle/netoff`, see below); `readable()` asks
+  IsBadReadPtr for memory VirtualQuery does not know on a native host; 16 MiB title stacks (`MIN_TITLE_STACK`, the
+  `CreateThread` wrapper); `class_for`: 16 words of the host's table mirrored in front of an extended vtable
+  (`PREFIX` / `HDR` – D3DMetal runs `dynamic_cast` through them), every slot up to `total` under the guard and the
+  host's tail words after XCL's slots on a native host; stand-in shaders as DXIL from DXC there. `is_adopted` /
+  upstream's `this_first` (struct-returning device methods) are untouched by the prefix: `EXTS` holds the address
+  after the header.
+- **Instructions Rosetta 2 does not run** (`isa.rs`, `eh::unsupported_insn_handler`, which runs before upstream's
+  `emulate_console_only`). Upstream's `insn` is used for what it covers – a lone CLZERO and the CLZERO loop, CLWB,
+  MONITORX / MWAITX, RDPRU, RDPID, EXTRQ, INSERTQ by register. Ours stays for what only a translator lacks: ADCX /
+  ADOX, RDSEED, MOVNTSS / MOVNTSD (emulated), and for speed (a trap costs tens of microseconds there): ADX, INSERTQ
+  with immediates and CLZERO-with-the-next-instruction sites are redirected to helpers after their first trap
+  (INSERTQ's helper zeroes the high quadword, as `insn` does). Seen live: `Clwb`, `Monitorx`, `Mwaitx` through
+  upstream's handler, CLZERO and INSERTQ through the helpers.
+- **Unified memory without OpenExistingHeapFromAddress** (D3DMetal: E_NOTIMPL): the committed window is a
+  buffers-only heap of video memory kept in step like a sparse window's tiles (`Uma::shadowed`,
+  `sparse::shadow_window`, `list_x::note_copy_into`; `XCL_UMA_SHADOW`). Upstream's start-up import check is not run
+  for it. **Upstream's buffer mirrors work on top of it** (index / vertex buffers of the UI library in ordinary
+  memory: `list_x::gpu_va`, `sync_title_buffers`): the mirror is unified memory, what a draw copies there is uploaded
+  with the window's other CPU writes before the submit. The local copies to upload buffers (`XCL_CPU_GEOMETRY`,
+  `cpu_index_view`, the second copy at execute) are dropped.
+- **Depth formats** (`device_x::depth_only`, `XCL_DEPTH_STENCIL=1` restores upstream's mapping): on a native host
+  every depth + stencil family is R32_TYPELESS / D32_FLOAT / R32_FLOAT, on top of upstream's functions
+  (`pc_resource_desc`, `pc_view_format`, `pc_shader_view_format`, `pc_depth_view_format` for DSVs) – upstream's
+  typeless resource with R24_UNORM_X8 / R32_FLOAT_X8X24 views and stencil in plane 1 is the combination Metal ends
+  the process on ("failed assertion `Texture Creation`"). The stencil plane is lost. `XCL_TRACE_DEPTH_VIEWS=1`.
+- **Title textures in memory that is not write-watched** are compared by content before the title's submits
+  (`title_textures::poll_unwatched`, `pick`, `note_unmap`; `XCL_TRACE_TITLE_TEXTURES=1`). Merged with upstream's
+  per-subresource states and its small render targets kept in step (#211: the 256x256 glyph caches get registered
+  at all). On this host every registered title texture is in unwatched memory (900 of 900 through the menus, 2 000
+  of 2 000 into loading: the title's heaps and page pools are plain memory here), so the content compare is what
+  uploads CPU writes after the first upload – in a traced run through the menus the glyph atlas (2048x2048 A8 at
+  0x2a1100000) went up six times by "content … changed – upload", and upstream's write-watch path found nothing
+  (no texture was in watched memory). If upstream's PR #252 (the title's plain reservation write-watched) lands,
+  it would need the same switch as the coherent heaps here: watched memory the title writes with masked stores.
+- **Switches for upstream mechanisms** (on elsewhere, off by default on a Mac, either can be forced):
+  `XCL_COHERENT_HEAPS` (the title's GPU heaps in the coherent window: here that window is write-watched and the
+  title's heaps would be in it – Rosetta cannot resume an AVX2 masked store that faults; replaces the local
+  `XCL_GRAPHICS_PROTECT` / `XCL_FAR_HOMES`), `XCL_LAZY_PAGES` (pages committed in a vectored handler at first
+  access: the same fault), `XCL_VRAM_ARENAS=0` (GPU-owned targets as reserved textures on pages: never tried on
+  D3DMetal; the new own-size arenas are used), `XCL_RECT_LIST_GS` (the generated geometry shader: Metal has no
+  geometry stage; `bind::draw_rects` makes the fourth corner on the CPU).
+- **Kept, small:** the stall watchdog is skipped (`eh::title_watchdog_resume`), `XCL_BACKGROUND=1` (and keyboard /
+  mouse only between a click on the window and its deactivation), `XCL_REMOTE_INPUT=<file>`,
+  `XCL_DUMP_THREADS_AT`, `XCL_PEEK`, `XCL_TRACE_EXCEPTIONS`, `XCL_TRACE_FENCES`, the first frames in
+  `XCL_FRAME_DUMP`, the DXC memory gate's log line; physical pages told to the sparse windows in runs and
+  `sparse::page_committed` (Wine's VirtualQuery is slow); from the gap audit XMemIsToolsMemAvailable, Scatter
+  without a page array, 128 xgameruntime slots, XDisplayTryEnableHdrMode, device #101 CreateStateObject failing
+  cleanly; from the pipeline lane a heap per DXC compile thread on Wine (`XCL_DXC_HEAP`), known translations
+  (`pso::Translated`), the capture hash outside its lock, `XCL_TRANSLATED_IDENT`.
+- **Dropped for upstream's:** the frame-path lane (list slots shifted from #61 as a rule, #146 Barrier as legacy
+  transitions, queue #35 with list-type filtering, Wait64BitValueX without a mask, the logged no-ops) – upstream's
+  `NEWER_LIST_SLOTS`, `uav_barrier_x` and #35 are used; the title-address answer of GetGPUVirtualAddress (upstream's
+  `TITLE_ADDRESS` / `texture_memory`; on a native host the title's address is looked up before the host is asked);
+  frame clock, bottom-of-pipe writes by the CPU, XG #10, PRs 163 / 170 / 201; far homes and graphics memory by
+  protection; shared DXIL in `real`, derived pipelines' hashes, the per-1000 timing line; `XCL_TRACE_WINDOW`.
+- **Live on this host** (2026-11-24, bottle runs of up to 275 s, network off, `XCL_BACKGROUND=1`, input through
+  `XCL_REMOTE_INPUT`; the translation cache seeded from the old base's):
+  - First frame at 18 – 35 s, the sign-in bar ("ACCOUNT PICKER (Y) / SCREEN NARRATION (X) / PLAYER1 (A)") at
+    100 – 150 s, then with A presses the intro video (flat green, as on the old base: its planes sample as zero),
+    NAVIGATION EXPERIENCE, UI TEXT SIZE, SUBTITLES, BRIGHTNESS, FINISH SETUP, LEGAL NOTICES and the page ROCKSTAR
+    GAMES LEGAL TERMS & POLICIES – every page with complete text (headings, body text, bold runs, button prompts).
+    The two boxes there were left unticked: accepting is the user's. Two runs went the whole way (4 and 5).
+  - 30 fps on every page with the machine otherwise idle (60 presents per 2 s; "3900 frames presented, 30.0 fps"),
+    10 – 24 fps in a run made while other copies of the game ran. With a load average of 50 from other work a run
+    reaches its first frame after ~175 s instead of ~30 s: check `uptime` before reading a frame rate.
+  - Memory: the title queues 57 800 pipelines and XCL builds what is used – "compiling shaders: 0 running, 6 done,
+    57805 pipelines queued" at the terms page; the DXC memory gate held nothing back in any run. `XCL_ACTIVITY`
+    there: arenas 3 436 MB in use (3 504 MB made), sparse pools 1 152 MB, video memory 188 – 444 MB local; the
+    system had 62 – 66 % of its 64 GB free. (The old base queued the same pipelines for compilation: its logs show
+    the gate holding compiles back with ~6 GB of physical memory available in the menus, and ~38 GB in the process
+    after the terms page.) Wine reports no commit ("0 MB committed"), and `footprint` of the process says 77 MB:
+    neither measures it – use the system's free memory.
+  - With a profile in which the terms are accepted (gamesave/, pls/ copied into the data folder) the title goes
+    from the sign-in A and the video A straight to loading. In the 20 s of it seen: 900 title textures / 1.0 GB in
+    unwatched memory (2 000 registered in all, the trace's limit), presents falling from 30 to 3.5 a second.
+  - Unit tests of the touched modules under Wine in the same bottle: 111 passed (isa, insn, device_x,
+    title_textures, vram, tiling, sparse, kernelx, eh, dxc / pso caches, queue layout, xgameruntime api, lazy, uma).
+- **The network block** (a hard requirement here: the title's crash reporter – Breakpad's `http_upload.cc` in the
+  exe – posts a minidump to submit.backtrace.io on every crash). Off is the default: only `XCL_NETWORK=1` turns
+  the network on. Statically, from the import tables: the exe, XCurl.dll and libHttpClient.GDK.dll import
+  WinHTTP by name (`WinHttpSendRequest` among 15 functions) and nothing else of the network but the exe's ws2_32
+  by ordinal (connect 4, sendto 20, gethostbyname 52, bind 2, … ) and `getaddrinfo`; no module imports wininet,
+  mswsock or another network DLL, and the exe has no string of one to load by name. With the block on
+  `WinHttpSendRequest`, the proxy lookups, `connect` / `sendto` / `WSAConnect` / `WSASendTo` (loopback excepted),
+  the name lookups (local names excepted) and `bind` (bound to loopback) are XCL's; the rest of winhttp / ws2_32
+  (handles, options, socket calls that send nothing without a connection) is the host's. Hardened on this branch:
+  a GetProcAddress **by ordinal** on the real ws2_32 handle reached the host's connect (overrides were taken by
+  name only); wsock32.dll goes the way of ws2_32.dll; wininet, mswsock, websocket, urlmon, msquic, httpapi,
+  webservices, winhttpcom are stubs that fail and offer nothing to GetProcAddress; a unit test holds the default
+  and each of these ways in (`netoff::tests::the_default_is_no_network_for_every_way_in`). Dynamically
+  (`XCL_CRASH_AT=175`, a deliberate access violation): the reporter wrote its dump, built the request (URL
+  submit.backtrace.io, payload 693 245 bytes) and the log has "XCL_NETWORK=0: WinHttpSendRequest fails (no
+  network)" followed by its own "WinHttpSendRequest error: 12007" – the failure is XCL's function, which never
+  calls the host's, so the `0.0.0.0 submit.backtrace.io` line in this machine's hosts file had no part in it; no
+  "HTTP Return code" line in any of the 12 runs. Upstream's report that `XCL_NETWORK=0` did not stop an upload
+  (#305, host winhttp in the crash thread's stack) is not reproduced by this title's import tables – every
+  `WinHttpSendRequest` import is by name and routed; what it would take is a lookup this block did not cover
+  (the ordinal path fixed here is one), a user alias of winhttp.dll to `@system`, or the block not being on.
+- **Not tried live:** the switches forced the other way (`XCL_VRAM_ARENAS=0`, `XCL_RECT_LIST_GS=1`,
+  `XCL_COHERENT_HEAPS=1`, `XCL_LAZY_PAGES=1`) – their defaults on a Mac rest on the old base's findings (masked
+  stores into write-watched memory) and on caution (Metal's assertions), not on a failed run of this tree.
+- **Open, in order:** (1) loading after the terms page: within ~10 s of the video's end presents fall from 30 to
+  1.5 a second and then stop (two runs, 20 – 25 s of it each before the run's limit); a thread dump there has the
+  title's render thread inside the host's D3D12 and its main thread in title code, 119 of 127 threads waiting.
+  Not separated yet: first-use pipeline builds on the render thread (57 800 queued, a handful built), the content
+  compare of ~900 young textures a submit (`pick`), and DirectStorage: from the first A press on, requests with
+  options 0x200001 (zlib, destination a physical page array, 64 KiB each, from `data\ttdb\props\*.ttpf` and
+  `peds_loose.ttpf`) fail with 0x89240009 – 44 of 896 in one 2 s window – i.e. `kernelx::write_physical_pages`
+  found no place for a page; the log now names the page as it was at the request ("could not be written to its
+  … page(s) – the first: …"). Whether that is this host's doing (pages are committed when mapped here,
+  `XCL_LAZY_PAGES`) or upstream's too is not known. Then the growth of placed textures upstream reports as #248
+  (video memory is system memory here). (2) The title's second 24 GB reservation of 64 KiB pages (PAGE_NOACCESS |
+  PAGE_GRAPHICS_NOACCESS: a GPU-only view of the first, GPU address = CPU address + 0x6_0000_0000; upstream PR #283,
+  lane-video 96e3db6) is not paired here either: `kernelx::VirtualAlloc` gives it a sparse window's address space
+  if there is room, else plain memory, and the unified-memory shadow covers the committed window only – resources
+  placed there read zeros (the green intro video). (3) `XCL_FRAME_DUMP` still hangs at a dump now and then (frame
+  470 in one run here: the title stops presenting and `xcl-activity` stops logging) – use window captures.
+  (4) Upstream's coherent-window hint (`cache/uma_coherent.txt`, 12 fps in menus on a first run there) does not
+  apply while `XCL_COHERENT_HEAPS` is off: the window is 512 MB on every run. (5) The stencil plane.
+- **As pull requests upstream** (Mac-only code behind a host check, the Windows path unchanged by construction):
+  the mingw cross-build needs no change of code (this tree builds for x86_64-pc-windows-gnu as upstream's does).
+  Behind a host check already (`NATIVE_HOST_MEMORY` / `util::mac_host` / an API's E_NOTIMPL), one PR each:
+  `readable()` by IsBadReadPtr; `class_for`'s guard-all-slots and tail (the 16 prefix words are copied on every
+  host: gate that too or argue it); DXIL stand-ins; the unified-memory shadow (taken only when
+  OpenExistingHeapFromAddress answers E_NOTIMPL); depth-only formats; the four switches' defaults; the title
+  address before the host's GetGPUVirtualAddress. Shared path, so with a Windows regression run: the network
+  block's hardening (wanted upstream as it is; the default-off flip is local policy), 16 MiB title stacks, the
+  instruction handler (`isa`: on a PC CPU with ADX / RDSEED it never fires for those, but its INSERTQ / CLZERO
+  redirection would also act on Intel – gate it on a translated host or offer it as the faster path), the
+  watchdog skip, the content compare of unwatched title textures and `detile_level`, physical pages in runs /
+  `page_committed` / `live_zero_runs`, the gap-audit fixes, the per-compiler DXC heap (Wine only by default) and
+  known translations, and the opt-in diagnostics (`XCL_BACKGROUND`, `XCL_REMOTE_INPUT`, `XCL_DUMP_THREADS_AT`,
+  `XCL_CRASH_AT`, the DirectStorage and depth-view traces).
