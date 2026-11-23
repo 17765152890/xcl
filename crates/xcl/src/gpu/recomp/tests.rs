@@ -1676,6 +1676,11 @@ fn draw_vsi() -> super::VsInterface {
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the
 /// form of `upper_lanes`).
 fn draw_console(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]]) -> Vec<[f32; 4]> {
+    draw_console_as(vs, ps, tris_px, true)
+}
+
+/// `draw_console` with the programs translated as wave64 or wave32 programs.
+fn draw_console_as(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]], wave64: bool) -> Vec<[f32; 4]> {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
     let pass_vs = prog(&[
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
@@ -1697,7 +1702,7 @@ fn draw_console(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]]) -> V
         ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
     ]);
     let compile = |code: &[u8], mode: Mode, profile: &str| {
-        let t = translate(code, &runner::options(mode)).unwrap();
+        let t = translate(code, &Options { wave64, ..runner::options(mode) }).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
     };
@@ -1731,44 +1736,62 @@ fn spill_slots(slot: fn(u32) -> u32) -> Vec<u8> {
     code
 }
 
-/// The whole-wave reduction of the retail pixel shaders (`upper_lanes`), run as a wave64 PS:
-/// identity into the lanes outside the mask, DPP8 xor 1 / 2 / 4, row_mirror, the other row
-/// through `v_permlanex16`, `v_readlane` 32 for the upper half's result, `v_readlane` 0 for
-/// the total – as min (identity -1, as in the pack) and as a sum (identity 0: wrong if lane
-/// 32 is read as anything but the identity, e.g. as lane 0, where a 32-lane GPU's wave read
-/// wraps). Over the odd pixels of each wave; also the waterfall read of the pack
-/// (`v_readlane` of the lane `s_ff1` picks from mask & EXEC). The waves are found from the
-/// pixels: each exports its wave's `v_readfirstlane` of the pixel number and its lane
-/// (`v_mbcnt`), and the CPU computes what a console wave of those lanes gives.
+/// The whole-wave reduction of the retail pixel shaders as the console's compiler emits it
+/// (`reductions`): EXEC saved in s[30:31]; `op` over vX in the lanes of the saved EXEC – and of
+/// s[and_with:+1], given – with `identity` elsewhere (v_cndmask), three DPP8 steps (the other
+/// lane of the pair, a lane of the other pair, of the other quad: the pack's selects),
+/// row_mirror, the other row through `v_permlanex16` (v7), `v_readlane` 32 for the upper
+/// half's (s[half]), `v_readlane` 0 for the wave's (s[total]); v6 the steps' register.
+fn whole_wave_reduction(op: &str, identity: u64, x: u64, and_with: Option<u64>, half: u64, total: u64) -> Vec<u8> {
+    whole_wave_reduction_as(true, op, identity, x, and_with, half, total)
+}
+
+/// `whole_wave_reduction` in a wave64 program, or in a wave32 one: the 32-bit forms, no
+/// upper half (s30 the saved EXEC, s[and_with] the mask, `half` unused).
+fn whole_wave_reduction_as(wave64: bool, op: &str, identity: u64, x: u64, and_with: Option<u64>, half: u64, total: u64) -> Vec<u8> {
+    let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+    let mut c = vec![ins(w("S_OR_SAVEEXEC_B64", "S_OR_SAVEEXEC_B32"), "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None)];
+    if let Some(s) = and_with {
+        c.push(ins(w("S_AND_B64", "S_AND_B32"), "ENC_SOP2", &[("SDST", 10), ("SSRC0", s), ("SSRC1", 30)], None));
+    }
+    let mask = if and_with.is_some() { 10 } else { 30 };
+    c.push(ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + x), ("SRC2", mask)], None));
+    let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
+    for sel in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 2, 0, 0, 6, 6, 4, 4], [4, 4, 4, 4, 0, 0, 0, 0]] {
+        let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
+        f.extend(names.iter().copied().zip(sel));
+        c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
+    }
+    c.extend([
+        ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
+    ]);
+    if wave64 {
+        c.push(ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", half), ("SRC0", V + 6), ("SRC1", 128 + 32)], None));
+        c.push(ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", half), ("VSRC1", 6)], None));
+    }
+    c.push(ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", total), ("SRC0", V + 6), ("SRC1", 128)], None));
+    c.push(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None));
+    c.concat()
+}
+
+/// The whole-wave reduction of the retail pixel shaders (`whole_wave_reduction`), run as a
+/// wave64 PS in full waves – as min (identity -1, as in the pack: replaced with wave
+/// operations, `reductions`) and as a sum (identity 0: its steps stay, and lane 32 is read as
+/// the identity in a 32-lane wave, `upper_lanes`; wrong if it were read as anything else, e.g.
+/// as lane 0, where a 32-lane GPU's wave read wraps). Over the odd pixels of each wave; also
+/// the waterfall read of the pack (`v_readlane` of the lane `s_ff1` picks from mask & EXEC).
+/// The waves are found from the pixels: each exports its wave's `v_readfirstlane` of the pixel
+/// number and its lane (`v_mbcnt`), and the CPU computes what a console wave of those lanes
+/// gives.
 #[test]
 fn gpu_wave64_ps_whole_wave_reductions() {
     use std::collections::{BTreeMap, BTreeSet};
     if !gpu_ready() {
         return;
     }
-    let reduce = |op: &str, identity: u64, out: u64| -> Vec<u8> {
-        let mut c = vec![
-            ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
-            ins("S_AND_B64", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 18), ("SSRC1", 30)], None),
-            ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + 13), ("SRC2", 10)], None),
-        ];
-        let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
-        for sel in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]] {
-            let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
-            f.extend(names.iter().copied().zip(sel));
-            c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
-        }
-        c.extend([
-            ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
-            ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
-            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
-            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 32)], None),
-            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", 10), ("VSRC1", 6)], None),
-            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", out), ("SRC0", V + 6), ("SRC1", 128)], None),
-            ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
-        ]);
-        c.concat()
-    };
+    let reduce = |op: &str, identity: u64, out: u64| whole_wave_reduction(op, identity, 13, Some(18), 10, out);
     let code = program_of(&[
         // v12 = pixel number y·16 + x, v13 = v12 + 1, s[18:19] = the odd pixels
         ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
@@ -1899,6 +1922,227 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
         }
         if hi {
             assert_eq!(&p[1..], &want[1..], "pixel {i}: slots 32..47, lane 32");
+        }
+    }
+}
+
+/// The three reductions of the pack (`reductions`): instruction, identity operand code, op.
+const WAVE_REDUCTIONS: [(&str, u64, super::reductions::Op); 3] = [
+    ("V_MIN_U32", 193, super::reductions::Op::MinU32),
+    ("V_MAX_U32", 128, super::reductions::Op::MaxU32),
+    ("V_OR_B32", 128, super::reductions::Op::OrB32),
+];
+
+/// The translation of recognised reductions (`reductions`, `Em::reduction`) in every VS / PS
+/// form: wave operations instead of the steps (no lane read left), quad reads in a pixel
+/// shader only, the halves of a 64-lane wave for wave32 programs, the same HLSL whether or not
+/// the GPU has 64-lane waves (`split_wave64`); it compiles (DXC, where there is one).
+#[test]
+fn whole_wave_reductions_translate_to_wave_operations() {
+    for wave64 in [true, false] {
+        for pixel in [true, false] {
+            let mut parts: Vec<Vec<u8>> = WAVE_REDUCTIONS.iter().map(|(op, id, _)| whole_wave_reduction_as(wave64, op, *id, 13, Some(18), 40, 41)).collect();
+            let (mode, profile) = if pixel {
+                parts.push(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 7), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+                (Mode::Pixel(draw_psi()), "ps_6_6")
+            } else {
+                parts.push(ins("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 7), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None));
+                parts.push(ins("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 7), ("VSRC2", 6), ("VSRC3", 7)], None));
+                (Mode::Vertex(draw_vsi()), "vs_6_6")
+            };
+            let code = program_of(&parts);
+            let what = format!("wave64 {wave64}, {profile}");
+            let native = translate(&code, &Options { mode: mode.clone(), wave64, ..Default::default() }).unwrap();
+            let split = translate(&code, &Options { mode, wave64, split_wave64: true, ..Default::default() }).unwrap();
+            assert!(native.complete(), "{what}: {:?}", native.unsupported_why);
+            let h = &native.hlsl;
+            assert_eq!(h, &split.hlsl, "{what}: one form at every wave size");
+            for op in ["min_u32", "max_u32", "or_b32"] {
+                assert_eq!(h.matches(&format!("xcl_wave_{op}(")).count(), 2, "{what}: the function and its call\n{h}");
+            }
+            assert!(!h.contains(" = rla("), "{what}: a lane read left\n{h}");
+            assert_eq!(h.contains("QuadReadLaneAt(x, 3u)"), pixel, "{what}: quad reads\n{h}");
+            assert_eq!(h.contains("select(xcl_half != 0u, "), !wave64, "{what}: the halves\n{h}");
+            if super::dxc::location().is_ok() {
+                super::dxc::compile(h, "main", profile, &[]).unwrap_or_else(|e| panic!("{what}: {e}\n{h}"));
+            }
+        }
+    }
+}
+
+/// Whole-wave reductions (`reductions`) in full and partial pixel waves, of wave64 and of wave32
+/// programs: the pack's min, max and or of pixel number + 1, over the odd pixels (`s_and` of
+/// the saved EXEC with the live pixels' mask, as in the pack) and over every lane of the wave's
+/// quads (the saved EXEC after `s_wqm`, helper lanes included), drawn as the whole target, a
+/// 3-quad triangle and a 55-pixel one. A pixel exports its console wave and lane and one of the
+/// results for each op – the wave's (sT), the upper half's (sH, wave64), what the steps leave in
+/// its lane (vA, vB) – which the CPU computes from the console wave's lanes, as on a console
+/// wave whose other lanes are not populated. Each step translated on its own (before,
+/// `XCL_NO_WAVE_REDUCTIONS=1`) reads the lanes the PC did not launch: 0 on NVIDIA, so the min
+/// of a partial wave was 0 – and the or over the quads' lanes of 3 quads missed helper pixels.
+#[test]
+fn gpu_ps_partial_wave_reductions() {
+    use std::collections::BTreeMap;
+    if !gpu_ready() {
+        return;
+    }
+    const RESULTS: [&str; 4] = ["sT", "sH", "vA", "vB"];
+    // `view`: which result a pixel exports (RESULTS)
+    let program = |wave64: bool, wqm: bool, view: usize| -> Vec<u8> {
+        let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+        let pixel = [
+            ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
+            ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+            ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None),
+        ];
+        // v12 = pixel number y·16 + x; the console wave: its first lane's pixel number (s62),
+        // the lane (v15)
+        let mut c = pixel.to_vec();
+        c.extend([
+            ins("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 62), ("SRC0", V + 12)], None),
+            ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", 128)], None),
+            ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", V + 15)], None),
+        ]);
+        if wqm {
+            // live pixels in s[16:17], then the whole quads: the helper lanes' pixel numbers too
+            c.push(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 16), ("SSRC0", 126)], None));
+            c.push(ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None));
+            c.extend(pixel.iter().cloned());
+        }
+        // v13 = pixel number + 1, s[18:19] = the odd pixels
+        c.extend([
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None),
+            ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 129), ("VSRC1", 12)], None),
+            ins("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 14)], None),
+            ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 18), ("SSRC0", 106)], None),
+        ]);
+        // op k: sH in s[40 + 2k], sT in s[41 + 2k], vA / vB copied to v[20 + 2k] / v[21 + 2k]
+        for (k, (op, id, _)) in WAVE_REDUCTIONS.iter().enumerate() {
+            let k = k as u64;
+            c.push(whole_wave_reduction_as(wave64, op, *id, 13, (!wqm).then_some(18), 40 + 2 * k, 41 + 2 * k));
+            c.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 20 + 2 * k), ("SRC0", V + 6)], None));
+            c.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 21 + 2 * k), ("SRC0", V + 7)], None));
+        }
+        if wqm {
+            c.push(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None));
+        }
+        for k in 0..3u64 {
+            let src = [41 + 2 * k, 40 + 2 * k, V + 20 + 2 * k, V + 21 + 2 * k][view];
+            c.push(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 30 + k), ("SRC0", src)], None));
+        }
+        c.extend([
+            ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 33), ("SRC0", 62), ("SRC1", 128 + 6), ("SRC2", V + 15)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 33), ("SRC0", V + 33)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 30), ("VSRC1", 31), ("VSRC2", 32), ("VSRC3", 33), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        program_of(&c)
+    };
+    let shapes: [(&str, [[f32; 2]; 3]); 3] = [
+        ("whole target", [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]]),
+        ("3 quads", [[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]),
+        ("55 pixels", [[0.0, 0.0], [11.0, 0.0], [0.0, 11.0]]),
+    ];
+    let mut wave_sizes = BTreeMap::new();
+    // wave size, shape, mask, op, result → (pixels wrong, the first: pixel, lane, got, want)
+    let mut wrong: BTreeMap<String, (usize, (u32, u32, u32, u32))> = BTreeMap::new();
+    for wave64 in [true, false] {
+        let size = if wave64 { "wave64" } else { "wave32" };
+        for (shape, tri) in &shapes {
+            for wqm in [false, true] {
+                let mask = if wqm { "the quads' lanes" } else { "the odd pixels" };
+                for (view, what) in RESULTS.iter().enumerate() {
+                    if view == 1 && !wave64 {
+                        continue;
+                    }
+                    let px = draw_console_as(None, Some(&program(wave64, wqm, view)), tri, wave64);
+                    // by console wave (its first lane's pixel number): (pixel number, lane, results)
+                    let mut waves: BTreeMap<u32, Vec<(u32, u32, [f32; 4])>> = BTreeMap::new();
+                    for (id, p) in px.iter().enumerate().filter(|(_, p)| p[3] >= 0.0) {
+                        let kl = p[3] as u32;
+                        waves.entry(kl >> 6).or_default().push((id as u32, kl & 63, *p));
+                    }
+                    assert!(!waves.is_empty(), "{size}, {shape}: nothing drawn");
+                    if view == 0 {
+                        wave_sizes.insert((size, *shape, wqm), waves.values().map(|w| w.len()).collect::<Vec<_>>());
+                    }
+                    for (first, w) in &waves {
+                        // the lanes in the mask: (row = lane / 16, value)
+                        let lanes: Vec<(u32, u32)> = if wqm {
+                            // every lane of a quad with a live pixel; a quad keeps to one row
+                            let quads: BTreeMap<(u32, u32), u32> = w.iter().map(|(id, lane, _)| ((id % 16 / 2, id / 16 / 2), lane >> 4)).collect();
+                            quads.iter().flat_map(|(&(qx, qy), &row)| [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| (row, (2 * qy + dy) * 16 + 2 * qx + dx + 1))).collect()
+                        } else {
+                            w.iter().filter(|x| x.0 % 2 == 1).map(|(id, lane, _)| (lane >> 4, id + 1)).collect()
+                        };
+                        for (o, (_, _, op)) in WAVE_REDUCTIONS.iter().enumerate() {
+                            let rows: [u32; 4] = std::array::from_fn(|k| lanes.iter().filter(|l| l.0 == k as u32).fold(op.identity(), |a, l| op.apply(a, l.1)));
+                            let half = op.apply(rows[2], rows[3]);
+                            let wave = op.apply(op.apply(rows[0], rows[1]), half);
+                            for (id, lane, p) in w {
+                                let want = match view {
+                                    0 => wave,
+                                    1 => half,
+                                    2 if *lane < 32 => wave,
+                                    2 => half,
+                                    _ => rows[((lane >> 4) ^ 1) as usize],
+                                };
+                                // u32 → f32 → u32: exact below 2^24; the identity -1 saturates back
+                                let got = p[o] as u32;
+                                if got != want {
+                                    let k = format!("{size}, {shape}, over {mask}: {} {what} (wave of pixel {first})", op.name());
+                                    wrong.entry(k).or_insert((0, (*id, *lane, got, want))).0 += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("pixels per console wave: {wave_sizes:?}");
+    for (k, (n, (id, lane, got, want))) in &wrong {
+        println!("{k}: {n} pixels wrong, e.g. pixel {id} (lane {lane}): {got:#x}, want {want:#x}");
+    }
+    assert!(wrong.is_empty(), "{} results wrong", wrong.len());
+}
+
+/// Whole-wave reductions (`reductions`) in a vertex wave of three lanes, of a wave64 and of a
+/// wave32 program: min, max and or of vertex id + 1 over the saved EXEC, exported as param0 with
+/// what v_permlanex16 leaves for the min (vB: the other row's – no lane there, so the
+/// identity). The same at every vertex, so the interpolated value is exact. Before
+/// (`XCL_NO_WAVE_REDUCTIONS=1`) the min and vB read lanes the PC did not launch: 0 on NVIDIA.
+#[test]
+fn gpu_vs_partial_wave_reductions() {
+    if !gpu_ready() {
+        return;
+    }
+    for wave64 in [true, false] {
+        // v13 = vertex id + 1 (the id is in v0), then the position and the reductions
+        let mut c = vec![
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 0)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ];
+        for (k, (op, id, _)) in WAVE_REDUCTIONS.iter().enumerate() {
+            c.push(whole_wave_reduction_as(wave64, op, *id, 13, None, 40 + 2 * k as u64, 41 + 2 * k as u64));
+            if k == 0 {
+                c.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 7)], None));
+            }
+        }
+        c.extend([
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 41)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 43)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 45)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 21)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ]);
+        let px = draw_console_as(Some(&program_of(&c)), None, &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], wave64);
+        println!("wave64 {wave64}: {:?}", px[0]);
+        for (i, p) in px.iter().enumerate() {
+            assert_eq!(p.map(|x| x as u32), [1, 3, 3, u32::MAX], "wave64 {wave64}, pixel {i}: min, max, or of vertex id + 1, vB of the min");
         }
     }
 }
