@@ -713,7 +713,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if args.iter().any(|a| a == "--precompile") {
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), t0);
+        let gentle = args.iter().any(|a| a == "--gentle");
+        // a handful of DXC workers, before the pool reads the thread count
+        if gentle && std::env::var_os("XCL_DXC_THREADS").is_none() {
+            std::env::set_var("XCL_DXC_THREADS", "4");
+        }
+        let pause = opt("--pause").unwrap_or(0);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), gentle, pause, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -731,23 +737,34 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// no split form, so a title asked for other HLSL and compiled everything again. Still
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0: std::time::Instant) -> i32 {
+/// `--gentle` compiles with four threads at below-normal priority and builds two compute
+/// pipelines at a time on its own device, so the driver cache fills without taking the machine.
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, gentle: bool, pause_ms: usize, t0: std::time::Instant) -> i32 {
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
-    let threads = recomp::dxc::compile_threads() + 2;
+    let threads = if gentle { 4 } else { recomp::dxc::compile_threads() + 2 };
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
+    if gentle {
+        bake_priority();
+    }
+    let pipes = if gentle { Pipelines::new(2).map_err(|e| eprintln!("xcl shaders: pipelines stay for the game ({e})")).ok() } else { None };
     println!(
-        "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
+        "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
-        recomp::dxc::compile_threads(),
-        if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
+        if gentle { 4 } else { recomp::dxc::compile_threads() },
+        if split { ", split wave64 for a GPU with 32-lane waves" } else { "" },
+        if gentle { ", two pipelines at a time" } else { "" }
     );
     std::thread::scope(|s| {
         for _ in 0..threads {
-            s.spawn(|| loop {
+            s.spawn(|| {
+                if gentle {
+                    bake_priority();
+                }
+                loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
@@ -755,6 +772,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
+                let mut busy = false;
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -778,23 +796,49 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                         }
                         for (profile, src) in &jobs {
                             match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
-                                Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
-                                Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                                Ok((dxil, hit)) => {
+                                    if hit {
+                                        cached.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        compiled.fetch_add(1, Ordering::Relaxed);
+                                        busy = true;
+                                    }
+                                    if *profile == "cs_6_6" {
+                                        if let Some(p) = &pipes {
+                                            if !pipeline_baked(&dxil) && p.alive() && !dxil.is_empty() {
+                                                busy = true;
+                                                p.make_dxil(&dxil);
+                                                let _ = std::fs::write(pipeline_mark(&dxil), b"");
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(e) => {
                                     let mut g = errors.lock().unwrap();
                                     if g.len() < 10 {
                                         g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or("")));
                                     }
-                                    failed.fetch_add(1, Ordering::Relaxed)
+                                    failed.fetch_add(1, Ordering::Relaxed);
                                 }
                             };
                         }
                     }
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 200 == 0 {
-                    eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                if gentle && pause_ms > 0 && busy {
+                    std::thread::sleep(std::time::Duration::from_millis(pause_ms as u64));
                 }
+                if (gentle && d % 25 == 0) || (!gentle && d % 200 == 0) {
+                    let pipes_n = pipes.as_ref().map(|p| p.counts()).unwrap_or((0, 0));
+                    eprintln!(
+                        "  {d}/{n} shaders, {} new, {} cached, {} pipelines ({:.0} s)",
+                        compiled.load(Ordering::Relaxed),
+                        cached.load(Ordering::Relaxed),
+                        pipes_n.0,
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+            }
             });
         }
     });
@@ -810,6 +854,150 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
         println!("  {e}");
     }
     0
+}
+
+fn pipeline_mark(dxil: &[u8]) -> std::path::PathBuf {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in dxil {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    recomp::dxc::cache_dir().join(format!("baked-{h:016x}"))
+}
+
+fn pipeline_baked(dxil: &[u8]) -> bool {
+    dxil.is_empty() || pipeline_mark(dxil).is_file()
+}
+
+fn bake_priority() {
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority, BELOW_NORMAL_PRIORITY_CLASS, THREAD_PRIORITY_BELOW_NORMAL};
+    unsafe {
+        let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+/// Compute pipelines on a device that is not the game's, `most` of them at once. The driver
+/// keeps each one in its own cache. A removed device stops further pipelines; shaders still compile.
+struct Pipelines {
+    dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    made: AtomicUsize,
+    refused: AtomicUsize,
+    inflight: AtomicUsize,
+    most: usize,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+unsafe impl Sync for Pipelines {}
+
+impl Pipelines {
+    fn new(most: usize) -> Result<Self, String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::CreateDXGIFactory2;
+        use windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS;
+        unsafe {
+            let factory = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+            Ok(Pipelines {
+                dev,
+                signatures: Mutex::new(Default::default()),
+                made: AtomicUsize::new(0),
+                refused: AtomicUsize::new(0),
+                inflight: AtomicUsize::new(0),
+                most: most.max(1),
+                dead: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    fn alive(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed)
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed))
+    }
+
+    fn make(&self, c: &recomp::pso::Compiled) {
+        if !self.alive() {
+            return;
+        }
+        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let rs = {
+            let mut g = self.signatures.lock().unwrap();
+            match g.get(&key) {
+                Some(rs) => rs.clone(),
+                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &c.samplers) {
+                    Ok(rs) => {
+                        g.insert(key, rs.clone());
+                        rs
+                    }
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                },
+            }
+        };
+        self.finish(rs, &c.dxil);
+    }
+
+    fn make_dxil(&self, dxil: &[u8]) {
+        if !self.alive() || dxil.is_empty() {
+            return;
+        }
+        let key = Vec::new();
+        let rs = {
+            let mut g = self.signatures.lock().unwrap();
+            if let Some(rs) = g.get(&key) {
+                rs.clone()
+            } else {
+                match recomp::pso::abi_root_signature(&self.dev, true) {
+                    Ok(rs) => {
+                        g.insert(key, rs.clone());
+                        rs
+                    }
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        };
+        self.finish(rs, dxil);
+    }
+
+    fn finish(&self, rs: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, dxil: &[u8]) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        while self.inflight.load(Ordering::Relaxed) >= self.most {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            ..Default::default()
+        };
+        let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+        match r {
+            Ok(_) => {
+                self.made.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                let code = e.code().0 as u32;
+                if code & 0xFFFF0000 == 0x887A0000 {
+                    self.dead.store(true, Ordering::Relaxed);
+                    eprintln!("xcl shaders: pipeline compile removed the device ({code:#x}); shaders continue, pipelines stop");
+                }
+            }
+        }
+    }
 }
 
 /// Compile the kept HLSL samples with DXC on all cores: (ok, failures with the first error line).

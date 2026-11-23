@@ -34,6 +34,10 @@ Usage:
       for the recompiler). RPF9 packages are scanned for shader records.
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
+      --precompile: translate every program into the DXIL cache (resumable).
+      --precompile --gentle: the same, plus each compute pipeline, a few at a time
+      (below-normal priority, four compile threads, two driver compiles).
+      --pause MS inserts a pause after a compile (default 0). Cached programs are skipped.
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.

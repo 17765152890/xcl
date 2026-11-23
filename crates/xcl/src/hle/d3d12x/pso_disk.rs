@@ -55,13 +55,7 @@ pub fn load(key: u64) -> Option<std::sync::Arc<Vec<u8>>> {
     Some(blob)
 }
 
-/// Write `blob` so the next launch can reuse this driver's compile.
-pub fn store(key: u64, blob: &[u8]) {
-    if blob.is_empty() || blob.len() > 32 << 20 {
-        return;
-    }
-    let owned = std::sync::Arc::new(blob.to_vec());
-    memory().lock().unwrap().insert(key, owned);
+fn write_file(key: u64, blob: &[u8]) {
     let dir = dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -75,10 +69,33 @@ pub fn store(key: u64, blob: &[u8]) {
     body.extend_from_slice(&VERSION.to_le_bytes());
     body.extend_from_slice(blob);
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    if std::fs::write(&tmp, &body).is_ok() {
-        if std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn writer() -> &'static std::sync::mpsc::SyncSender<(u64, std::sync::Arc<Vec<u8>>)> {
+    static W: OnceLock<std::sync::mpsc::SyncSender<(u64, std::sync::Arc<Vec<u8>>)>> = OnceLock::new();
+    W.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, std::sync::Arc<Vec<u8>>)>(64);
+        let _ = std::thread::Builder::new().name("xcl-pso-cache".into()).spawn(move || {
+            while let Ok((key, blob)) = rx.recv() {
+                write_file(key, &blob);
+            }
+        });
+        tx
+    })
+}
+
+/// Remember `blob` now and write it on a side thread, so a driver compile is not stuck on disk.
+pub fn store(key: u64, blob: &[u8]) {
+    if blob.is_empty() || blob.len() > 32 << 20 {
+        return;
+    }
+    let owned = std::sync::Arc::new(blob.to_vec());
+    memory().lock().unwrap().insert(key, owned.clone());
+    if let Err(std::sync::mpsc::TrySendError::Full((_, blob))) = writer().try_send((key, owned)) {
+        write_file(key, &blob);
     }
 }
 

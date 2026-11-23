@@ -1779,6 +1779,28 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     super::present::note_use(res as usize, super::present::USE_UAV);
+    // A depth buffer the console also marks as a UAV has no UAV flag on the PC. A view of
+    // that resource removes the device; a null view does not. Typed formats are not rewritten.
+    let null_view;
+    let (res, counter, desc) = match ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()) {
+        Some(rd) if rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_info!(
+                    "D3D12.X: UAV of a resource without unordered access ({}x{}, format {}, flags {:#x}) – a null view",
+                    rd.Width, rd.Height, rd.Format.0, rd.Flags.0
+                );
+            }
+            let mut d = desc.as_ref().copied().unwrap_or(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                ViewDimension: D3D12_UAV_DIMENSION(resource_dim_to_view(&rd)),
+                ..Default::default()
+            });
+            d.Format = dxgi(42);
+            null_view = d;
+            (std::ptr::null_mut(), std::ptr::null_mut(), &null_view as *const D3D12_UNORDERED_ACCESS_VIEW_DESC)
+        }
+        _ => (res, counter, desc),
+    };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     if super::present::trace_frame() {
         let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
@@ -2757,8 +2779,19 @@ fn note_driver_cache(saved: bool) {
     }
 }
 
+static PSO_DEVICE_REMOVED: AtomicBool = AtomicBool::new(false);
+
+fn device_is_removed(_this: *mut c_void) -> bool {
+    PSO_DEVICE_REMOVED.load(Ordering::Acquire)
+}
+
+fn note_device_removed() {
+    PSO_DEVICE_REMOVED.store(true, Ordering::Release);
+}
+
 /// Create `desc` (a graphics or compute pipeline desc). A blob saved for `key` is tried
-/// first; the driver's own blob is written when this compile is new.
+/// first; the driver's own blob is written when this compile is new. A cache hit does not
+/// take a driver-compile slot. A miss does, so only a few new pipelines compile at once.
 unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, graphics: bool, key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let loaded = super::pso_disk::load(key);
     let apply = |blob: &[u8]| {
@@ -2771,16 +2804,54 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
     };
     if let Some(blob) = &loaded {
         apply(blob);
-    }
-    let mut hr = finish_pso(this, f, desc, riid, ppv);
-    if hr < 0 && loaded.is_some() {
+        let hr = finish_pso(this, f, desc, riid, ppv);
+        if hr >= 0 {
+            note_driver_cache(false);
+            return hr;
+        }
+        if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
+            note_device_removed();
+            return hr;
+        }
         super::pso_disk::forget(key);
         apply(&[]);
-        hr = finish_pso(this, f, desc, riid, ppv);
-    } else if hr >= 0 && loaded.is_some() {
-        note_driver_cache(false);
     }
-    if hr >= 0 && loaded.is_none() && !ppv.is_null() && !(*ppv).is_null() {
+    if device_is_removed(this) {
+        return 0x887A_0005u32 as HRESULT;
+    }
+    // A cache miss reaches the GPU compiler. Two of those compiles remove the device from
+    // inside the call (0x887A0001): one graphics pipeline, and the first new compute shader.
+    // Cached pipelines still load above. The title already holds a stand-in for a miss.
+    if key == 0x94a63ac3f96c98ac || !graphics {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !graphics {
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("D3D12.X: new compute pipelines stay stand-ins; compiling them removes the device");
+            }
+        } else {
+            crate::xlog_warn!("D3D12.X: pipeline {key:016x} is not compiled: it removes the device");
+        }
+        return E_INVALIDARG;
+    }
+    let _guard = super::pso_async::uncached_compile();
+    if graphics {
+        let g = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+        let n = (g.NumRenderTargets as usize).min(8);
+        crate::xlog_info!(
+            "D3D12.X: driver compile {key:016x} RTs {} {:?} DSV {} samples {}",
+            g.NumRenderTargets,
+            &g.RTVFormats[..n].iter().map(|f| f.0).collect::<Vec<_>>(),
+            g.DSVFormat.0,
+            g.SampleDesc.Count
+        );
+    } else {
+        crate::xlog_info!("D3D12.X: driver compile {key:016x} compute");
+    }
+    let hr = finish_pso(this, f, desc, riid, ppv);
+    if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
+        note_device_removed();
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         if let Some(blob) = driver_blob(*ppv) {
             super::pso_disk::store(key, &blob);
             note_driver_cache(true);
@@ -2909,6 +2980,12 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if !is_console(cs) {
         return None;
     }
+    // Driver compile of a pipeline is the slow part, cached DXIL or not. The title gets a
+    // stand-in; a worker does this same call without `cached_only`.
+    if crate::gpu::recomp::dxc::in_cached_only() {
+        crate::gpu::recomp::dxc::defer_to_worker();
+        return None;
+    }
     let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
         Ok(b) => b,
         Err(e) => {
@@ -2952,6 +3029,12 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     }
     if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
         note_translation_error("PSO with HS/DS – not supported yet".into());
+        return None;
+    }
+    // Driver compile of a pipeline is the slow part, cached DXIL or not. The title gets a
+    // stand-in; a worker does this same call without `cached_only`.
+    if crate::gpu::recomp::dxc::in_cached_only() {
+        crate::gpu::recomp::dxc::defer_to_worker();
         return None;
     }
     if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
@@ -3003,10 +3086,12 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let hr = finish_pso_cached(this, f, &mut copy as *mut _ as *mut c_void, true, key, riid, ppv);
     if hr < 0 {
         note_translation_error(format!(
-            "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
+            "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets {:?}, DSV format {}, samples {}, HS {}, GS {})",
             copy.PrimitiveTopologyType.0,
             copy.NumRenderTargets,
+            &copy.RTVFormats[..(copy.NumRenderTargets as usize).min(8)].iter().map(|f| f.0).collect::<Vec<_>>(),
             copy.DSVFormat.0,
+            copy.SampleDesc.Count,
             !copy.HS.pShaderBytecode.is_null(),
             !copy.GS.pShaderBytecode.is_null()
         ));
@@ -3194,6 +3279,9 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.StreamOutput = std::mem::zeroed();
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // the title's formats (A8, Xbox depth) are not the PC's; a stand-in built with them
+    // removes the device before the real pipeline is compiled
+    pc_pso_formats(&mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
@@ -3513,6 +3601,10 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         note_translation_error("mesh pipeline with AS – not supported yet".into());
         return Some(E_INVALIDARG);
     }
+    if crate::gpu::recomp::dxc::in_cached_only() {
+        crate::gpu::recomp::dxc::defer_to_worker();
+        return None;
+    }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, wave32_only(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
@@ -3668,9 +3760,56 @@ fn dxgi(format: u32) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
 }
 
 fn pc_pso_formats(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
-    g.DSVFormat = dxgi(super::device_x::pc_dsv_format(g.DSVFormat.0 as u32));
-    for f in &mut g.RTVFormats {
-        *f = dxgi(super::device_x::pc_color_format(f.0 as u32));
+    // A typeless format, or an Xbox-only one, in a pipeline is an invalid call. On this GPU
+    // that removes the device (0x887A0001) instead of returning E_INVALIDARG, and every later
+    // create fails the same way. Only illegal formats change, so a pipeline the driver already
+    // accepted keeps its cache key.
+    g.DSVFormat = dxgi(typed_dsv(super::device_x::pc_dsv_format(g.DSVFormat.0 as u32)));
+    let n = (g.NumRenderTargets as usize).min(g.RTVFormats.len());
+    for f in &mut g.RTVFormats[..n] {
+        *f = dxgi(typed_rtv(super::device_x::pc_color_format(f.0 as u32)));
+    }
+    if g.SampleDesc.Count == 0 {
+        g.SampleDesc.Count = 1;
+        g.SampleDesc.Quality = 0;
+    }
+}
+
+/// A render-target format the PC accepts. Typeless and the Xbox depth family are not.
+fn typed_rtv(format: u32) -> u32 {
+    match format {
+        1 => 2,   // R32G32B32A32
+        5 => 6,   // R32G32B32
+        9 => 10,  // R16G16B16A16
+        15 => 16, // R32G32
+        23 => 24, // R10G10B10A2
+        27 => 28, // R8G8B8A8
+        33 => 35, // R16G16
+        39 => 40, // R32
+        44 | 118 | 119 | 120 => 28,
+        48 => 49, // R8G8
+        53 => 54, // R16
+        60 => 61, // R8
+        70 => 71, // BC1
+        73 => 74, // BC2
+        76 => 77, // BC3
+        79 => 80, // BC4
+        82 => 83, // BC5
+        95 => 96, // BC6H
+        98 => 99, // BC7
+        other => other,
+    }
+}
+
+/// A depth format the PC accepts. Anything else is no depth view, which the driver allows.
+fn typed_dsv(format: u32) -> u32 {
+    match format {
+        0 => 0,
+        19 | 20 => 20,             // D32_FLOAT_S8X24
+        39 | 41 => 41,             // D32_FLOAT
+        44 | 45 | 118 | 119 => 45, // D24_UNORM_S8
+        53 | 55 => 55,             // D16_UNORM
+        other => other,
     }
 }
 
@@ -3909,6 +4048,10 @@ unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, de
     let desc = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, 64) {
         std::ptr::copy_nonoverlapping(desc as *const u8, copy.as_mut_ptr(), 64);
         let format = u32::from_le_bytes(copy[..4].try_into().unwrap());
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_info!("D3D12.X: DSV format {format} of {res:p}");
+        }
         copy[..4].copy_from_slice(&super::device_x::pc_dsv_format(format).to_le_bytes());
         copy.as_ptr() as *const c_void
     } else {

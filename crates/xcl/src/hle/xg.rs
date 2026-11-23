@@ -155,8 +155,9 @@ impl Texture {
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
         }
-        // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
-        let planar = matches!(format, 19..=22 | 44..=47);
+        // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane.
+        // 118–120 are the Xbox D16+stencil family; the PC resource is D24+stencil, same planes.
+        let planar = matches!(format, 19..=22 | 44..=47 | 118..=120);
         let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
         let mode = match layout {
             1 => 0,
