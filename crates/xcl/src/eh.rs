@@ -247,6 +247,11 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
 
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    // VirtualQuery walks the 4 GiB coherent window to size it (~40 ms): a title's clzero loops
+    // into it ran at a frame or two a second
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
     found
