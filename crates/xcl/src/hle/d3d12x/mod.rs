@@ -54,6 +54,7 @@ fn exports_fns() -> Vec<(&'static str, usize)> {
         D3D12GetInterface,
         D3D10CreateBlob,
         D3D12XboxSetProcessDebugFlags,
+        D3D12ConfigureVirtualMemoryX,
     ]
 }
 
@@ -231,5 +232,27 @@ pub unsafe extern "system" fn D3D10CreateBlob(size: usize, out: *mut *mut c_void
 }
 
 pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRESULT {
+    S_OK
+}
+
+/// `D3D12ConfigureVirtualMemoryX`: a newer GDK export a title calls before its device, to
+/// set up how the console's D3D12 maps its memory (`MicrosoftGame.Config` title memory
+/// "Advanced"). Its signature is not documented anywhere XCL can see; the first title seen
+/// calling it (a 2026 Rockstar build) asserts on anything but S_OK, so it gets S_OK – XCL's
+/// title memory is configured by XCL – and its arguments are logged for the day they matter.
+pub unsafe extern "system" fn D3D12ConfigureVirtualMemoryX(a1: usize, a2: usize, a3: usize, a4: usize) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // a pointer argument: its first words (a description structure?)
+        let words = |p: usize| -> String {
+            if crate::gpu::shader::readable(p, 32) {
+                let w: Vec<u64> = (0..4).map(|k| (p as *const u64).add(k).read_unaligned()).collect();
+                format!(" -> {w:#x?}")
+            } else {
+                String::new()
+            }
+        };
+        crate::xlog_info!("D3D12ConfigureVirtualMemoryX({a1:#x}{}, {a2:#x}{}, {a3:#x}, {a4:#x}) -> S_OK (nothing to configure: XCL lays out the title's memory)", words(a1), words(a2));
+    });
     S_OK
 }
