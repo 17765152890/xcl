@@ -4212,7 +4212,7 @@ impl Em {
                             .find_map(|f| {
                                 let b = vs.input_vgpr(f.elem.register)?;
                                 let c = v.checked_sub(b).filter(|&c| c < 4)? as u32;
-                                (c >= f.first && c < f.first + f.count).then(|| format!("asuint(xi.{}[{}])", f.name, c - f.first))
+                                (f.mask & (1u8 << c) != 0).then(|| format!("asuint(xi.{}[{}])", f.name, c - f.first))
                             })
                             .unwrap_or_else(|| "0u".into())
                     };
@@ -4734,6 +4734,7 @@ struct VsInputField<'a> {
     name: String,
     first: u32,
     count: u32,
+    mask: u8,
 }
 
 /// The `XclIn` members of the VS inputs: an element alone in its register is `a{register}`,
@@ -4747,12 +4748,12 @@ fn vs_input_fields<'a>(inputs: &[&'a SigElement]) -> Vec<VsInputField<'a>> {
         .iter()
         .map(|&e| {
             if inputs.iter().filter(|o| o.register == e.register).count() < 2 {
-                return VsInputField { elem: e, name: format!("a{}", e.register), first: 0, count: 4 };
+                return VsInputField { elem: e, name: format!("a{}", e.register), first: 0, count: 4, mask: 0xF };
             }
             let mask = u32::from(e.mask & 0xF).max(1);
             let first = mask.trailing_zeros();
             let count = 32 - mask.leading_zeros() - first;
-            VsInputField { elem: e, name: format!("a{}_{first}", e.register), first, count }
+            VsInputField { elem: e, name: format!("a{}_{first}", e.register), first, count, mask: e.mask & 0xF }
         })
         .collect()
 }

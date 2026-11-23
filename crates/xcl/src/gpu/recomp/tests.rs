@@ -7240,3 +7240,45 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+// Synthetic GPU probe adapted from this PR's packed-input test.
+#[test]
+fn gpu_vs_interleaved_isg1_input_masks() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32_FLOAT};
+    let (vs_code, mut vsi) = packed_inputs_vs(0x2);
+    vsi.inputs[1].mask = 0x5;
+    vsi.inputs[1].rw_mask = 0x5;
+    let pass_ps = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 2)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 2)], None),
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 3)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 3)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let compile = |code: &[u8], mode: Mode, profile: &str| {
+        let t = translate(code, &runner::options(mode)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+    };
+    let vs = compile(&vs_code, Mode::Vertex(vsi), "vs_6_6");
+    let ps = compile(&pass_ps, Mode::Pixel(draw_psi()), "ps_6_6");
+    let (t0, t1) = ([0.25f32, -0.4, 0.75], [0.5f32]);
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], t0[0], t0[1], t0[2], t1[0]]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "TEXCOORD", index: 0, format: DXGI_FORMAT_R32G32B32_FLOAT, offset: 8 },
+        runner::VertexElement { semantic: "TEXCOORD", index: 1, format: DXGI_FORMAT_R32_FLOAT, offset: 20 },
+    ];
+    let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 16, [-1.0; 4]).unwrap();
+    let want = [t0[0], t1[0], t0[2], 0.0];
+    for (i, got) in px.iter().enumerate() {
+        assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6), "pixel ({},{}) = {got:?}, expected {want:?}", i % 16, i / 16);
+    }
+}
