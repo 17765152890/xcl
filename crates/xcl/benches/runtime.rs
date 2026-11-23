@@ -113,6 +113,7 @@ fn manifest_and_config_benches(c: &mut Criterion) {
     });
 
     let parsed_manifest = manifest::parse(MANIFEST);
+    group.throughput(Throughput::Elements(1));
     group.bench_function("resolve_defaults", |b| {
         b.iter_batched(
             Config::default,
@@ -129,6 +130,7 @@ fn manifest_and_config_benches(c: &mut Criterion) {
         ..Config::default()
     };
     resolved.resolve(Some(&parsed_manifest));
+    group.throughput(Throughput::Elements(1));
     group.bench_function("resolved_memory_queries", |b| {
         b.iter(|| {
             black_box(resolved.title_memory_budget_mb());
@@ -166,6 +168,9 @@ fn vfs_benches(c: &mut Criterion) {
             b.iter(|| vfs.classify_with(black_box(path), black_box(full)));
         });
     }
+    group.throughput(Throughput::Bytes(
+        cases.iter().map(|(_, path)| path.len() as u64).sum(),
+    ));
     group.bench_function("classify_mixed_batch", |b| {
         b.iter(|| {
             for (_, path) in black_box(&cases) {
@@ -174,6 +179,7 @@ fn vfs_benches(c: &mut Criterion) {
         });
     });
     for rel in ["", "data", r"data\textures\terrain.bin"] {
+        group.throughput(Throughput::Elements(1));
         group.bench_with_input(
             BenchmarkId::new("overlay_path", rel.len()),
             rel,

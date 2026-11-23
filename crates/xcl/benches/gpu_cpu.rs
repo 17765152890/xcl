@@ -146,12 +146,15 @@ fn shader_scans(c: &mut Criterion) {
     group.bench_function("find_rdna2_programs", |b| {
         b.iter(|| black_box(rdna2::find_programs(black_box(&blob))))
     });
+    group.throughput(Throughput::Bytes(program.len() as u64));
     group.bench_function("classify_raw_rdna2", |b| {
         b.iter(|| black_box(shader::classify(black_box(&program))))
     });
+    group.throughput(Throughput::Bytes(blob.len() as u64));
     group.bench_function("fnv64", |b| {
         b.iter(|| black_box(shader::fnv64(black_box(&blob))))
     });
+    group.throughput(Throughput::Bytes(program.len() as u64));
     group.bench_function("split_segments", |b| {
         b.iter(|| black_box(xbox::split_segments(black_box(&program))))
     });
