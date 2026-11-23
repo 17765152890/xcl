@@ -2107,18 +2107,88 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+type MadeKey = (usize, u64, [u8; 0x38]);
+
+#[derive(Default)]
+struct ResourceAtCache {
+    made: HashMap<MadeKey, usize>,
+    by_res: HashMap<usize, MadeKey>,
+    order: std::collections::VecDeque<(MadeKey, usize)>,
+    cooling: std::collections::VecDeque<(usize, usize, std::time::Instant)>,
+}
+
+const MADE_COOL: std::time::Duration = std::time::Duration::from_secs(2);
+const MADE_MAX: usize = 65536;
+static MADE: Mutex<Option<ResourceAtCache>> = Mutex::new(None);
+
+impl ResourceAtCache {
+    fn retire(&mut self, res: usize, now: std::time::Instant) -> bool {
+        let Some(k) = self.by_res.remove(&res) else { return false };
+        self.made.remove(&k);
+        self.cooling.push_back((k.0, res, now));
+        true
+    }
+
+    fn drain_expired(&mut self, now: std::time::Instant) -> Vec<usize> {
+        let mut out = Vec::new();
+        while self.cooling.front().is_some_and(|&(_, _, at)| now.duration_since(at) >= MADE_COOL) {
+            out.push(self.cooling.pop_front().unwrap().1);
+        }
+        out
+    }
+
+    fn insert(&mut self, key: MadeKey, res: usize, cap: usize, now: std::time::Instant) {
+        while self.made.len() >= cap {
+            let Some((ok, or)) = self.order.pop_front() else { break };
+            if self.made.get(&ok) == Some(&or) && self.made.remove(&ok).is_some() && or != 0 && self.by_res.remove(&or).is_some() {
+                self.cooling.push_back((ok.0, or, now));
+            }
+        }
+        self.made.insert(key, res);
+        if res != 0 {
+            self.by_res.insert(res, key);
+        }
+        self.order.push_back((key, res));
+    }
+
+    fn teardown_device(&mut self, device: usize) -> Vec<usize> {
+        let keys: Vec<MadeKey> = self.made.keys().filter(|k| k.0 == device).copied().collect();
+        self.order.retain(|(k, _)| k.0 != device);
+        let mut out: Vec<usize> = keys.into_iter().filter_map(|k| self.made.remove(&k).filter(|&r| r != 0 && self.by_res.remove(&r).is_some())).collect();
+        self.cooling.retain(|&(d, r, _)| if d == device { out.push(r); false } else { true });
+        out
+    }
+}
+
+/// Retire a superseded `resource_at` entry; its COM reference drops after `MADE_COOL`.
+pub(super) fn retire_resource_at(res: usize) {
+    if let Some(c) = MADE.lock().unwrap().as_mut() {
+        c.retire(res, std::time::Instant::now());
+    }
+}
+
+unsafe fn teardown_resource_at(device: usize) {
+    let to_drop = MADE.lock().unwrap().as_mut().map_or_else(Vec::new, |c| c.teardown_device(device));
+    for r in to_drop {
+        drop(windows::core::IUnknown::from_raw(r as *mut c_void));
+    }
+}
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
+    }
+    let expired = MADE.lock().unwrap().get_or_insert_with(ResourceAtCache::default).drain_expired(std::time::Instant::now());
+    for r in expired {
+        drop(windows::core::IUnknown::from_raw(r as *mut c_void));
     }
     // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+    let key = (this as usize, va, x);
+    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(ResourceAtCache::default).made.get(&key) {
         return r as *mut c_void;
     }
     let mut r = std::ptr::null_mut();
@@ -2130,7 +2200,16 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    let mut g = MADE.lock().unwrap();
+    let c = g.get_or_insert_with(ResourceAtCache::default);
+    if let Some(&existing) = c.made.get(&key) {
+        drop(g);
+        if !r.is_null() {
+            drop(windows::core::IUnknown::from_raw(r));
+        }
+        return existing as *mut c_void;
+    }
+    c.insert(key, r as usize, MADE_MAX, std::time::Instant::now());
     r
 }
 
@@ -2406,6 +2485,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     let mut v: Vec<(&'static str, usize)> = vec![("QueryInterface", qi_override as usize)];
     match kind {
         Kind::Device => v.extend_from_slice(&[
+            ("Release", dev_release as usize),
             ("CreateCommandQueue", dev_create_command_queue as usize),
             ("CheckFeatureSupport", dev_check_feature_support as usize),
             ("CreateCommandAllocator", dev_create_command_allocator as usize),
@@ -4707,11 +4787,22 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     n
 }
 
+unsafe extern "system" fn dev_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        teardown_resource_at(this as usize);
+        super::title_textures::teardown(Some(this as usize));
+    }
+    n
+}
+
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::vram::on_queue_release(this as usize);
     }
     n
 }
@@ -5551,5 +5642,27 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+
+    #[test]
+    fn resource_at_cache_retires_cools_caps_and_tears_down() {
+        let t0 = std::time::Instant::now();
+        let d = [0u8; 0x38];
+        let mut c = ResourceAtCache::default();
+        c.insert((1, 0x1000, d), 0xA1, 2, t0);
+        c.insert((1, 0x2000, d), 0xA2, 2, t0);
+        // cap=2 evicts oldest into cooling; not dropped before MADE_COOL
+        c.insert((2, 0x3000, d), 0xB1, 2, t0);
+        assert_eq!(c.made.len(), 2);
+        assert!(c.drain_expired(t0 + std::time::Duration::from_secs(1)).is_empty());
+        assert_eq!(c.drain_expired(t0 + MADE_COOL), vec![0xA1]);
+        // explicit retirement moves resource out of cache and into cooling
+        assert!(c.retire(0xA2, t0 + std::time::Duration::from_secs(3)));
+        assert!(!c.made.contains_key(&(1, 0x2000, d)));
+        assert_eq!(c.teardown_device(1), vec![0xA2]);
+        // device 2 untouched until torn down
+        assert_eq!(c.made.get(&(2, 0x3000, d)), Some(&0xB1));
+        assert_eq!(c.teardown_device(2), vec![0xB1]);
+        assert!(c.made.is_empty() && c.cooling.is_empty());
     }
 }
