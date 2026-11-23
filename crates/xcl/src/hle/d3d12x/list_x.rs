@@ -629,6 +629,7 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
     }
+    super::bind::reset(list, alloc, pso);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -644,6 +645,7 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::bind::forget(list as *mut c_void);
     if let Some(old) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list)) {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -721,6 +723,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
 
 /// Track `ClearState` on a command list: resets dynamic state and binds `pso`.
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
+    super::bind::clear_state(list, pso);
     let key = list as usize;
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
@@ -1622,7 +1625,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
-    super::bind::reset(this, alloc);
+    super::bind::reset(this, alloc, pso);
     // the PC runtime writes its own vtable into a copy list again on Reset: keep XCL's
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);

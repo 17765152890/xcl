@@ -83,15 +83,36 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
-/// The list was reset onto `allocator`: the previous recording's memory is the previous
-/// allocator's until that one is reset.
-pub(super) fn reset(list: *mut c_void, allocator: usize) {
+fn clear_bound_state(s: &mut State, pso: usize) {
+    s.layout = None;
+    s.args.clear();
+    s.layout_gfx = None;
+    s.args_gfx.clear();
+    s.pso = pso;
+    #[cfg(test)]
+    {
+        s.last_two_pass_result = None;
+    }
+}
+
+/// The list was reset onto `allocator` and `pso`: the previous recording's memory is the
+/// previous allocator's until that one is reset. Root arguments and arena offsets belong to
+/// the previous recording and must not survive Reset.
+pub(super) fn reset(list: *mut c_void, allocator: usize, pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
+        clear_bound_state(s, pso);
         s.arena = Default::default();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
+}
+
+/// Clear command-list binding state without ending the current recording. Existing ABI
+/// allocations remain owned by this recording, but no root layout, root argument, or pipeline
+/// binding may leak across ClearState.
+pub(super) fn clear_state(list: *mut c_void, pso: usize) {
+    with(list, |s| clear_bound_state(s, pso));
 }
 
 /// The list is gone.
@@ -1099,9 +1120,12 @@ mod abi_tests {
     fn reset_transfers_all_prepared_blocks_to_the_previous_allocator() {
         let list = 0x1234usize as *mut c_void;
         with(list, |state| { state.allocator = 7; state.uma = vec![11, 22, 33]; });
-        reset(list, 8);
+        reset(list, 8, 9);
         assert_eq!(super::super::console_list::take_pending_for_test(7), vec![11, 22, 33]);
-        with(list, |state| { assert_eq!(state.allocator, 8); assert!(state.uma.is_empty()); });
+        with(list, |state| {
+            assert_eq!((state.allocator, state.pso), (8, 9));
+            assert!(state.uma.is_empty());
+        });
         STATES.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
     }
 
@@ -1242,6 +1266,59 @@ mod abi_tests {
             execute_indirect(list, 0, 1, 0, 0, 0, 0);
         }
         assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 3);
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    fn seed_stale_binding_state(list: *mut c_void, pso: usize) {
+        with(list, |state| {
+            state.layout = Some(Arc::new(Layout::default()));
+            state.args = vec![1, 2, 3, 4];
+            state.layout_gfx = Some(Arc::new(Layout::default()));
+            state.args_gfx = vec![5, 6, 7, 8];
+            state.pso = pso;
+            state.last_two_pass_result = Some((0x1234, 64));
+        });
+    }
+
+    #[test]
+    fn reset_sets_initial_pipeline_and_drops_previous_root_state() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_789ausize;
+        let list = list_key as *mut c_void;
+        seed_stale_binding_state(list, 0x1111);
+
+        reset(list, 0x2222, 0x3333);
+        with(list, |state| {
+            assert_eq!((state.allocator, state.pso), (0x2222, 0x3333));
+            assert!(state.layout.is_none() && state.args.is_empty());
+            assert!(state.layout_gfx.is_none() && state.args_gfx.is_empty());
+            assert_eq!(state.last_two_pass_result, None);
+            assert!(state.uma.is_empty());
+        });
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn clear_state_replaces_pipeline_and_roots_but_keeps_recording_memory() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_89abusize;
+        let list = list_key as *mut c_void;
+        seed_stale_binding_state(list, 0x1111);
+        // A synthetic value is safe here because the test removes State directly rather than
+        // handing it to the allocator-retirement path.
+        with(list, |state| {
+            state.allocator = 0x2222;
+            state.uma = vec![0x4444];
+        });
+
+        unsafe { super::super::list_x::on_clear_state(list, 0x3333) };
+        with(list, |state| {
+            assert_eq!((state.allocator, state.pso), (0x2222, 0x3333));
+            assert!(state.layout.is_none() && state.args.is_empty());
+            assert!(state.layout_gfx.is_none() && state.args_gfx.is_empty());
+            assert_eq!(state.last_two_pass_result, None);
+            assert_eq!(state.uma, vec![0x4444]);
+        });
         STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
     }
 
