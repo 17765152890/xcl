@@ -418,7 +418,8 @@ fn clock_thread() {
                 }
                 let interval = ticks(c.interval_us as i64);
                 let now = qpc();
-                c.kinds
+                let mut due = c
+                    .kinds
                     .iter()
                     .enumerate()
                     .filter(|(_, k)| k.scheduled)
@@ -429,34 +430,40 @@ fn clock_thread() {
                         }
                         (d, i, k.internal as usize, Arc::clone(&k.extra))
                     })
-                    .min_by_key(|e| e.0)
-                    .map(|e| (c.generation, e))
+                    .collect::<Vec<_>>();
+                // every event due first – types at the same offset (GTA VI: 0 and 2 at 0 µs)
+                // fire together, else the one not picked would starve
+                let first = due.iter().map(|e| e.0).min()?;
+                due.retain(|e| e.0 == first);
+                Some((c.generation, first, due))
             });
-            let Some((generation, (deadline, ty, internal, extra))) = plan else {
+            let Some((generation, deadline, due)) = plan else {
                 WaitForMultipleObjects(1, &wake(), 0, INFINITE);
                 continue;
             };
             if !sleep_until(timer, deadline) || !with(|c| c.generation == generation) {
                 continue;
             }
-            last[ty] = deadline;
-            if ty == 0 {
-                let now = qpc();
-                LAST_ORIGIN.store(now, Ordering::Relaxed);
-                // an origin the semaphore cannot hold (ORIGIN_SEMAPHORE_MAX pending) is lost to the title too
-                if ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut()) != 0 {
-                    let mut o = ORIGINS.lock().unwrap();
-                    o.push_back(now);
-                    while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
-                        o.pop_front();
+            for (_, ty, internal, extra) in due {
+                last[ty] = deadline;
+                if ty == 0 {
+                    let now = qpc();
+                    LAST_ORIGIN.store(now, Ordering::Relaxed);
+                    // an origin the semaphore cannot hold (ORIGIN_SEMAPHORE_MAX pending) is lost to the title too
+                    if ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut()) != 0 {
+                        let mut o = ORIGINS.lock().unwrap();
+                        o.push_back(now);
+                        while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
+                            o.pop_front();
+                        }
                     }
+                } else {
+                    SetEvent(internal as HANDLE);
                 }
-            } else {
-                SetEvent(internal as HANDLE);
-            }
-            for &h in &extra.0 {
-                if SetEvent(h) == 0 {
-                    ReleaseSemaphore(h, 1, std::ptr::null_mut());
+                for &h in &extra.0 {
+                    if SetEvent(h) == 0 {
+                        ReleaseSemaphore(h, 1, std::ptr::null_mut());
+                    }
                 }
             }
         }
@@ -478,6 +485,25 @@ mod tests {
         assert_eq!(next_deadline(100, 10, 3, 50), 103);
         assert_eq!(next_deadline(100, 10, 3, 103), 113);
         assert_eq!(next_deadline(100, 10, 3, 120), 123);
+    }
+
+    /// Two event types at the same offset both fire each frame (one used to starve the other).
+    #[test]
+    fn events_at_the_same_offset_all_fire() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let dev = std::ptr::null_mut();
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
+            let hr = schedule_frame_event_x(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            assert_eq!(schedule_frame_event_x(dev, 2, 0, std::ptr::null(), 0), S_FALSE);
+            for _ in 0..3 {
+                // the origins too: left in the semaphore they would end the next test's waits early
+                assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, std::ptr::null_mut()), S_OK);
+                assert_eq!(wait_frame_event_x(dev, 2, 200, std::ptr::null(), 0, std::ptr::null_mut()), S_OK);
+            }
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
+        }
     }
 
     /// The origin event of a 60 Hz clock: waits return about one interval apart with fresh
