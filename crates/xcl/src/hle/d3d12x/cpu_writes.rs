@@ -6,11 +6,12 @@
 //! The PC GPU cannot write there; dropped, the title waited for ever after its second frame.
 //! Here each queue gets a fence of XCL's: after a submission whose lists carry such writes the
 //! queue signals it, and a worker thread does the writes, in submission order, when the GPU is
-//! there – what bottom of pipe means.
+//! there – what bottom of pipe means. A GPU timestamp goes the same way: the GPU resolves it
+//! into a readback buffer of XCL's and the worker copies those 8 bytes to the title's address.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 
 use windows::core::Interface;
@@ -18,8 +19,17 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::Threading as th;
 
-/// (address, the dwords from there)
-pub(super) type Write = (usize, Vec<u32>);
+/// What goes to an address once the GPU is there.
+#[derive(Clone)]
+pub(super) enum Value {
+    /// these dwords
+    Words(Vec<u32>),
+    /// the 8 bytes the GPU resolved at this address of a mapped readback buffer (a timestamp)
+    Resolved(usize),
+}
+
+/// (address, what goes there)
+pub(super) type Write = (usize, Value);
 
 struct Job {
     fence: ID3D12Fence,
@@ -54,8 +64,19 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                 if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
                     th::WaitForSingleObject(event, WAIT_MS);
                 }
-                for (va, words) in &job.writes {
-                    write_now(*va, words);
+                for (va, value) in &job.writes {
+                    match value {
+                        Value::Words(words) => write_now(*va, words),
+                        Value::Resolved(at) => {
+                            // one 8-byte store: a title polling it never sees half of a new value
+                            let v = std::ptr::read_volatile(*at as *const u64);
+                            if va % 8 == 0 && can_write_now(*va, 8) {
+                                (*(*va as *const AtomicU64)).store(v, Ordering::Release);
+                            } else {
+                                write_now(*va, &[v as u32, (v >> 32) as u32]);
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -68,12 +89,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
 
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-        return;
-    }
-    if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + 4 * words.len() {
+    if !can_write_now(va, 4 * words.len()) {
         return;
     }
     for (i, &w) in words.iter().enumerate() {
@@ -81,16 +97,20 @@ unsafe fn write_now(va: usize, words: &[u32]) {
     }
 }
 
-/// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
-pub(super) fn writable(va: usize, bytes: usize) -> bool {
-    crate::hle::kernelx::lazy::ensure(va, bytes);
+/// Whether `[va, va + bytes)` is still committed, writable memory.
+unsafe fn can_write_now(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
-    found
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
         && m.State == MEM_COMMIT
         && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
         && m.BaseAddress as usize + m.RegionSize >= va + bytes
+}
+
+/// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
+pub(super) fn writable(va: usize, bytes: usize) -> bool {
+    crate::hle::kernelx::lazy::ensure(va, bytes);
+    unsafe { can_write_now(va, bytes) }
 }
 
 /// `writes` of lists just submitted to `queue`: done when the GPU has finished them.
@@ -146,13 +166,66 @@ mod tests {
             let cell = Box::new([0u32; 2]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![(va, vec![7, 9])]);
+            after(q.as_raw(), vec![(va, Value::Words(vec![7, 9]))]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
+            let words = || [0, 1].map(|i| (*((va + 4 * i) as *const AtomicU32)).load(Ordering::Acquire));
+            while words() != [7, 9] {
                 assert!(t.elapsed().as_secs() < 5, "never written");
                 std::thread::yield_now();
             }
             assert_eq!(*cell, [7, 9]);
+        }
+    }
+
+    /// A timestamp the GPU resolved into a readback buffer lands at the address once the queue
+    /// has written it.
+    #[test]
+    fn resolved_values_land_after_the_queue() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 1, NodeMask: 0 }, &mut heap).unwrap();
+            let heap = heap.unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+            let readback = readback.unwrap();
+            let mut p: *mut c_void = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, &readback, 0);
+            list.Close().unwrap();
+            q.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            let cell = Box::new(std::sync::atomic::AtomicU64::new(0));
+            let va = cell.as_ptr() as usize;
+            assert!(writable(va, 8));
+            after(q.as_raw(), vec![(va, Value::Resolved(p as usize))]);
+            let t = std::time::Instant::now();
+            while cell.load(Ordering::Acquire) != std::ptr::read_volatile(p as *const u64) || cell.load(Ordering::Acquire) == 0 {
+                assert!(t.elapsed().as_secs() < 5, "never written");
+                std::thread::yield_now();
+            }
+            assert_eq!(cell.load(Ordering::Acquire), std::ptr::read_volatile(p as *const u64));
+            readback.Unmap(0, None);
         }
     }
 }

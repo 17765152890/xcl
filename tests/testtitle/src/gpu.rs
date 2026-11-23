@@ -552,6 +552,23 @@ pub fn console_list_methods() -> Result<(), String> {
         ensure!(r32(0x300) == 0xDEAD_00AA && r64(0x308) == 0x0000_0003_0000_0000, "wait cells not written");
         ensure!(r32(0x310) == 0x55AA_55AA, "post-Wait32/64 write failed ({:#x})", r32(0x310));
 
+        // 4. A GPU timestamp into the title's own memory (its heap, outside unified memory), as a
+        // retail title asks for one: written by the CPU once the GPU is there, after the first one
+        let own = Box::new(std::sync::atomic::AtomicU64::new(0));
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        write64_bottom(l, own.as_ptr() as u64, 0, 0, 1);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 4)?;
+        let t0 = std::time::Instant::now();
+        while own.load(std::sync::atomic::Ordering::Acquire) == 0 && t0.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ts = own.load(std::sync::atomic::Ordering::Acquire);
+        ensure!(ts != 0, "no GPU timestamp in the title's own memory");
+        ensure!(ts >= r64(0x10), "GPU timestamp in the title's own memory before an earlier one ({ts:#x} < {:#x})", r64(0x10));
+
         crate::XMemFree(mem as *mut c_void, graphics);
         Ok(())
     }

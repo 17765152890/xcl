@@ -1098,7 +1098,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.cpu_writes.push((va as usize, words.to_vec()));
+                s.cpu_writes.push((va as usize, super::cpu_writes::Value::Words(words.to_vec())));
                 return;
             }
         }
@@ -1111,40 +1111,90 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
 }
 
-/// timestamp queries (one heap per device, used round-robin)
-static TIMESTAMPS: Mutex<Option<HashMap<usize, ID3D12QueryHeap>>> = Mutex::new(None);
+/// Per device: the timestamp query heap (used round-robin) and, once a timestamp goes to the
+/// title's own memory, a readback buffer with a slot per query and where it is mapped.
+struct Timestamps {
+    heap: ID3D12QueryHeap,
+    readback: Option<(ID3D12Resource, usize)>,
+}
+
+static TIMESTAMPS: Mutex<Option<HashMap<usize, Timestamps>>> = Mutex::new(None);
 const TIMESTAMP_SLOTS: u32 = 4096;
 static NEXT_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
 
+/// The device's timestamp heap and, with `readback`, its readback buffer and mapping.
+unsafe fn timestamp_heap(dev: &ID3D12Device, readback: bool) -> Option<(usize, Option<(usize, usize)>)> {
+    let mut m = TIMESTAMPS.lock().unwrap();
+    let m = m.get_or_insert_with(HashMap::new);
+    let t = match m.entry(dev.as_raw() as usize) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let mut h: Option<ID3D12QueryHeap> = None;
+            let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: TIMESTAMP_SLOTS, NodeMask: 0 };
+            dev.CreateQueryHeap(&desc, &mut h).ok()?;
+            slot.insert(Timestamps { heap: h?, readback: None })
+        }
+    };
+    if readback && t.readback.is_none() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 8 * TIMESTAMP_SLOTS as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).ok()?;
+        let rb = rb?;
+        // mapped for good: the CPU reads a slot only after the queue's fence says it is written
+        let mut p: *mut c_void = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).ok()?;
+        t.readback = Some((rb, p as usize));
+    }
+    Some((t.heap.as_raw() as usize, t.readback.as_ref().map(|(r, p)| (r.as_raw() as usize, *p))))
+}
+
 /// The GPU timestamp (the PC queue's ticks) written at `va` when the work before it is done.
+/// In the title's own memory (outside the unified memory windows) the GPU resolves it into a
+/// readback buffer and the CPU copies it there afterwards, like the values `write` puts there.
 unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let ty = list_type(list);
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return warn(&N, what, format_args!("a timestamp on a type-{} list", ty.0));
     }
-    let Some((d, off)) = real::uma_window_buffer(va as usize, 8).filter(|_| va.is_multiple_of(8)) else {
-        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned in unified memory"));
-    };
+    if !va.is_multiple_of(8) {
+        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned"));
+    }
+    let uma = real::uma_window_buffer(va as usize, 8);
+    if uma.is_none() && !super::cpu_writes::writable(va as usize, 8) {
+        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    }
     let Some(dev) = device_of(list) else { return };
-    let heap = {
-        let mut m = TIMESTAMPS.lock().unwrap();
-        let m = m.get_or_insert_with(HashMap::new);
-        if let std::collections::hash_map::Entry::Vacant(slot) = m.entry(dev.as_raw() as usize) {
-            let mut h: Option<ID3D12QueryHeap> = None;
-            let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: TIMESTAMP_SLOTS, NodeMask: 0 };
-            match dev.CreateQueryHeap(&desc, &mut h) {
-                Ok(()) if h.is_some() => slot.insert(h.unwrap()),
-                _ => return warn(&N, what, format_args!("no timestamp query heap")),
-            };
-        }
-        m[&(dev.as_raw() as usize)].as_raw() as usize
+    let Some((heap, readback)) = timestamp_heap(&dev, uma.is_none()) else {
+        return warn(&N, what, format_args!("no timestamp query heap or readback buffer"));
     };
-    note_write(list as usize, va, 8);
     let i = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS;
-    pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+    match (uma, readback) {
+        (Some((d, off)), _) => {
+            note_write(list as usize, va, 8);
+            pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+            as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+        }
+        (None, Some((rb, mapped))) => {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+            // a readback buffer stays in COPY_DEST
+            pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb, 8 * i as u64);
+            let write = (va as usize, super::cpu_writes::Value::Resolved(mapped + 8 * i as usize));
+            LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().cpu_writes.push(write);
+        }
+        (None, None) => {}
+    }
 }
 
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
