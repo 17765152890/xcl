@@ -1728,6 +1728,26 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
     out
 }
 
+/// Translated shaders with heap windows (`pso::heap_windows`) read the memory windows from the
+/// shared heap: a list that set no heaps (a dispatch with no views) gets it before the bind.
+pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
+    if !crate::gpu::recomp::pso::heap_windows() {
+        return;
+    }
+    let Some(g) = super::console_heap::global_heap() else { return };
+    let mut set = false;
+    with_bindings(this, |b| {
+        if b.heaps.is_empty() {
+            b.heaps = vec![g.as_raw() as usize];
+            set = true;
+        }
+    });
+    if set {
+        let raw = [g.as_raw() as usize];
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, 1, raw.as_ptr());
+    }
+}
+
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
