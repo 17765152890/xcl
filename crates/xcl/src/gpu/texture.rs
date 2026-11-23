@@ -57,21 +57,23 @@ pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
     if !desc::valid_cube_view(t) {
         return Err(format!("cube view {}..{} is not a nonempty whole number of faces", t.base_array, t.depth));
     }
-    if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
-        return Err(format!("texture {:?} – not yet (MSAA)", t.ty));
-    }
+    let is_msaa = matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray);
     let mut surface = *t;
+    if is_msaa {
+        surface.last_level = 0; // only mip 0 exists for MSAA
+    }
     if matches!(surface.ty, ImageType::D1 | ImageType::D1Array) {
         // The T# height field is ignored for 1D resources, just as image_d3d12 ignores it.
         surface.height = 1;
     }
     // linear (SW_MODE 0) included: addrlib's 256-byte rows, levels from the smallest
     let chain = tiling::image_chain(&surface, cfg).ok_or_else(|| format!("SW_MODE {} / format {} without a tiling pattern", t.swizzle_mode, t.format))?;
-    let slices = match t.ty {
-        ImageType::D1Array | ImageType::D2Array | ImageType::Cube => t.depth.max(1) as usize,
+    let array_slices = match t.ty {
+        ImageType::D1Array | ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube => t.depth.max(1) as usize,
         ImageType::D3 => chain.layers(),
         _ => 1,
     };
+    let slices = array_slices;
     let start = t.address & !(chain.layout.block_bytes as u64 - 1);
     let bytes = chain.slice_bytes.checked_mul(slices).ok_or("tiled texture size overflow")?;
     Ok(Placement { start, bytes, chain, slices })
