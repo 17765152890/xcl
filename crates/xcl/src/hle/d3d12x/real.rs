@@ -3567,6 +3567,25 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    // `XCL_TRACE_SHADERS=<ps hash>,…`: the pipeline's output state (does it blend?)
+    if debug_pso_switch("XCL_TRACE_SHADERS", ps_hash) {
+        let b = &copy.BlendState.RenderTarget[0];
+        crate::xlog_info!(
+            "D3D12.X: pipeline with ps {ps_hash:016x}: RT0 blend {} (src {} dst {} op {}; alpha src {} dst {} op {}), logic op {} {}, write mask {:#x}; independent {}, alpha-to-coverage {}; {} targets, RTV0 format {}, DSV format {}, sample mask {:#x}, topology type {}, rect GS {}",
+            b.BlendEnable.as_bool(), b.SrcBlend.0, b.DestBlend.0, b.BlendOp.0, b.SrcBlendAlpha.0, b.DestBlendAlpha.0, b.BlendOpAlpha.0,
+            b.LogicOpEnable.as_bool(), b.LogicOp.0, b.RenderTargetWriteMask,
+            copy.BlendState.IndependentBlendEnable.as_bool(), copy.BlendState.AlphaToCoverageEnable.as_bool(),
+            copy.NumRenderTargets, copy.RTVFormats[0].0, copy.DSVFormat.0, copy.SampleMask, copy.PrimitiveTopologyType.0, rect_gs.is_some(),
+        );
+        let ds = &copy.DepthStencilState;
+        let face = |f: &D3D12_DEPTH_STENCILOP_DESC| format!("fail {} depth-fail {} pass {} func {}", f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0);
+        crate::xlog_info!(
+            "D3D12.X: pipeline with ps {ps_hash:016x}: depth {} write {} func {}; stencil {} read {:#x} write {:#x}, front ({}), back ({}); cull {} fill {} depth clip {}",
+            ds.DepthEnable.as_bool(), ds.DepthWriteMask.0, ds.DepthFunc.0, ds.StencilEnable.as_bool(), ds.StencilReadMask, ds.StencilWriteMask,
+            face(&ds.FrontFace), face(&ds.BackFace),
+            copy.RasterizerState.CullMode.0, copy.RasterizerState.FillMode.0, copy.RasterizerState.DepthClipEnable.as_bool(),
+        );
+    }
     let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
     if hr < 0 {
         note_translation_error(format!(

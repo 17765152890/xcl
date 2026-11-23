@@ -255,7 +255,20 @@ fn scripted() -> u32 {
     static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
     let at = AT.get_or_init(|| {
         let var = |n: &str| std::env::var(n).unwrap_or_default();
-        parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
+        // `XCL_PRESS_FILE=<path>`: more presses, `seconds:BUTTON` per line or comma-separated
+        // (what `XCL_INPUT_RECORD` writes)
+        let mut script = var("XCL_PRESS_AT");
+        if let Some(path) = std::env::var_os("XCL_PRESS_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+                    crate::xlog_info!("GameInput: {} scripted presses from {}", lines.len(), path.to_string_lossy());
+                    script = format!("{script},{}", lines.join(","));
+                }
+                Err(e) => crate::xlog_warn!("GameInput: XCL_PRESS_FILE {}: {e}", path.to_string_lossy()),
+            }
+        }
+        parse_presses(&script, &var("XCL_PRESS_A_AT"))
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
@@ -299,6 +312,60 @@ fn merge_host_inputs(
     s.buttons |= read_scripted();
 }
 
+/// The buttons XCL_PRESS_AT knows, by name (`button_named` the other way round).
+const BUTTON_NAMES: [(u32, &str); 12] = [
+    (A, "A"), (B, "B"), (X, "X"), (Y, "Y"), (DPAD_UP, "UP"), (DPAD_DOWN, "DOWN"), (DPAD_LEFT, "LEFT"),
+    (DPAD_RIGHT, "RIGHT"), (MENU, "MENU"), (VIEW, "VIEW"), (LEFT_SHOULDER, "LB"), (RIGHT_SHOULDER, "RB"),
+];
+
+/// The buttons `s` holds, with a left stick pushed past 0.7 as the D-pad direction (menus take
+/// both) – what a recording keeps.
+fn recorded_buttons(s: &GamepadState) -> u32 {
+    let mut b = s.buttons;
+    if s.left_y > 0.7 { b |= DPAD_UP }
+    if s.left_y < -0.7 { b |= DPAD_DOWN }
+    if s.left_x < -0.7 { b |= DPAD_LEFT }
+    if s.left_x > 0.7 { b |= DPAD_RIGHT }
+    b
+}
+
+/// `XCL_INPUT_RECORD=<path>`: every new press is appended there as `seconds:BUTTON` (seconds
+/// since the host started, the log's clock) – the file `XCL_PRESS_FILE` replays.
+fn record(s: &GamepadState) {
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static HELD: AtomicU32 = AtomicU32::new(0);
+    static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    let Some(path) = PATH.get_or_init(|| std::env::var_os("XCL_INPUT_RECORD").map(Into::into)) else { return };
+    let now = recorded_buttons(s);
+    let new = now & !HELD.swap(now, Ordering::AcqRel);
+    if new == 0 {
+        return;
+    }
+    let t = crate::log::uptime();
+    let mut f = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if f.is_none() {
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                crate::xlog_info!("GameInput: recording presses to {}", path.display());
+                *f = Some(file);
+            }
+            Err(e) => {
+                crate::xlog_warn!("GameInput: XCL_INPUT_RECORD {}: {e}", path.display());
+                return;
+            }
+        }
+    }
+    if let Some(file) = f.as_mut() {
+        use std::io::Write;
+        for (bit, name) in BUTTON_NAMES {
+            if new & bit != 0 {
+                let _ = writeln!(file, "{t:.3}:{name}");
+            }
+        }
+        let _ = file.flush();
+    }
+}
+
 /// the gamepad now
 pub fn poll() -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
@@ -320,6 +387,7 @@ pub fn poll() -> GamepadState {
             crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");
         }
     }
+    record(&s);
     s
 }
 

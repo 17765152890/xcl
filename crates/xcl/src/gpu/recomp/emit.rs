@@ -1598,6 +1598,16 @@ impl Em {
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        // An indexed access through a V# with stride 0 steps by the access's own size. The
+        // retail game's UI vertex shader (28d887aa04ffa15a) reads its 2x4 transform as two
+        // `buffer_load_dwordx4 … idxen` (index n, n+1) through a V# it writes itself with stride
+        // 0 (format 32_FLOAT): taken as written, both rows are the same and every UI vertex has
+        // x = y (a diagonal line instead of the account prompt). Stepping 16 bytes draws it as
+        // on the console. Which hardware rule gives that step is not established; `XCL_STRIDE0_IDX=0`
+        // keeps the plain formula.
+        if idxen && std::env::var("XCL_STRIDE0_IDX").map_or(true, |v| v != "0") {
+            self.line(&format!("if ({t}_stride == 0u) {t}_stride = {}u;", count * 4));
+        }
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
         let act = self.act();

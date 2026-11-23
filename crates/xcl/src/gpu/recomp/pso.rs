@@ -451,7 +451,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_STRIDE0_IDX"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -882,7 +882,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_STRIDE0_IDX"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
