@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
+    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    job: Mutex<Option<Job>>,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -19,15 +21,35 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
-    /// the build, until a worker – or a title thread that cannot wait for the queue
-    /// (`resolve_wait`) – takes it
-    job: Mutex<Option<Job>>,
     /// sent to the workers (a lazy pipeline is sent at its first use)
     queued: std::sync::atomic::AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+
+/// The build is done (`real`: its pipeline, 0 = failed).
+fn complete(p: &Pending, real: usize) {
+    if real == 0 {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BUILT.fetch_add(1, Ordering::Relaxed);
+    }
+    let orphan = {
+        let mut done = p.done.lock().unwrap();
+        let orphan = p.orphan.load(Ordering::Acquire);
+        if !orphan {
+            p.real.store(real, Ordering::Release);
+        }
+        *done = true;
+        p.cv.notify_all();
+        orphan
+    };
+    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    if orphan {
+        release(real);
+    }
+}
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 
@@ -53,36 +75,15 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(BUILD_STACK).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
-                // a title thread may have taken it already (`resolve_wait`)
-                let Some(job) = p.job.lock().unwrap().take() else { continue };
-                finish(&p, job());
+                // (None: a bind took it and builds it itself)
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    complete(&p, job());
+                }
             });
         }
         Mutex::new(tx)
     })
-}
-
-/// Hand a built pipeline (0 = failed) to whoever waits for it.
-fn finish(p: &Pending, real: usize) {
-    if real == 0 {
-        FAILED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        BUILT.fetch_add(1, Ordering::Relaxed);
-    }
-    let orphan = {
-        let mut done = p.done.lock().unwrap();
-        let orphan = p.orphan.load(Ordering::Acquire);
-        if !orphan {
-            p.real.store(real, Ordering::Release);
-        }
-        *done = true;
-        p.cv.notify_all();
-        orphan
-    };
-    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
-    if orphan {
-        release(real);
-    }
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -160,7 +161,8 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built.
+/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
+/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     // not started yet: build it now instead of waiting behind the whole queue (thousands of
@@ -177,7 +179,7 @@ pub fn resolve_wait(pso: usize) -> usize {
                 .and_then(|t| t.join().ok())
                 .unwrap_or(0)
         });
-        finish(&p, real);
+        complete(&p, real);
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
