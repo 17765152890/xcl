@@ -4778,7 +4778,10 @@ mod stream_tests {
         pc.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
         let desc: [usize; 2] = [pc.0.len(), pc.0.as_ptr() as usize];
         assert!(unsafe { pc_stream_types(desc.as_ptr() as *const c_void) }.is_none());
+    }
+}
 
+#[cfg(test)]
 mod depth_view_tests {
     use super::depth_srv_format;
 
