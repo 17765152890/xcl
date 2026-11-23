@@ -1367,6 +1367,17 @@ fn mesh_draw_split_impl(
 /// temporary index buffer; the right half uses the restored all-zero index buffer.
 #[cfg(test)]
 pub(super) fn routed_indexed_draw_smoke(vs: &[u8], ps: &[u8], constants: &[u32], size: u32, clear: [f32; 4]) -> Result<Vec<[f32; 4]>, String> {
+    routed_graphics_draw_smoke(vs, ps, constants, size, clear, false)
+}
+
+/// Synthetic live check for the production standard DrawInstanced route.
+#[cfg(test)]
+pub(super) fn routed_standard_draw_smoke(vs: &[u8], ps: &[u8], constants: &[u32], size: u32, clear: [f32; 4]) -> Result<Vec<[f32; 4]>, String> {
+    routed_graphics_draw_smoke(vs, ps, constants, size, clear, true)
+}
+
+#[cfg(test)]
+fn routed_graphics_draw_smoke(vs: &[u8], ps: &[u8], constants: &[u32], size: u32, clear: [f32; 4], standard: bool) -> Result<Vec<[f32; 4]>, String> {
     let _serial = GPU.lock().unwrap();
     unsafe {
         if crate::hle::d3d12x::backend() != crate::hle::d3d12x::Backend::Real {
@@ -1443,13 +1454,23 @@ pub(super) fn routed_indexed_draw_smoke(vs: &[u8], ps: &[u8], constants: &[u32],
         let _state = crate::hle::d3d12x::bind::install_dispatch_route_for_test(list.as_raw(), pso.as_raw() as usize);
         crate::hle::d3d12x::bind::set_graphics_root_signature(list.as_raw(), root as *mut std::ffi::c_void);
         crate::hle::d3d12x::bind::set_graphics_root_constants(list.as_raw(), 0, constants.len() as u32, constants.as_ptr(), 0);
+        let _preparation_order = standard.then(crate::hle::d3d12x::bind::observe_graphics_preparation_for_test);
         let sentinel = D3D12_INDEX_BUFFER_VIEW { BufferLocation: ib.GetGPUVirtualAddress(), SizeInBytes: 6, Format: DXGI_FORMAT_R16_UINT };
         crate::hle::d3d12x::list_x::ia_set_index_buffer_x(list.as_raw(), &sentinel);
         let half = |left: u32| D3D12_VIEWPORT { TopLeftX: left as f32, TopLeftY: 0.0, Width: (size / 2) as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 };
-        list.RSSetViewports(&[half(0)]);
-        crate::hle::d3d12x::list_x::draw_indexed_x(list.as_raw(), ib.GetGPUVirtualAddress() + 8, DXGI_FORMAT_R16_UINT, 3, 0);
-        list.RSSetViewports(&[half(size / 2)]);
-        list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+        if standard {
+            list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+            crate::hle::d3d12x::bind::draw_instanced_for_test(list.as_raw(), 3, 1, 0, 0);
+            let order = crate::hle::d3d12x::bind::graphics_preparation_order_for_test();
+            if order != 3 {
+                return Err(format!("graphics ABI and pending draw state were prepared out of order ({order})"));
+            }
+        } else {
+            list.RSSetViewports(&[half(0)]);
+            crate::hle::d3d12x::list_x::draw_indexed_x(list.as_raw(), ib.GetGPUVirtualAddress() + 8, DXGI_FORMAT_R16_UINT, 3, 0);
+            list.RSSetViewports(&[half(size / 2)]);
+            list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+        }
         list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };

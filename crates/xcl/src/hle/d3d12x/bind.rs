@@ -183,10 +183,14 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
-    let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if super::real::two_pass_of(pso).is_some() {
+        reject_two_pass_draw("ExecuteIndirect");
+        return;
+    }
+    let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     if !gfx && !compute {
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
@@ -194,6 +198,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
+        }
+        return;
+    }
+    if gfx {
+        if prepare_graphics_command(this).is_some() {
+            pc(this, sig, max, args, args_off, count_buf, count_off);
         }
         return;
     }
@@ -216,9 +226,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
-    if let Some(list) = graphics_bound(this) {
+    if let Some(list) = prepare_graphics_command(this) {
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn draw_instanced_for_test(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    draw_instanced(this, vertices, instances, first_vertex, first_instance)
 }
 
 thread_local! {
@@ -229,7 +244,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
-    if let Some(list) = graphics_bound(this) {
+    if let Some(list) = prepare_graphics_command(this) {
         list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
     }
 }
@@ -238,18 +253,29 @@ pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, i
 /// owned by the caller (for example, DrawIndexedX's temporary index-buffer binding).
 pub(super) unsafe fn prepare_indexed_draw(this: *mut c_void, indices: u32) -> bool {
     DRAW_ARGS.with(|d| d.set((true, indices, 1, 0, 0)));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
-    // A checked two-pass mesh pipeline needs explicit compute dispatch dimensions. Draw
-    // arguments are not equivalent, so this console-specific entry fails closed.
-    if super::real::two_pass_of(pso).is_some() {
-        count(DRAWS_SKIPPED);
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: DrawIndexedX with a two-pass pipeline skipped: dispatch dimensions are unavailable");
-        }
-        return false;
+    prepare_graphics_command(this).is_some()
+}
+
+fn reject_two_pass_draw(what: &str) {
+    count(DRAWS_SKIPPED);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: {what} with a two-pass pipeline skipped: dispatch dimensions are unavailable");
     }
-    graphics_bound(this).is_some()
+}
+
+/// Establish the complete state invariant for a graphics command: reject mesh two-pass
+/// metadata, bind the translated graphics ABI (or retain an ordinary PC pipeline), then apply
+/// pending draw state so a derived depth-bias PSO remains the final pipeline.
+unsafe fn prepare_graphics_command(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
+    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    if super::real::two_pass_of(pso).is_some() {
+        reject_two_pass_draw("draw");
+        return None;
+    }
+    let list = graphics_bound(this)?;
+    super::list_x::prepare_draw(this);
+    Some(list)
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -764,7 +790,43 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
     let bindings = prepare_abi(this, gfx, DEFAULT_RESULT_BYTES)?;
-    bind_prepared_abi(list, pso, gfx, &bindings)
+    bind_prepared_abi(list, pso, gfx, &bindings)?;
+    #[cfg(test)]
+    if gfx && GRAPHICS_PREP_TEST_STATE.load(Ordering::SeqCst) == 1 {
+        GRAPHICS_PREP_TEST_STATE.store(2, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static GRAPHICS_PREP_TEST_STATE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) struct GraphicsPrepTestGuard;
+
+#[cfg(test)]
+impl Drop for GraphicsPrepTestGuard {
+    fn drop(&mut self) { GRAPHICS_PREP_TEST_STATE.store(0, Ordering::SeqCst); }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_graphics_preparation_for_test() -> GraphicsPrepTestGuard {
+    assert_eq!(GRAPHICS_PREP_TEST_STATE.swap(1, Ordering::SeqCst), 0);
+    GraphicsPrepTestGuard
+}
+
+#[cfg(test)]
+pub(crate) fn note_prepare_draw_for_test() {
+    let state = GRAPHICS_PREP_TEST_STATE.load(Ordering::SeqCst);
+    if state != 0 && state != 3
+        && GRAPHICS_PREP_TEST_STATE.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        GRAPHICS_PREP_TEST_STATE.store(4, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn graphics_preparation_order_for_test() -> u64 {
+    GRAPHICS_PREP_TEST_STATE.load(Ordering::SeqCst)
 }
 
 const DEFAULT_RESULT_BYTES: usize = 256;
@@ -1153,6 +1215,33 @@ mod abi_tests {
         };
         assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 1);
         with(list, |state| assert!(state.uma.is_empty()));
+        STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn standard_graphics_entries_reject_two_pass_before_native_calls() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list_key = 0x7fff_6789usize;
+        let list = list_key as *mut c_void;
+        let metadata = super::super::real::TwoPassPso {
+            compute: 0,
+            compute_rs: 20,
+            mesh_rs: 30,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 2,
+            kind: "test",
+        };
+        let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
+        with(list, |state| state.pso = list_key);
+        let skipped_before = COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst);
+
+        // The fake pointer proves rejection precedes command-list borrowing or vtable access.
+        unsafe {
+            draw_instanced(list, 3, 1, 0, 0);
+            draw_indexed_instanced(list, 3, 1, 0, 0, 0);
+            execute_indirect(list, 0, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 3);
         STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
     }
 

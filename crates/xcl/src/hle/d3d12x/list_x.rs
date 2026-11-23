@@ -1400,6 +1400,8 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
 
 /// Apply a pending fallback `RSSetDepthBiasX` override before a draw call on `list`.
 pub(super) unsafe fn prepare_draw(list: *mut c_void) {
+    #[cfg(test)]
+    super::bind::note_prepare_draw_for_test();
     if !DEPTH_BIAS_USED.load(Ordering::Acquire) {
         return;
     }
@@ -1577,7 +1579,6 @@ pub(crate) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     if !super::bind::prepare_indexed_draw(this, count) {
         return;
     }
-    prepare_draw(this);
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
