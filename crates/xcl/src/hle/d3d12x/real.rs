@@ -749,6 +749,7 @@ fn console_extensions(kind: Kind) -> Option<usize> {
         Kind::Device => Some(44),
         Kind::CommandList => Some(60),
         Kind::DmaList => Some(15),
+        Kind::CommandAllocator => Some(9),
         _ => None,
     }
 }
@@ -831,6 +832,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
+        Kind::CommandAllocator => vec![(9, alloc_register_custom_allocator_x as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -901,6 +903,11 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                (75, l::cmd_list_75_x as usize),
+                (126, l::cmd_list_126_x as usize),
+                (131, l::cmd_list_131_x as usize),
+                (132, l::cmd_list_132_x as usize),
+                (142, l::cmd_list_142_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -4325,6 +4332,16 @@ fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 
+/// command allocator #9: Registers the title's custom command memory allocator callback.
+unsafe extern "system" fn alloc_register_custom_allocator_x(this: *mut c_void, callback: usize, ctx: usize) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: ID3D12CommandAllocator::#9 RegisterCustomAllocator(allocator {:p}, callback {:#x}, ctx {:#x})", this, callback, ctx);
+    });
+    let _ = (this, callback, ctx);
+    S_OK
+}
+
 /// first queue slot `queue_dispatch` handles
 const QUEUE_FIRST: usize = 14;
 
@@ -4338,6 +4355,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     const PC_GET_DESC: usize = 18;
     if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
+    }
+    if slot == 31 && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue extension #31 called)");
     }
     let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
     if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
@@ -4384,6 +4404,13 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        // the newer layout's #31 (older 29): queue extension
+        29 if shifted => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_info!("D3D12.X: queue #31 extension (a1: {a1:#x}, a2: {a2:#x}, a3: {a3:#x}, a4: {a4:#x})"));
+            let _ = (a1, a2, a3, a4);
+            0
+        }
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at

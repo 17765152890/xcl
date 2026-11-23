@@ -1801,6 +1801,7 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
     copies what it reads (`list_x::gpu_va`); rect lists are drawn as two triangles a rectangle (fourth corner on the
     CPU, `bind::draw_rects`); a committed texture asked for its GPU address gets lazily committed memory at one
     (`real::texture_memory`); stand-in streams carry null pointers for missing shaders.
+  - Console D3D12 extensions: `ID3D12CommandAllocator::#9` (RegisterCustomAllocator callback), `ID3D12GraphicsCommandList::#75`, `#126`, `#131`, `#132`, `#142`, and `ID3D12CommandQueue::#31` on newer GDK layouts (Issue #159).
   - Pipelines whose console MS container sits in the AS slot (no MS subobject; its minimap) are **refused**:
     translated as the mesh shader they are, the title rendered nothing from then on (black every run). Open: what
     it expects of them.

@@ -150,7 +150,10 @@ fn vtable(kind: Kind) -> *const usize {
             v[17] = Queue_GetClockCalibration as usize;
             v[18] = Hidden_ZeroDesc16 as usize; // GetDesc
         }
-        Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
+        Kind::CommandAllocator => {
+            v[8] = Ret_S_OK as usize; // Reset
+            v[9] = Ret_S_OK as usize; // RegisterCustomAllocator
+        }
         Kind::CommandList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
