@@ -111,6 +111,11 @@ impl<W: Write> Trace<W> {
         if !self.enabled || self.sequence >= self.cap {
             return;
         }
+        // Release hooks also observe native lists that never entered the console-list trace
+        // lifecycle. Keep the trace self-contained instead of inventing an epoch-zero object.
+        if matches!(kind, Kind::Release) && !self.epochs.contains_key(&raw) {
+            return;
+        }
         let list = self.object_id(raw);
         let epoch = self.epochs.entry(raw).or_insert(0);
         if matches!(outcome, Outcome::Accepted) && matches!(kind, Kind::Create | Kind::Reset | Kind::ClearState) {
@@ -296,6 +301,18 @@ mod tests {
         assert!(!trace.enabled);
         assert_eq!(trace.writer.calls, 1);
         assert_eq!(trace.sequence, 0);
+    }
+
+    #[test]
+    fn release_without_an_observed_create_is_not_emitted() {
+        let mut trace = Trace::new(Vec::new(), 8, 7);
+        trace.emit(0x1000, Kind::Release, Outcome::Accepted, Category::None, [0, 0, 0]);
+        assert!(trace.writer.is_empty());
+        assert_eq!(trace.sequence, 0);
+
+        trace.emit(0x1000, Kind::Create, Outcome::Accepted, Category::None, [0, 0, 0]);
+        trace.emit(0x1000, Kind::Release, Outcome::Accepted, Category::None, [0, 0, 0]);
+        assert_eq!(String::from_utf8(trace.writer).unwrap().lines().count(), 2);
     }
 
     #[test]

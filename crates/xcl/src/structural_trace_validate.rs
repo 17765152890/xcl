@@ -229,10 +229,20 @@ fn validate_reader_with_cap(
 
         match r.event {
             Event::Create => {
-                if r.outcome != Outcome::Accepted || r.epoch != 1 || seen.contains(&r.list) {
+                if r.outcome != Outcome::Accepted {
                     return Err(reject(line_number, "lifecycle_create"));
                 }
-                active.insert(r.list, 1);
+                let expected = match active.get(&r.list).copied() {
+                    Some(current) => current
+                        .checked_add(1)
+                        .ok_or_else(|| reject(line_number, "epoch_overflow"))?,
+                    None if !seen.contains(&r.list) => 1,
+                    None => return Err(reject(line_number, "lifecycle_create")),
+                };
+                if r.epoch != expected {
+                    return Err(reject(line_number, "lifecycle_create"));
+                }
+                active.insert(r.list, expected);
                 seen.insert(r.list);
                 epochs += 1;
             }
@@ -420,6 +430,43 @@ mod tests {
         assert_eq!(
             (a.events, a.lists, a.epochs, a.accepted, a.skipped, a.rejected),
             (6, 1, 2, 3, 1, 2)
+        );
+    }
+
+    #[test]
+    fn active_create_rebind_advances_epoch_without_creating_a_new_identity() {
+        let trace = [
+            record(0, 1, 1, "create", "accepted", "none", [3, 0, 0]),
+            record(1, 1, 2, "create", "accepted", "none", [0, 0, 0]),
+            record(2, 1, 3, "reset", "accepted", "none", [0, 0, 0]),
+            record(3, 1, 3, "release", "accepted", "none", [0, 0, 0]),
+        ]
+        .concat();
+        let summary = check(&trace).unwrap();
+        assert_eq!((summary.events, summary.lists, summary.epochs), (4, 1, 3));
+
+        let stale_epoch = trace.replacen(
+            "\"epoch\":2,\"event\":\"create\"",
+            "\"epoch\":1,\"event\":\"create\"",
+            1,
+        );
+        assert_eq!(
+            check(&stale_epoch).unwrap_err().category,
+            "lifecycle_create"
+        );
+
+        let after_release = format!(
+            "{}{}",
+            [
+                record(0, 1, 1, "create", "accepted", "none", [0, 0, 0]),
+                record(1, 1, 1, "release", "accepted", "none", [0, 0, 0]),
+            ]
+            .concat(),
+            record(2, 1, 2, "create", "accepted", "none", [0, 0, 0])
+        );
+        assert_eq!(
+            check(&after_release).unwrap_err().category,
+            "lifecycle_create"
         );
     }
 

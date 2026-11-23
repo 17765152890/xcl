@@ -18,7 +18,7 @@
 - Command-list creation, `Reset`, `ClearState`, and release now synchronize the bound pipeline
   and root-argument state. `Reset` is transactional: native failure preserves the current
   recording and its allocation ownership; success commits the new state exactly once.
-- Current verification: 615 library tests passed, 16 ignored, 0 failed; every workspace
+- Current verification: 617 library tests passed, 16 ignored, 0 failed; every workspace
   integration and end-to-end suite passed. The only build warning is a pre-existing unrelated
   standard-library deprecation.
 - `XCL_STRUCTURAL_TRACE=<output>` enables an optional bounded structural JSONL trace for
@@ -28,6 +28,10 @@
 - `xcl trace-validate <file> [--json]` validates structural traces offline with strict schema,
   size, sequence, run, list, epoch, lifecycle, outcome, and category checks. Hostile lines are
   capped at 513 bytes before rejection, and errors expose only stable line numbers and categories.
+- A release synthetic run exercised the sink and validator together: its bounded trace contained
+  79 events across 29 anonymous lists and 37 epochs, and the release CLI accepted it. Rebinding an
+  active list advances its epoch exactly once; stale epochs, recreation after release, incomplete
+  lifecycles, and commands without an observed creation remain rejected.
 - The optimized workspace build produces a runnable `xcl.exe`; release-mode launcher tests
   execute the synthetic title end to end and verify that its source folder remains unchanged.
   The complete optimized workspace suite passes, including all six GPU pipeline integration
