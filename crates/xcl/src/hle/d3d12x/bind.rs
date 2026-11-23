@@ -232,22 +232,29 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if super::real::two_pass_of(pso).is_some() {
         reject_two_pass_draw("ExecuteIndirect");
+        super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::IncompatiblePipeline, [max, u32::from(gfx), u32::from(compute)]);
         return;
     }
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     if !gfx && !compute {
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        pc(this, sig, max, args, args_off, count_buf, count_off);
+        super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [max, 0, 0]);
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
         }
+        super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::IncompatiblePipeline, [max, u32::from(gfx), u32::from(compute)]);
         return;
     }
     if gfx {
-        if prepare_graphics_command(this).is_some() {
+        if prepare_graphics_command(this).is_ok() {
             pc(this, sig, max, args, args_off, count_buf, count_off);
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [max, 1, 0]);
+        } else {
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [max, 1, 0]);
         }
         return;
     }
@@ -255,7 +262,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            pc(this, sig, max, args, args_off, count_buf, count_off);
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [max, 0, 1]);
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -263,6 +271,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
             }
+            super::structural_trace::event(this, super::structural_trace::Kind::ExecuteIndirect, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [max, 0, 1]);
         }
     }
 }
@@ -270,8 +279,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
-    if let Some(list) = prepare_graphics_command(this) {
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+    match prepare_graphics_command(this) {
+        Ok(list) => {
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+            super::structural_trace::event(this, super::structural_trace::Kind::Draw, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [vertices, instances, first_vertex]);
+        }
+        Err(category) => {
+            let outcome = if matches!(category, super::structural_trace::Category::IncompatiblePipeline) { super::structural_trace::Outcome::Rejected } else { super::structural_trace::Outcome::Skipped };
+            super::structural_trace::event(this, super::structural_trace::Kind::Draw, outcome, category, [vertices, instances, first_vertex]);
+        }
     }
 }
 
@@ -288,16 +304,23 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
-    if let Some(list) = prepare_graphics_command(this) {
-        list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    match prepare_graphics_command(this) {
+        Ok(list) => {
+            list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+            super::structural_trace::event(this, super::structural_trace::Kind::DrawIndexed, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [indices, instances, first_index]);
+        }
+        Err(category) => {
+            let outcome = if matches!(category, super::structural_trace::Category::IncompatiblePipeline) { super::structural_trace::Outcome::Rejected } else { super::structural_trace::Outcome::Skipped };
+            super::structural_trace::event(this, super::structural_trace::Kind::DrawIndexed, outcome, category, [indices, instances, first_index]);
+        }
     }
 }
 
 /// Prepare the graphics ABI for a console-specific indexed draw whose command emission is
 /// owned by the caller (for example, DrawIndexedX's temporary index-buffer binding).
-pub(super) unsafe fn prepare_indexed_draw(this: *mut c_void, indices: u32) -> bool {
+pub(super) unsafe fn prepare_indexed_draw(this: *mut c_void, indices: u32) -> Result<(), super::structural_trace::Category> {
     DRAW_ARGS.with(|d| d.set((true, indices, 1, 0, 0)));
-    prepare_graphics_command(this).is_some()
+    prepare_graphics_command(this).map(|_| ())
 }
 
 fn reject_two_pass_draw(what: &str) {
@@ -311,15 +334,15 @@ fn reject_two_pass_draw(what: &str) {
 /// Establish the complete state invariant for a graphics command: reject mesh two-pass
 /// metadata, bind the translated graphics ABI (or retain an ordinary PC pipeline), then apply
 /// pending draw state so a derived depth-bias PSO remains the final pipeline.
-unsafe fn prepare_graphics_command(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
+unsafe fn prepare_graphics_command(this: *mut c_void) -> Result<ID3D12GraphicsCommandList, super::structural_trace::Category> {
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     if super::real::two_pass_of(pso).is_some() {
         reject_two_pass_draw("draw");
-        return None;
+        return Err(super::structural_trace::Category::IncompatiblePipeline);
     }
-    let list = graphics_bound(this)?;
+    let list = graphics_bound(this).ok_or(super::structural_trace::Category::PrerequisiteUnavailable)?;
     super::list_x::prepare_draw(this);
-    Some(list)
+    Ok(list)
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -627,6 +650,10 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    dispatch_kind(this, x, y, z, super::structural_trace::Kind::Dispatch);
+}
+
+unsafe fn dispatch_kind(this: *mut c_void, x: u32, y: u32, z: u32, kind: super::structural_trace::Kind) {
     let pso = with(this, |s| s.pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
@@ -637,6 +664,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        super::structural_trace::event(this, kind, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::IncompatiblePipeline, [x, y, z]);
         return;
     }
     count(DISPATCHES);
@@ -645,6 +673,9 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
         }
+        super::structural_trace::event(this, kind, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [x, y, z]);
+    } else {
+        super::structural_trace::event(this, kind, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [x, y, z]);
     }
 }
 
@@ -680,9 +711,14 @@ pub(super) unsafe fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32) {
     let metadata = super::real::two_pass_of(real_pso);
     let route = dispatch_x_route(metadata.as_deref(), super::real::is_translated_compute(real_pso), [x, y, z]);
     match route {
-        Ok(DispatchXRoute::Compute) | Ok(DispatchXRoute::Skip) => dispatch(this, x, y, z),
+        Ok(DispatchXRoute::Compute) | Ok(DispatchXRoute::Skip) => {
+            dispatch_kind(this, x, y, z, super::structural_trace::Kind::DispatchX)
+        }
         Ok(DispatchXRoute::TwoPass(plan)) => {
-            if plan.total_groups == 0 { return; }
+            if plan.total_groups == 0 {
+                super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [x, y, z]);
+                return;
+            }
             let result = (|| -> Result<(), String> {
                 let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this).ok_or("command list")?;
                 // Validate the required interface before allocating an ABI record, so a cast
@@ -695,13 +731,17 @@ pub(super) unsafe fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32) {
                 Ok(())
             })();
             match result {
-                Ok(()) => count(DISPATCHES),
+                Ok(()) => {
+                    count(DISPATCHES);
+                    super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [x, y, z]);
+                }
                 Err(e) => {
                     count(DISPATCHES_SKIPPED);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                         crate::xlog_warn!("D3D12.X: DispatchX with a two-pass pipeline skipped: {e}");
                     }
+                    super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Skipped, super::structural_trace::Category::PrerequisiteUnavailable, [x, y, z]);
                 }
             }
         }
@@ -711,6 +751,7 @@ pub(super) unsafe fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32) {
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: DispatchX plan rejected: {e}");
             }
+            super::structural_trace::event(this, super::structural_trace::Kind::DispatchX, super::structural_trace::Outcome::Rejected, super::structural_trace::Category::InvalidArguments, [x, y, z]);
         }
     }
 }
@@ -1245,6 +1286,7 @@ mod abi_tests {
         };
         let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
         with(list, |state| state.pso = list_key);
+        super::super::structural_trace::start_test_capture();
         let skipped_before = COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst);
 
         // This is the function installed in console command-list slot 81. A fake command-list
@@ -1261,6 +1303,11 @@ mod abi_tests {
             )
         };
         assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 1);
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["event"], "draw_indexed_x");
+        assert_eq!(trace[0]["outcome"], "rejected");
+        assert_eq!(trace[0]["category"], "incompatible_pipeline");
         with(list, |state| assert!(state.uma.is_empty()));
         STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
     }
@@ -1280,6 +1327,7 @@ mod abi_tests {
         };
         let _registration = super::super::real::install_two_pass_for_test(list_key, metadata);
         with(list, |state| state.pso = list_key);
+        super::super::structural_trace::start_test_capture();
         let skipped_before = COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst);
 
         // The fake pointer proves rejection precedes command-list borrowing or vtable access.
@@ -1289,7 +1337,57 @@ mod abi_tests {
             execute_indirect(list, 0, 1, 0, 0, 0, 0);
         }
         assert_eq!(COUNTS[DRAWS_SKIPPED].load(Ordering::SeqCst), skipped_before + 3);
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 3);
+        for record in &trace {
+            assert_eq!(record["outcome"], "rejected");
+            assert_eq!(record["category"], "incompatible_pipeline");
+        }
         STATES.lock().unwrap().as_mut().unwrap().remove(&list_key);
+    }
+
+    #[test]
+    fn console_draw_indexed_x_entry_rejects_invalid_index_format_with_exact_category() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list = 0x7fff_6790usize as *mut c_void;
+        super::super::structural_trace::start_test_capture();
+        unsafe {
+            super::super::list_x::draw_indexed_x(
+                list,
+                0x1000,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                3,
+                0,
+            );
+        }
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["event"], "draw_indexed_x");
+        assert_eq!(trace[0]["outcome"], "rejected");
+        assert_eq!(trace[0]["category"], "invalid_arguments");
+    }
+
+    #[test]
+    fn console_draw_indexed_x_zero_work_entry_preserves_trace_sequence() {
+        let _serial = DISPATCH_X_TEST_LOCK.lock().unwrap();
+        let list = 0x7fff_6791usize as *mut c_void;
+        super::super::structural_trace::start_test_capture();
+        unsafe {
+            super::super::list_x::draw_indexed_x(
+                list,
+                0x1000,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT,
+                0,
+                0,
+            );
+        }
+        let trace = super::super::structural_trace::finish_test_capture();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["sequence"], 0);
+        assert_eq!(trace[0]["event"], "draw_indexed_x");
+        assert_eq!(trace[0]["outcome"], "accepted");
+        assert_eq!(trace[0]["category"], "none");
+        assert_eq!((trace[0]["a"].as_u64(), trace[0]["b"].as_u64(), trace[0]["c"].as_u64()), (Some(0), Some(1), Some(0)));
     }
 
     fn seed_stale_binding_state(list: *mut c_void, pso: usize) {

@@ -7,11 +7,15 @@ production path disabled.
 
 ## Implementation status
 
-The bounded, versioned JSONL sink and offline admission validator described below do not exist
-yet. Current frame and shader tracing is interactive diagnostic logging, not a compliant evidence
-export. Existing logs may contain raw addresses or bounded memory-derived diagnostics and must not
-be shared as contract-compliant evidence. A future sink must transform observations through the
-redaction rules below before export.
+The bounded, versioned structural JSONL sink exists as an explicit opt-in through
+`XCL_STRUCTURAL_TRACE`. It covers command-list lifecycle, draw, dispatch, and indirect-command
+events with pseudonymous identifiers, fixed categories, and strict caps. The offline admission
+validator does not exist yet, and the sink does not by itself enable production eligibility.
+
+Current frame and shader tracing remains interactive diagnostic logging, not compliant evidence
+export. Those logs may contain raw addresses or bounded memory-derived diagnostics and must not be
+shared as contract-compliant evidence. Only output produced through the structural sink follows
+the redaction rules below.
 
 ## Required evidence
 
@@ -140,11 +144,10 @@ mappings, resource layouts, or draw-to-dispatch conversion.
 2. Run once with ordinary aggregate reporting.
 3. If graphics initialization is reached, enable bounded frame tracing.
 4. Narrow later local captures to specific shaders and enforce a small event cap.
-5. Implement the bounded redaction sink before exporting any trace evidence.
-6. Export only redacted structural JSONL and aggregate results through that sink.
-7. Implement and run the offline validator against every admission gate.
-8. Add a synthetic regression reproducing the observed contract.
-9. Enable only that exact verified contract behind a fail-closed predicate.
+5. Export only the sink's redacted structural JSONL plus separately reviewed aggregate results.
+6. Implement and run the offline validator against every admission gate.
+7. Add a synthetic regression reproducing the observed contract.
+8. Enable only that exact verified contract behind a fail-closed predicate.
 
 ## Prohibited scope
 

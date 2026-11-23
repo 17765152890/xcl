@@ -630,6 +630,13 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
     }
     super::bind::reset(list, alloc, pso);
+    super::structural_trace::event(
+        list,
+        super::structural_trace::Kind::Create,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [ty.0 as u32, u32::from(pso != 0), 0],
+    );
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -645,6 +652,13 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::structural_trace::event(
+        list as *mut c_void,
+        super::structural_trace::Kind::Release,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [0, 0, 0],
+    );
     super::bind::forget(list as *mut c_void);
     if let Some(old) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list)) {
         if !old.pending_waits.is_empty() {
@@ -724,6 +738,13 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
 /// Track `ClearState` on a command list: resets dynamic state and binds `pso`.
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     super::bind::clear_state(list, pso);
+    super::structural_trace::event(
+        list,
+        super::structural_trace::Kind::ClearState,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [u32::from(pso != 0), 0, 0],
+    );
     let key = list as usize;
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
@@ -1574,12 +1595,40 @@ pub(crate) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     let stride = match format {
         DXGI_FORMAT_R16_UINT => 2,
         DXGI_FORMAT_R32_UINT => 4,
-        f => return warn(&N, "DrawIndexedX", format_args!("index format {}", f.0)),
+        f => {
+            warn(&N, "DrawIndexedX", format_args!("index format {}", f.0));
+            super::structural_trace::event(
+                this,
+                super::structural_trace::Kind::DrawIndexedX,
+                super::structural_trace::Outcome::Rejected,
+                super::structural_trace::Category::InvalidArguments,
+                [count, 0, 0],
+            );
+            return;
+        }
     };
     if count == 0 {
+        super::structural_trace::event(
+            this,
+            super::structural_trace::Kind::DrawIndexedX,
+            super::structural_trace::Outcome::Accepted,
+            super::structural_trace::Category::None,
+            [0, 1, 0],
+        );
         return;
     }
-    if !super::bind::prepare_indexed_draw(this, count) {
+    if let Err(category) = super::bind::prepare_indexed_draw(this, count) {
+        super::structural_trace::event(
+            this,
+            super::structural_trace::Kind::DrawIndexedX,
+            if matches!(category, super::structural_trace::Category::IncompatiblePipeline) {
+                super::structural_trace::Outcome::Rejected
+            } else {
+                super::structural_trace::Outcome::Skipped
+            },
+            category,
+            [count, 1, 0],
+        );
         return;
     }
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
@@ -1587,6 +1636,13 @@ pub(crate) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     set_index_buffer(this, Some(&view));
     pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32)>(this, PC_DRAW_INDEXED)(this, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
+    super::structural_trace::event(
+        this,
+        super::structural_trace::Kind::DrawIndexedX,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [count, 1, 0],
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1619,6 +1675,13 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         *(this as *mut usize) = ext;
     }
     if hr < 0 {
+        super::structural_trace::event(
+            this,
+            super::structural_trace::Kind::Reset,
+            super::structural_trace::Outcome::Rejected,
+            super::structural_trace::Category::NativeFailure,
+            [u32::from(pso != 0), 0, 0],
+        );
         return hr;
     }
 
@@ -1641,6 +1704,13 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::bind::reset(this, alloc, pso);
+    super::structural_trace::event(
+        this,
+        super::structural_trace::Kind::Reset,
+        super::structural_trace::Outcome::Accepted,
+        super::structural_trace::Category::None,
+        [u32::from(pso != 0), 0, 0],
+    );
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
