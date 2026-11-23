@@ -1,7 +1,6 @@
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::collections::BTreeMap;
+use std::hint::black_box;
 use std::path::Path;
 use xcl::config::Config;
 use xcl::manifest;
