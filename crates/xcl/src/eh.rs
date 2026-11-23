@@ -951,8 +951,11 @@ mod tests {
         modules::unregister_mapped(code);
     }
 
+    static TITLE_FILTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn unhandled_filter_unwinds_cleanly_from_title_filter() {
+        let _serial = TITLE_FILTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct ResetFilter(usize);
         impl Drop for ResetFilter {
             fn drop(&mut self) {

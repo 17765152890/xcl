@@ -558,10 +558,6 @@ mod tests {
         }));
         assert!(r1.is_err(), "init_dll must propagate unwind from guest DllMain");
         assert_eq!(IN_LOAD.with(|c| c.get()), 0, "LoadGuard::drop must reset IN_LOAD on unwind");
-        assert!(
-            !matches!(LOAD_LOCK.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
-            "LOAD_LOCK must be unlocked after unwind"
-        );
         LOAD_LOCK.clear_poison();
         {
             // Subsequent LoadGuard::enter() must succeed cleanly without deadlocking.
@@ -589,11 +585,10 @@ mod tests {
         }));
         assert!(r2.is_err(), "init_dll must propagate unwind from guest TLS callback");
         assert_eq!(IN_LOAD.with(|c| c.get()), 0, "LoadGuard::drop must reset IN_LOAD on TLS unwind");
-        assert!(
-            !matches!(LOAD_LOCK.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
-            "LOAD_LOCK must be unlocked after TLS unwind"
-        );
         LOAD_LOCK.clear_poison();
+        {
+            let (_g, _lock) = LoadGuard::enter();
+        }
         assert!(!m_tls.initialized.load(Ordering::Acquire));
     }
 }

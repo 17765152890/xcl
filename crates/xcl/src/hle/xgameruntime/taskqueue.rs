@@ -592,36 +592,35 @@ pub unsafe extern "system-unwind" fn XTaskQueueTerminate(h: *mut c_void, wait: b
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
     q.state.lock().unwrap().terminated = true;
     // Cancel only queued items submitted through `q`; sibling queues sharing a composite port
-    // keep their pending work untouched. Wake any manual-port dispatchers waiting on this port.
+    // keep their pending work untouched. Drain both ports and wake any manual-port dispatchers
+    // on both ports before running any canceled callback so an unwind during a `PORT_WORK`
+    // callback still drains `PORT_COMPLETION` and never strands `PORT_COMPLETION` waiters.
+    struct Remaining(VecDeque<QueuedItem>);
+    impl Drop for Remaining {
+        fn drop(&mut self) {
+            for qi in self.0.drain(..) {
+                qi.queue.done_one(qi.port);
+            }
+        }
+    }
+    let mut mine = Remaining(VecDeque::new());
     for port in 0..2 {
-        let mine = {
+        {
             let mut items = q.ports[port].items.lock().unwrap();
-            let mut mine = Vec::new();
             let mut keep = VecDeque::with_capacity(items.len());
             while let Some(qi) = items.pop_front() {
                 if Arc::ptr_eq(&qi.queue, &q) {
-                    mine.push(qi);
+                    mine.0.push_back(qi);
                 } else {
                     keep.push_back(qi);
                 }
             }
             *items = keep;
-            mine
-        };
+        }
         q.ports[port].cv.notify_all();
-        struct Remaining(Vec<QueuedItem>);
-        impl Drop for Remaining {
-            fn drop(&mut self) {
-                for qi in self.0.drain(..) {
-                    qi.queue.done_one(qi.port);
-                }
-            }
-        }
-        let mut mine = Remaining(mine);
-        while !mine.0.is_empty() {
-            let qi = mine.0.remove(0);
-            qi.queue.execute(qi.port, qi.item);
-        }
+    }
+    while let Some(qi) = mine.0.pop_front() {
+        qi.queue.execute(qi.port, qi.item);
     }
     // Delayed callbacks of `q` still waiting for their time are canceled too, before the
     // termination callback (libHttpClient: CancelPendingEntries when a port terminates). They
@@ -1186,6 +1185,53 @@ mod tests {
                 XTaskQueueTerminate(h2, true, std::ptr::null_mut(), throwing_term as usize)
             });
             assert!(r4.is_err(), "XTaskQueueTerminate(wait=true) must propagate unwind from terminated callback");
+            XTaskQueueCloseHandle(h2);
+        }
+    }
+
+    #[test]
+    fn terminate_work_unwind_still_drains_completion_and_wakes_waiters() {
+        use std::sync::mpsc;
+
+        unsafe extern "system-unwind" fn throwing_cb(_ctx: *mut c_void, _canceled: bool) {
+            panic!("guest canceled PORT_WORK unwind");
+        }
+        unsafe extern "system-unwind" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+
+        unsafe {
+            // (a) Unwind during a canceled PORT_WORK callback still drains PORT_COMPLETION and
+            // releases inflight counts for both ports.
+            let mut h1 = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h1), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h1, PORT_WORK, std::ptr::null_mut(), throwing_cb as usize), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h1, PORT_COMPLETION, std::ptr::null_mut(), noop as usize), S_OK);
+            let r1 = std::panic::catch_unwind(|| XTaskQueueTerminate(h1, true, std::ptr::null_mut(), 0));
+            assert!(r1.is_err());
+            assert!(XTaskQueueIsEmpty(h1, PORT_WORK), "PORT_WORK must be empty after terminate unwind");
+            assert!(XTaskQueueIsEmpty(h1, PORT_COMPLETION), "PORT_COMPLETION must be drained even when PORT_WORK unwinds");
+            XTaskQueueCloseHandle(h1);
+
+            // (b) A manual dispatcher blocked in XTaskQueueDispatch(PORT_COMPLETION, INFINITE)
+            // must still be woken even when a canceled PORT_WORK callback unwinds.
+            let mut h2 = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h2), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h2, PORT_WORK, std::ptr::null_mut(), throwing_cb as usize), S_OK);
+            let h2_addr = h2 as usize;
+            let (tx, rx) = mpsc::channel();
+            let dispatcher = std::thread::spawn(move || {
+                let ran = XTaskQueueDispatch(h2_addr as *mut c_void, PORT_COMPLETION, u32::MAX);
+                let _ = tx.send(ran);
+            });
+            std::thread::sleep(Duration::from_millis(10));
+            let r2 = std::panic::catch_unwind(|| XTaskQueueTerminate(h2, true, std::ptr::null_mut(), 0));
+            assert!(r2.is_err());
+            let ran = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("PORT_COMPLETION dispatcher hung after PORT_WORK unwind in XTaskQueueTerminate");
+            dispatcher.join().unwrap();
+            assert!(!ran);
+            assert!(XTaskQueueIsEmpty(h2, PORT_WORK));
+            assert!(XTaskQueueIsEmpty(h2, PORT_COMPLETION));
             XTaskQueueCloseHandle(h2);
         }
     }

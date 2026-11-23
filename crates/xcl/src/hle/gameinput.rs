@@ -1397,25 +1397,56 @@ mod tests {
     fn reading_callback_unwind_releases_guard_and_unblocks_unregister() {
         let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+        use std::sync::atomic::AtomicUsize;
+
         struct ThrowCtx {
             test_tid: ThreadId,
+            held_reading: AtomicUsize,
+        }
+
+        struct UnregGuard {
+            g: *mut Object,
+            token: u64,
+        }
+        impl Drop for UnregGuard {
+            fn drop(&mut self) {
+                if self.token != 0 {
+                    unsafe { unregister_callback(self.g, self.token, u64::MAX) };
+                }
+            }
+        }
+
+        struct HeldReadingGuard(usize);
+        impl Drop for HeldReadingGuard {
+            fn drop(&mut self) {
+                if self.0 != 0 {
+                    unsafe { reading_release(self.0 as *mut Reading) };
+                }
+            }
         }
 
         unsafe extern "system-unwind" fn throwing_reading_cb(
             _token: u64,
             ctx: *mut c_void,
-            _reading: *mut Reading,
+            reading: *mut Reading,
             _overflow: bool,
         ) {
             let c = &*(ctx as *const ThrowCtx);
             // Only throw on the test thread so the background poller thread never panics.
             if std::thread::current().id() == c.test_tid {
+                // Take a temporary extra ref so we can safely verify after unwind that
+                // ReadingGuard released dispatch_reading_callbacks’s reference.
+                reading_add_ref(reading);
+                c.held_reading.store(reading as usize, Ordering::Release);
                 panic!("guest GameInput ReadingCallback unwind");
             }
         }
 
-        let ctx = Box::new(ThrowCtx { test_tid: std::thread::current().id() });
+        let test_tid = std::thread::current().id();
+        let ctx = Box::new(ThrowCtx { test_tid, held_reading: AtomicUsize::new(0) });
         let g = input();
+        // Declared after `ctx` so Drop always unregisters and waits for the poller before `ctx` frees.
+        let mut unreg = UnregGuard { g, token: 0 };
         let mut token = 0u64;
         unsafe {
             assert_eq!(
@@ -1423,14 +1454,42 @@ mod tests {
                 S_OK
             );
         }
+        unreg.token = token;
+        let entry = CALLBACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.token == token)
+            .cloned()
+            .expect("registered reading callback entry");
 
         let r = std::panic::catch_unwind(|| {
             dispatch_reading_callbacks(GamepadState { buttons: A, ..Default::default() });
         });
         assert!(r.is_err(), "dispatch_reading_callbacks must propagate unwind from guest ReadingCallback");
 
-        // CallbackGuard::drop must have decremented in_flight and cleared running_threads so
-        // zero-timeout unregister succeeds immediately.
-        assert!(unsafe { unregister_callback(g, token, 0) }, "CallbackGuard did not release in-flight tracking on unwind");
+        // Verify ReadingGuard::drop released the dispatcher’s ref (refs went 2 -> 1).
+        let held = HeldReadingGuard(ctx.held_reading.swap(0, Ordering::AcqRel));
+        assert_ne!(held.0, 0, "callback must have received a Reading");
+        let refs_after_unwind = unsafe { (*(held.0 as *const Reading)).refs.load(Ordering::Acquire) };
+        assert_eq!(refs_after_unwind, 1, "ReadingGuard did not release Reading on unwind");
+        drop(held);
+
+        // Verify CallbackGuard::drop cleared this thread from running_threads and decremented in_flight.
+        {
+            let st = entry.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!st.running_threads.contains(&test_tid), "CallbackGuard did not clear test_tid from running_threads on unwind");
+            assert_eq!(st.in_flight, st.running_threads.len(), "CallbackGuard did not decrement in_flight on unwind");
+        }
+
+        // Also verify from a DIFFERENT thread that zero-timeout unregister does not see test_tid as in-flight.
+        let g_addr = g as usize;
+        let ok = std::thread::spawn(move || unsafe { unregister_callback(g_addr as *mut Object, token, 0) })
+            .join()
+            .unwrap();
+        if ok {
+            unreg.token = 0;
+        }
+        assert!(ok, "other-thread unregister_callback(0) saw stale in-flight tracking after unwind");
     }
 }

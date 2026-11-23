@@ -2124,13 +2124,31 @@ mod tests {
             XMemFreeDefault(p, attrs);
         }
 
+        // Separate title hooks whose non-sentinel fallback returns null / no-op (matching
+        // `TITLE_HOOKS == [0, 0]`) so concurrent D3D12 tests calling `runtime_alloc` do not
+        // receive `Memory::Title` allocations that would miss `TITLE_HOOKS[1]` after reset.
+        unsafe extern "system-unwind" fn throwing_title_alloc(_size: usize, attrs: u64) -> *mut c_void {
+            if attrs == SENTINEL_ATTRS {
+                let _probe = DropProbe;
+                panic!("guest title runtime_alloc hook unwind");
+            }
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "system-unwind" fn throwing_title_free(_p: *mut c_void, attrs: u64) {
+            if attrs == SENTINEL_ATTRS {
+                let _probe = DropProbe;
+                panic!("guest title runtime_free hook unwind");
+            }
+        }
+
         let _reset = HookReset;
         DROPS.store(0, Ordering::SeqCst);
 
         unsafe {
             XMemSetAllocationHooks(throwing_alloc as usize, throwing_free as usize);
-            TITLE_HOOKS[0].store(throwing_alloc as usize, Ordering::Release);
-            TITLE_HOOKS[1].store(throwing_free as usize, Ordering::Release);
+            TITLE_HOOKS[0].store(throwing_title_alloc as usize, Ordering::Release);
+            TITLE_HOOKS[1].store(throwing_title_free as usize, Ordering::Release);
 
             let r1 = std::panic::catch_unwind(|| XMemAlloc(64, SENTINEL_ATTRS));
             assert!(r1.is_err(), "XMemAlloc should propagate unwind from guest alloc hook");
