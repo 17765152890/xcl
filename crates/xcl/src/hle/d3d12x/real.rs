@@ -1872,6 +1872,9 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
         let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
     }
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
     hr
 }
 
@@ -3660,6 +3663,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        for &list in chunk {
+            super::structural_trace::event(list, super::structural_trace::Kind::Submit,
+                super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [0, 0, 0]);
+        }
         super::list_x::readback_sparse_writes(this, chunk);
     });
     super::present::note_execute(this, &mapped);

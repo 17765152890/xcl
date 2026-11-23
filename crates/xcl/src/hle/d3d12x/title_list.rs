@@ -108,6 +108,12 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
+    let get_type: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(pc_slot(pc, 8));
+    if get_type(pc) == 3 {
+        super::structural_trace::event(pc, super::structural_trace::Kind::Close,
+            if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+            if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
+    }
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);

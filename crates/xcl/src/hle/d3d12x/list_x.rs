@@ -1251,6 +1251,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if close_hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if close_hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
@@ -1265,6 +1268,8 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    super::structural_trace::event(this, super::structural_trace::Kind::Submit,
+        super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [0, 0, 0]);
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes);
@@ -1278,8 +1283,12 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         *(this as *mut usize) = ext;
     }
     if reset_hr < 0 {
+        super::structural_trace::event(this, super::structural_trace::Kind::Reset,
+            super::structural_trace::Outcome::Rejected, super::structural_trace::Category::NativeFailure, [u32::from(bound_pso != 0), 0, 0]);
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    super::structural_trace::event(this, super::structural_trace::Kind::Reset,
+        super::structural_trace::Outcome::Accepted, super::structural_trace::Category::None, [u32::from(bound_pso != 0), 0, 0]);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(this, &b);
@@ -1797,6 +1806,9 @@ unsafe fn is_buffer(res: usize) -> bool {
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);

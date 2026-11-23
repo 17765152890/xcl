@@ -395,13 +395,17 @@ macro_rules! list_forward {
 list_forward!(cl_3 = 3, cl_4 = 4, cl_5 = 5, cl_6 = 6, cl_7 = 7, cl_8 = 8);
 
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
-    match close(this) {
+    let hr = match close(this) {
         Ok(_) => S_OK,
         Err(e) => {
             crate::xlog_error!("console list: Close – {e}");
             crate::util::E_FAIL
         }
-    }
+    };
+    super::structural_trace::event(this, super::structural_trace::Kind::Close,
+        if hr >= 0 { super::structural_trace::Outcome::Accepted } else { super::structural_trace::Outcome::Rejected },
+        if hr >= 0 { super::structural_trace::Category::None } else { super::structural_trace::Category::NativeFailure }, [0, 0, 0]);
+    hr
 }
 
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {

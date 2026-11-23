@@ -22,6 +22,8 @@ pub(super) enum Kind {
     Create,
     Reset,
     ClearState,
+    Close,
+    Submit,
     Release,
     Draw,
     DrawIndexed,
@@ -111,9 +113,8 @@ impl<W: Write> Trace<W> {
         if !self.enabled || self.sequence >= self.cap {
             return;
         }
-        // Release hooks also observe native lists that never entered the console-list trace
-        // lifecycle. Keep the trace self-contained instead of inventing an epoch-zero object.
-        if matches!(kind, Kind::Release) && !self.epochs.contains_key(&raw) {
+        // Lifecycle hooks also observe native lists that never entered the scoped trace.
+        if matches!(kind, Kind::Close | Kind::Submit | Kind::Release) && !self.epochs.contains_key(&raw) {
             return;
         }
         let list = self.object_id(raw);
@@ -313,6 +314,18 @@ mod tests {
         trace.emit(0x1000, Kind::Create, Outcome::Accepted, Category::None, [0, 0, 0]);
         trace.emit(0x1000, Kind::Release, Outcome::Accepted, Category::None, [0, 0, 0]);
         assert_eq!(String::from_utf8(trace.writer).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn tracked_submit_without_close_is_emitted_and_validator_rejects_it() {
+        let mut trace = Trace::new(Vec::new(), 8, 7);
+        trace.emit(0x1000, Kind::Create, Outcome::Accepted, Category::None, [0, 0, 0]);
+        trace.emit(0x1000, Kind::Submit, Outcome::Accepted, Category::None, [0, 0, 0]);
+        let text = String::from_utf8(trace.writer).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let error = crate::structural_trace_validate::validate_reader(std::io::Cursor::new(text)).unwrap_err();
+        assert_eq!(error.line, 2);
+        assert_eq!(error.category, "lifecycle_submit");
     }
 
     #[test]

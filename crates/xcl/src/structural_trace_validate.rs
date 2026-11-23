@@ -19,6 +19,8 @@ enum Event {
     Create,
     Reset,
     ClearState,
+    Close,
+    Submit,
     Release,
     Draw,
     DrawIndexed,
@@ -34,6 +36,8 @@ impl Event {
             Self::Create => "create",
             Self::Reset => "reset",
             Self::ClearState => "clear_state",
+            Self::Close => "close",
+            Self::Submit => "submit",
             Self::Release => "release",
             Self::Draw => "draw",
             Self::DrawIndexed => "draw_indexed",
@@ -129,7 +133,7 @@ fn validate_outcome(r: &Record, line: u64) -> Result<(), ValidationError> {
     let valid = match (r.outcome, r.category) {
         (Outcome::Accepted, Category::None) => true,
         (Outcome::Skipped, Category::PrerequisiteUnavailable) => command(r.event),
-        (Outcome::Rejected, Category::NativeFailure) => r.event == Event::Reset,
+        (Outcome::Rejected, Category::NativeFailure) => matches!(r.event, Event::Reset | Event::Close),
         (Outcome::Rejected, Category::InvalidArguments) => {
             matches!(r.event, Event::DrawIndexedX | Event::DispatchX)
         }
@@ -146,7 +150,7 @@ fn validate_shape(r: &Record, line: u64) -> Result<(), ValidationError> {
     let valid = match r.event {
         Event::Create => r.a <= 6 && boolean(r.b) && r.c == 0,
         Event::Reset | Event::ClearState => boolean(r.a) && r.b == 0 && r.c == 0,
-        Event::Release => [r.a, r.b, r.c] == [0, 0, 0],
+        Event::Close | Event::Submit | Event::Release => [r.a, r.b, r.c] == [0, 0, 0],
         Event::DrawIndexedX => {
             r.c == 0 && boolean(r.b) && (r.category != Category::InvalidArguments || r.b == 0)
         }
@@ -161,7 +165,7 @@ pub fn validate(path: &Path) -> Result<ValidationSummary, ValidationError> {
     validate_reader(std::io::BufReader::new(file))
 }
 
-fn validate_reader(mut reader: impl BufRead) -> Result<ValidationSummary, ValidationError> {
+pub(crate) fn validate_reader(mut reader: impl BufRead) -> Result<ValidationSummary, ValidationError> {
     validate_reader_with_cap(&mut reader, MAX_EVENTS)
 }
 
@@ -173,6 +177,7 @@ fn validate_reader_with_cap(
     let mut sequence = 0u64;
     let mut run_id = None;
     let mut active = BTreeMap::<u32, u32>::new();
+    let mut closed = BTreeSet::<u32>::new();
     let mut seen = BTreeSet::<u32>::new();
     let mut epochs = 0u64;
     let mut accepted = 0u64;
@@ -243,6 +248,7 @@ fn validate_reader_with_cap(
                     return Err(reject(line_number, "lifecycle_create"));
                 }
                 active.insert(r.list, expected);
+                closed.remove(&r.list);
                 seen.insert(r.list);
                 epochs += 1;
             }
@@ -262,7 +268,19 @@ fn validate_reader_with_cap(
                 }
                 if r.outcome == Outcome::Accepted {
                     active.insert(r.list, expected);
+                    closed.remove(&r.list);
                     epochs += 1;
+                }
+            }
+            Event::Close => {
+                let current = *active.get(&r.list).ok_or_else(|| reject(line_number, "lifecycle_missing_create"))?;
+                if r.epoch != current || closed.contains(&r.list) { return Err(reject(line_number, "lifecycle_close")); }
+                if r.outcome == Outcome::Accepted { closed.insert(r.list); }
+            }
+            Event::Submit => {
+                let current = *active.get(&r.list).ok_or_else(|| reject(line_number, "lifecycle_missing_create"))?;
+                if r.outcome != Outcome::Accepted || r.epoch != current || !closed.contains(&r.list) {
+                    return Err(reject(line_number, "lifecycle_submit"));
                 }
             }
             Event::Release => {
@@ -272,6 +290,7 @@ fn validate_reader_with_cap(
                 if r.outcome != Outcome::Accepted || r.epoch != current {
                     return Err(reject(line_number, "lifecycle_release"));
                 }
+                closed.remove(&r.list);
             }
             _ => {
                 let current = *active
@@ -280,6 +299,7 @@ fn validate_reader_with_cap(
                 if r.epoch != current {
                     return Err(reject(line_number, "epoch"));
                 }
+                if closed.contains(&r.list) { return Err(reject(line_number, "lifecycle_closed")); }
             }
         }
 
@@ -468,6 +488,22 @@ mod tests {
             check(&after_release).unwrap_err().category,
             "lifecycle_create"
         );
+    }
+
+    #[test]
+    fn close_and_submission_order_is_fail_closed() {
+        let valid = [
+            record(0, 1, 1, "create", "accepted", "none", [0, 0, 0]),
+            record(1, 1, 1, "close", "accepted", "none", [0, 0, 0]),
+            record(2, 1, 1, "submit", "accepted", "none", [0, 0, 0]),
+            record(3, 1, 2, "reset", "accepted", "none", [0, 0, 0]),
+            record(4, 1, 2, "release", "accepted", "none", [0, 0, 0]),
+        ].concat();
+        assert_eq!(check(&valid).unwrap().event_counts["submit"], 1);
+        let open = [record(0, 1, 1, "create", "accepted", "none", [0, 0, 0]), record(1, 1, 1, "submit", "accepted", "none", [0, 0, 0])].concat();
+        assert_eq!(check(&open).unwrap_err().category, "lifecycle_submit");
+        let closed = [record(0, 1, 1, "create", "accepted", "none", [0, 0, 0]), record(1, 1, 1, "close", "accepted", "none", [0, 0, 0]), record(2, 1, 1, "draw", "accepted", "none", [3, 1, 0])].concat();
+        assert_eq!(check(&closed).unwrap_err().category, "lifecycle_closed");
     }
 
     #[test]
