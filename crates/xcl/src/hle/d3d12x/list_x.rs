@@ -2944,12 +2944,14 @@ mod tests {
         }
         unsafe extern "system" fn fake_noop_ptr(_this: *mut c_void, _p: *mut c_void) {}
         unsafe extern "system" fn fake_noop_uav(_this: *mut c_void, _slot: u32, _va: u64) {}
+        unsafe extern "system" fn fake_set_heaps(_this: *mut c_void, _n: u32, _heaps: *const usize) {}
 
         let mut orig_vt = [0usize; 64];
         orig_vt[1] = fake_add_ref as usize;
         orig_vt[2] = fake_release as usize;
         orig_vt[13] = fake_draw_indexed as usize;
         orig_vt[25] = fake_noop_ptr as usize; // SetPipelineState
+        orig_vt[28] = fake_set_heaps as usize; // SetDescriptorHeaps (memory windows from the heap)
         orig_vt[30] = fake_noop_ptr as usize; // SetGraphicsRootSignature
         orig_vt[42] = fake_noop_uav as usize; // SetGraphicsRootUnorderedAccessView
         orig_vt[43] = fake_set_ib as usize;
