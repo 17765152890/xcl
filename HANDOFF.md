@@ -23,7 +23,8 @@
   standard-library deprecation.
 - The optimized workspace build produces a runnable `xcl.exe`; release-mode launcher tests
   execute the synthetic title end to end and verify that its source folder remains unchanged.
-  All six optimized GPU pipeline integration tests also pass.
+  The complete optimized workspace suite passes, including all six GPU pipeline integration
+  tests and every launcher, console-library, shader, package, oracle, and documentation target.
 
 ### Deliberate boundary
 
