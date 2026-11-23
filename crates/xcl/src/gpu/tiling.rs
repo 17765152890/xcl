@@ -365,6 +365,23 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * l.depth * e];
+        if self.layout.mode == 0 && self.layout.base_xor == 0 && l.origin == (0, 0) {
+            let row_bytes = l.width * e;
+            let stride = l.pitch.div_ceil(self.layout.block_w) * self.layout.block_bytes;
+            for z in 0..l.depth {
+                let z_off = z * self.slice_bytes + l.offset;
+                for y in 0..l.height {
+                    let o = z_off + y * stride;
+                    if let Some(avail) = mem.len().checked_sub(o) {
+                        let n = (avail.min(row_bytes) / e) * e;
+                        if n > 0 {
+                            out[(z * l.height + y) * row_bytes..][..n].copy_from_slice(&mem[o..o + n]);
+                        }
+                    }
+                }
+            }
+            return out;
+        }
         for z in 0..l.depth {
             for y in 0..l.height {
                 for x in 0..l.width {
@@ -398,6 +415,20 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
+        if self.layout.mode == 0 && self.layout.base_xor == 0 && l.origin == (0, 0) {
+            let row_bytes = l.width * e;
+            let stride = l.pitch.div_ceil(self.layout.block_w) * self.layout.block_bytes;
+            for y in 0..l.height {
+                let o = l.offset + y * stride;
+                if let Some(avail) = src.len().checked_sub(o) {
+                    let n = (avail.min(row_bytes) / e) * e;
+                    if n > 0 {
+                        out[y * row_bytes..][..n].copy_from_slice(&src[o..o + n]);
+                    }
+                }
+            }
+            return out;
+        }
         for y in 0..l.height {
             for x in 0..l.width {
                 let o = self.element_at(&l, x, y, slice);
@@ -413,6 +444,15 @@ impl Chain {
     pub fn tile_level(&self, dst: &mut [u8], i: usize, slice: usize, linear: &[u8]) {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
+        if self.layout.mode == 0 && self.layout.base_xor == 0 && l.origin == (0, 0) {
+            let row_bytes = l.width * e;
+            let stride = l.pitch.div_ceil(self.layout.block_w) * self.layout.block_bytes;
+            for y in 0..l.height {
+                let o = l.offset + y * stride;
+                dst[o..o + row_bytes].copy_from_slice(&linear[y * row_bytes..][..row_bytes]);
+            }
+            return;
+        }
         for y in 0..l.height {
             for x in 0..l.width {
                 let o = self.element_at(&l, x, y, slice);
