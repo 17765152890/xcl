@@ -1100,6 +1100,11 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
 impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
+            // the last present's list may still run: it uses the swap chain's buffers, the
+            // scaler's descriptors and the title's image, all released with the presenter
+            if !self.disabled {
+                let _ = fence::wait(&self.fence, self.value, &self.dev, Some(self.event), 2000);
+            }
             let _ = CloseHandle(self.event);
         }
     }
