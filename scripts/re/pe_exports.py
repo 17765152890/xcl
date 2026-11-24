@@ -35,11 +35,12 @@ for path in sys.argv[1:]:
     for i in range(nnames):
         nr = struct.unpack_from('<I', b, off(anames) + 4 * i)[0]
         o = struct.unpack_from('<H', b, off(aords) + 2 * i)[0]
-        names[o] = cstr(nr)
+        names.setdefault(o, []).append(cstr(nr))
     print(f'  {cstr(name_rva)}: {nfun} functions, {nnames} names, ordinal base {base}')
     for i in range(nfun):
         rva = struct.unpack_from('<I', b, off(afun) + 4 * i)[0]
         if not rva:
             continue
         fwd = f' -> {cstr(rva)}' if exp_rva <= rva < exp_rva + exp_size else ''
-        print(f'  #{base + i:<4} {names.get(i, "(ordinal only)")} @{rva:#x}{fwd}')
+        label = ', '.join(names[i]) if i in names else '(ordinal only)'
+        print(f'  #{base + i:<4} {label} @{rva:#x}{fwd}')
