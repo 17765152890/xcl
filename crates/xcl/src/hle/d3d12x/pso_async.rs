@@ -278,6 +278,38 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     }
 }
 
+/// Non-blocking resolve for graphics draws: returns `None` while the real pipeline is still
+/// being built (triggering lazy submission if needed), or `Some(real)` once built (`Some(pso)`
+/// when not managed by `pso_async` or when the build failed).
+pub fn resolve_nonblocking(pso: usize) -> Option<usize> {
+    let Some(p) = entry(pso) else { return Some(pso) };
+    let r = p.real.load(Ordering::Acquire);
+    if r != 0 {
+        return Some(r);
+    }
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        let _ = queue().lock().unwrap().send(p.clone());
+    }
+    if *p.done.lock().unwrap() {
+        Some(match p.real.load(Ordering::Acquire) {
+            0 => pso,
+            r => r,
+        })
+    } else {
+        None
+    }
+}
+
+/// Resolve for `ExecuteIndirect`: waits for compute pipelines (never skips dispatches), and
+/// returns `None` while a graphics pipeline is still compiling in the background.
+pub fn resolve_indirect(pso: usize) -> Option<usize> {
+    match entry(pso) {
+        Some(p) if p.compute => Some(resolve_wait(pso)),
+        Some(_) => resolve_nonblocking(pso),
+        None => Some(pso),
+    }
+}
+
 /// The title released stand-in `pso` for good: forget it (its address may come back for
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
