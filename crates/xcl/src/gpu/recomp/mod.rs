@@ -922,7 +922,7 @@ fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u6
     let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
     for (k, d) in block.iter().enumerate() {
         let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-        flow = em.inst(d, next);
+        flow = em.inst(d, next, block.get(k + 1).copied());
         if !matches!(flow, emit::Flow::Next) {
             break;
         }
@@ -1132,7 +1132,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
         for (k, d) in block.iter().enumerate() {
             let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-            flow = em.inst(d, next);
+            flow = em.inst(d, next, block.get(k + 1).copied());
             if !matches!(flow, emit::Flow::Next) {
                 break;
             }
@@ -1429,7 +1429,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         em.indent = 1;
         for (i, d) in insts.iter().enumerate() {
             let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
-            if let emit::Flow::End = em.inst(d, next) {
+            if let emit::Flow::End = em.inst(d, next, insts.get(i + 1)) {
                 break;
             }
         }
@@ -1465,6 +1465,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));
         }
         body.push_str(&code);
+    }
+    if em.used_lane_active {
+        body.insert_str(0, "    bool xcl_lane_active;\n");
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
