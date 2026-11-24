@@ -49,6 +49,26 @@ class TestOnlyApprovalTests(unittest.TestCase):
         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
 
 
+class BannedModelTests(unittest.TestCase):
+    def ai_use(self, line):
+        body = BODY.replace("**AI use**\nNone\n", "**AI use**\n" + line + "\n")
+        return check(body, HEAD, [changed("README.md")], lambda _: True)
+
+    def test_family_names_of_small_and_open_weight_models_are_refused(self):
+        for model in ("CodeLlama 34B", "TinyLlama", "Codestral 22B", "Devstral Small", "QwQ-32B",
+                      "Phi 4", "Magistral", "Ministral 8B", "CodeQwen1.5"):
+            with self.subTest(model=model):
+                problems = self.ai_use("- Cline with " + model + ", wrote the code")
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn("does not accept", problems[0])
+
+    def test_frontier_models_and_ordinary_words_pass(self):
+        for line in ("- Claude Code with Claude Opus 5.5", "- Claude Code with Claude Sonnet 5.5",
+                     "- GPT-6", "- Gemini 4", "- Codex", "- Phil 2 checked the alphabet and graph 3"):
+            with self.subTest(line=line):
+                self.assertEqual([], self.ai_use(line))
+
+
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n\n"
