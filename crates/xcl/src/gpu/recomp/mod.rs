@@ -1004,6 +1004,14 @@ fn emit_structured(
                 }
             }
         };
+        // a jump to a target that is already pending leaves the pending set (and so the open
+        // guard) as it is, but what follows must not run once the jump is taken: close the
+        // guard, the next item opens one that tests the flags again
+        if guard.is_some() && raised.iter().any(|t| pending.contains(t)) {
+            body.push_str(&format!("{pad}}}
+"));
+            guard = None;
+        }
         pending.extend(raised);
     }
     if guard.is_some() {
