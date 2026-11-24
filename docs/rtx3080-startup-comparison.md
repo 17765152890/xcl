@@ -19,3 +19,9 @@ $env:XCL_ACTIVITY = '1'
 ```
 
 The host present total counts calls accepted by DXGI. Confirm visible rendering and working input separately when reporting menu or gameplay progress. [Frame-dump parser](https://github.com/ivall/xcl/blob/f4ce27ceb6d1b0576d0c659b713b674778bf1968/crates/xcl/src/hle/d3d12x/present.rs#L775-L785) · [Activity counters](https://github.com/ivall/xcl/blob/f4ce27ceb6d1b0576d0c659b713b674778bf1968/crates/xcl/src/host.rs#L32-L49)
+
+## VIctory comparison
+
+VIctory `d2a4bae` passed mapping and import binding on the same 69-file set. An isolated boot using native D3D12 logged presented frames through index 16 and then stopped at `0x80000003`, guest image offset `+0x1dac734`. Both runtimes stopped before the menu on this file set. [VIctory source revision](https://github.com/Marvisak/VIctory/commit/d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989)
+
+An additional run with XCL `4017f8f` first presented at 5.445 seconds and hit the same stop at 9.062 seconds. Its activity log counted two host presents and 5,372 DirectStorage requests with zero failures through the last completed interval at 8.004 seconds. The final partial interval falls outside those counts. [XCL source revision](https://github.com/ivall/xcl/commit/4017f8ff8faaae6007fd83910d230a027dd85a33)
