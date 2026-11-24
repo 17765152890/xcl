@@ -42,7 +42,7 @@ enum WindowKind {
 
 pub struct Uma {
     base: usize,
-    kinds: [WindowKind; MAX_WINDOWS],
+    kinds: Vec<WindowKind>,
     /// VirtualAlloc base pointers owned by this Uma (freed on Drop)
     win_allocs: Vec<usize>,
     inner: Mutex<Inner>,
@@ -167,9 +167,14 @@ impl Uma {
 
     /// `for_runtime` with a coherent window of up to `coherent` bytes (`coherent_hint`).
     pub fn for_runtime_with(size: usize, coherent: usize) -> Option<Uma> {
+        Self::reserve_runtime(size, coherent, MAX_WINDOWS).or_else(|| Self::new(size))
+    }
+
+    fn reserve_runtime(size: usize, coherent: usize, windows: usize) -> Option<Uma> {
         let committed = ((size.min(coherent.max(RUNTIME_COMMITTED_CAP)) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
-        let sparse_len = (MAX_WINDOWS - 1) * WINDOW;
-        for slot in (4usize..512).step_by(MAX_WINDOWS) {
+        let coherent_index = windows - 1;
+        let sparse_len = coherent_index * WINDOW;
+        for slot in (windows..512).step_by(windows) {
             let base = slot << 32;
             let sp = unsafe { VirtualAlloc(base as *const std::ffi::c_void, sparse_len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) };
             if sp as usize != base {
@@ -178,7 +183,7 @@ impl Uma {
                 }
                 continue;
             }
-            let c_base = base + (MAX_WINDOWS - 1) * WINDOW;
+            let c_base = base + sparse_len;
             let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, committed, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
             if cp as usize != c_base {
                 if !cp.is_null() {
@@ -188,12 +193,14 @@ impl Uma {
                 continue;
             }
             let mut inner = Inner::default();
-            inner.free.insert((MAX_WINDOWS - 1) * WINDOW, committed);
+            inner.free.insert(sparse_len, committed);
             let mut sparse_free: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
             sparse_free.0.insert(base, sparse_len);
+            let mut kinds = vec![WindowKind::Sparse; windows];
+            kinds[coherent_index] = WindowKind::Committed(committed);
             let u = Uma {
                 base,
-                kinds: [WindowKind::Sparse, WindowKind::Sparse, WindowKind::Sparse, WindowKind::Committed(committed)],
+                kinds,
                 win_allocs: vec![base, c_base],
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
@@ -202,22 +209,20 @@ impl Uma {
             u.reserve_pool(POOL);
             return Some(u);
         }
-        Uma::new(size)
+        None
     }
 
     /// The windows after the committed ones as one write-watched reservation (sparse windows).
     fn reserve_sparse_windows(&mut self) {
         let committed = self.windows();
-        if committed >= MAX_WINDOWS {
+        if committed >= self.kinds.len() {
             return;
         }
         let start = self.base + committed * WINDOW;
-        let len = (MAX_WINDOWS - committed) * WINDOW;
+        let len = (self.kinds.len() - committed) * WINDOW;
         let p = unsafe { VirtualAlloc(start as *const std::ffi::c_void, len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) };
         if p as usize == start {
-            for k in committed..MAX_WINDOWS {
-                self.kinds[k] = WindowKind::Sparse;
-            }
+            self.kinds[committed..].fill(WindowKind::Sparse);
             self.win_allocs.push(start);
             self.sparse_free.lock().unwrap().0.insert(start, len);
         } else if !p.is_null() {
@@ -286,7 +291,7 @@ impl Uma {
         }
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
         let mut g = self.sparse_free.lock().unwrap();
-        let end = self.base + MAX_WINDOWS * WINDOW;
+        let end = self.base + self.kinds.len() * WINDOW;
         let lo = self.title_sparse_start();
         if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
             return Some(at);
@@ -325,7 +330,7 @@ impl Uma {
         let size = size.max(1).checked_next_multiple_of(GRAIN)?;
         let align = align.max(GRAIN).checked_next_power_of_two()?;
         let mut g = self.sparse_free.lock().unwrap();
-        let end = self.base + MAX_WINDOWS * WINDOW;
+        let end = self.base + self.kinds.len() * WINDOW;
         let lo = self.title_sparse_start();
         let above_0 = (self.base + WINDOW).max(lo);
         if size <= WINDOW {
@@ -390,7 +395,7 @@ impl Uma {
             }
             if got.len() == windows {
                 let mut inner = Inner::default();
-                let mut kinds = [WindowKind::None; MAX_WINDOWS];
+                let mut kinds = vec![WindowKind::None; MAX_WINDOWS];
                 let mut win_allocs = Vec::with_capacity(windows + 1);
                 for k in 0..windows {
                     inner.free.insert(k * WINDOW, size);
@@ -447,9 +452,9 @@ impl Uma {
     /// contiguous sparse windows belong to a single reservation, while each committed window
     /// is its own allocation.
     pub fn watch_regions(&self) -> Vec<(usize, usize)> {
-        let mut out: Vec<(usize, usize)> = Vec::with_capacity(MAX_WINDOWS);
+        let mut out = Vec::with_capacity(self.kinds.len());
         let mut k = 0;
-        while k < MAX_WINDOWS {
+        while k < self.kinds.len() {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
@@ -459,7 +464,7 @@ impl Uma {
                 WindowKind::Sparse => {
                     let start = self.base + k * WINDOW;
                     let mut len = 0usize;
-                    while k < MAX_WINDOWS && matches!(self.kinds[k], WindowKind::Sparse) {
+                    while k < self.kinds.len() && matches!(self.kinds[k], WindowKind::Sparse) {
                         len += WINDOW;
                         k += 1;
                     }
@@ -473,7 +478,7 @@ impl Uma {
     pub fn window_of(&self, p: usize) -> Option<usize> {
         let k = p.checked_sub(self.base)? / WINDOW;
         let (start, len) = self.window(k);
-        (k < MAX_WINDOWS && len > 0 && p - start < len).then_some(k)
+        (len > 0 && p - start < len).then_some(k)
     }
 
     pub fn contains(&self, p: usize) -> bool {
@@ -726,7 +731,7 @@ pub fn note_coherent_need(bytes: usize) {
 impl Uma {
     /// The committed coherent window (None: none).
     pub fn committed_window(&self) -> Option<usize> {
-        (0..MAX_WINDOWS).find(|&k| self.is_committed_window(k))
+        self.kinds.iter().position(|w| matches!(w, WindowKind::Committed(_)))
     }
 }
 
@@ -739,7 +744,7 @@ pub fn get() -> Option<&'static Uma> {
             let u = Uma::for_runtime_with((mb << 20).max(coherent), coherent);
             match &u {
                 Some(u) => {
-                    let sparse_n = (0..MAX_WINDOWS).filter(|&k| u.is_sparse_window(k)).count();
+                    let sparse_n = u.kinds.iter().filter(|w| matches!(w, WindowKind::Sparse)).count();
                     crate::xlog_info!(
                         "UMA: {} sparse VRAM window(s) ({} GiB VA) + {} MB coherent window at {:#x}",
                         sparse_n,
