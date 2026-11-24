@@ -31,6 +31,7 @@ TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
+COMMIT_SHA = re.compile(r"[0-9a-f]{7,40}", re.I)
 
 
 def smoke_blocks(body):
@@ -50,6 +51,14 @@ def smoke_blocks(body):
 def number(s):
     m = re.match(r"\s*(\d+)", s or "")
     return int(m.group(1)) if m else None
+
+
+def commit_sha(block):
+    """The 7-40 hex digit commit SHA at the start of a smoke block's `commit:` line, or None."""
+    parts = block.get("commit", "").split()
+    if parts and COMMIT_SHA.fullmatch(parts[0]):
+        return parts[0].lower()
+    return None
 
 
 def runtime(path):
@@ -113,13 +122,14 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
 
     if not test_only and any(runtime(p) or builds_runtime(p) for p, *_ in files):
         blocks = smoke_blocks(body)
-        mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
+        head_sha = head.lower()
+        mine = [b for b in blocks if (sha := commit_sha(b)) and head_sha.startswith(sha)]
         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]
-        base = [b for b in blocks if b not in mine and len(b.get("commit", "").split()[0] if b.get("commit") else "") >= 7]
+        base = [b for b in blocks if b not in mine and commit_sha(b)]
         if not clean:
             problems.append(f"the PR changes the runtime: **Regression run** needs an `xcl-smoke` block made on this PR's "
                             f"head commit {head[:12]} with no uncommitted changes (rerun scripts/smoke.ps1 after every push)")
-        main = [b for b in base if is_main_ancestor(b["commit"].split()[0])]
+        main = [b for b in base if is_main_ancestor(commit_sha(b))]
         if not main:
             problems.append("**Regression run** needs an `xcl-smoke` block made on a commit of main (not the PR's), "
                             "with the same title and time as the PR's")
@@ -169,6 +179,8 @@ def main():
             files.append((parts[0], parts[1], parts[2] == "true", lambda sha=sha: blob_size(sha)))
 
     def is_main_ancestor(sha):
+        if not COMMIT_SHA.fullmatch(sha):
+            return False
         if o.local:
             return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], capture_output=True).returncode == 0
         r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
