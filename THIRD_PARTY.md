@@ -15,6 +15,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 Â
 | [libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | no code; XTaskQueue/XAsync contract | specification |
 | Windows XGameRuntime (`System32\xgameruntime.dll`) | system | class GUIDs and slot order of the GDK thunk protocol in `hle/xgameruntime/api.rs` (facts, determined by analysis); APIs XCL does not implement are forwarded to it at runtime | interoperability; not distributed |
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
+| [Xbox2Windows BC7 controls](https://github.com/R0Y00/Xbox2Windows/issues/442) | MIT | synthetic mode-6 lane/block fixtures in test-only `hle/bcpack_bc7.rs` | independent field reconstruction (2026-11-23); fixture revisions and MIT notice in the file; no entropy or preset-history code |
 | Rust crates (`Cargo.lock`) | MIT / BSD-2 / Zlib / Unlicense (or with an MIT alternative) | build dependencies | statically linked |
 | [libopus](https://opus-codec.org/) (`opus.dll`) | BSD-3-Clause | Opus decoding where Windows has no `MSOpusDecoder.dll` (Wine): loaded at runtime from `%XCL_OPUS_DIR%` / next to xcl.exe (`hle/opus.rs`) | **not** distributed with XCL |
 | DXC (`dxcompiler.dll`, `dxil.dll`) from the Windows SDK | NCSA (dxcompiler) / Microsoft (dxil) | HLSL â†’ DXIL compilation at runtime | loaded from the user's SDK, **not** distributed with XCL |

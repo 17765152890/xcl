@@ -14,6 +14,8 @@ pub mod acphal;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
+#[cfg(test)]
+mod bcpack_bc7;
 pub mod dxcompiler;
 pub mod gameinput;
 pub mod kbm;
