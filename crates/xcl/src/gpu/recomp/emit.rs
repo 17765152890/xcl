@@ -851,6 +851,244 @@ impl Em {
 
     // ---------------------------------------------------------------- one instruction
 
+    /// Emit one basic block's instructions in order; stops at the first non-fallthrough flow.
+    /// In split-wave64 mode, folds cross-half reduction tails (`v_readlane(v, L)` -> `v_op(v, s, v)`
+    /// -> `v_readlane(v, L^32)`, 32-bit and 64-bit `v_add_f64`) into a single `xcl_x_meet()`.
+    pub fn emit_insts(&mut self, block: &[Decoded], end: u64) -> Flow {
+        let mut flow = Flow::Next;
+        let mut i = 0;
+        while i < block.len() {
+            if self.x64() {
+                if let Some(consumed) = self.try_emit_x64_reduction_tail(&block[i..]) {
+                    i += consumed;
+                    continue;
+                }
+            }
+            let next = block.get(i + 1).map(|n| n.pc).unwrap_or(end);
+            flow = self.inst(&block[i], next);
+            if !matches!(flow, Flow::Next) {
+                break;
+            }
+            i += 1;
+        }
+        flow
+    }
+
+    /// If `d` is a plain split-wave64 `v_readlane_b32` reading VGPR `v` at constant lane `0..63`
+    /// that will emit an exchange, returns `(dst, v, lane)`.
+    fn x64_const_readlane(&self, d: &Decoded) -> Option<(Dst, u64, u64)> {
+        if d.variant != Variant::Plain || d.inst.name != "V_READLANE_B32" {
+            return None;
+        }
+        if self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).is_some() {
+            return None;
+        }
+        let src0 = rdna2::field_value(d.enc, &d.words, "SRC0")?;
+        let v = src0.checked_sub(256)?;
+        let src1 = rdna2::field_value(d.enc, &d.words, "SRC1")?;
+        let lane = match src1 {
+            128..=192 => src1 - 128,
+            255 => d.literal? as u64,
+            _ => return None,
+        };
+        let (outs, _) = Self::ops(d);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        if !matches!(dst, Dst::S(_) | Dst::Null) {
+            return None;
+        }
+        Some((dst, v, lane & 63))
+    }
+
+    /// Check that `mid` is a plain, modifier-free binary VALU op writing VGPR `v` with inputs
+    /// `{S(s_in), V(v)}` in either order. Returns `Some(s_first)` (`true` if `ins[0]` is `S(s_in)`).
+    fn x64_match_binary_valu(mid: &Decoded, v: u64, s_in: u64) -> Option<bool> {
+        if mid.variant != Variant::Plain {
+            return None;
+        }
+        let m = Self::mods(mid);
+        if m.clamp || m.omod != 0 || m.opsel != 0 || m.abs.iter().any(|&x| x) || m.neg.iter().any(|&x| x) {
+            return None;
+        }
+        let (outs, ins) = Self::ops(mid);
+        if outs.len() != 1 || ins.len() != 2 {
+            return None;
+        }
+        if !matches!(Self::dst_of(mid, &outs[0]), Dst::V(dv) if dv == v) {
+            return None;
+        }
+        let decode_op = |o: &Operand| -> Option<(bool, u64)> {
+            let f = o.field?;
+            let raw = rdna2::field_value(mid.enc, &mid.words, f)? * rdna2::register_scale(f);
+            if f == "VSRC1" || o.ty.starts_with("OPR_VGPR") {
+                Some((false, raw))
+            } else if raw >= 256 {
+                Some((false, raw - 256))
+            } else if raw <= 124 || raw == 126 || raw == 127 {
+                Some((true, raw))
+            } else {
+                None
+            }
+        };
+        let (op0, op1) = (decode_op(&ins[0])?, decode_op(&ins[1])?);
+        if op0 == (true, s_in) && op1 == (false, v) {
+            Some(true)
+        } else if op0 == (false, v) && op1 == (true, s_in) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Scalar HLSL expression matching `emit.rs` for one lane of a supported 32-bit reduction op.
+    fn x64_reduction_expr32(&self, name: &str, lhs: &str, rhs: &str, old: &str) -> Option<String> {
+        Some(match name {
+            "V_ADD_NC_U32" => format!("({lhs} + {rhs})"),
+            "V_ADD_F32" => format!("asuint(asfloat({lhs}) + asfloat({rhs}))"),
+            "V_MIN_F32" => format!("asuint(min(asfloat({lhs}), asfloat({rhs})))"),
+            "V_MAX_F32" => format!("asuint(max(asfloat({lhs}), asfloat({rhs})))"),
+            "V_MIN_U32" => format!("min({lhs}, {rhs})"),
+            "V_MAX_U32" => format!("max({lhs}, {rhs})"),
+            "V_MIN_I32" => format!("(uint)min((int){lhs}, (int){rhs})"),
+            "V_MAX_I32" => format!("(uint)max((int){lhs}, (int){rhs})"),
+            "V_AND_B32" => format!("({lhs} & {rhs})"),
+            "V_OR_B32" => format!("({lhs} | {rhs})"),
+            "V_XOR_B32" => format!("({lhs} ^ {rhs})"),
+            "V_ADD_F16" => {
+                let sum = to_f16_expr(self.dynamic_f16_rm, &format!("(f16tof32({lhs} & 0xFFFFu) + f16tof32({rhs} & 0xFFFFu))"));
+                format!("(({old} & 0xFFFF0000u) | {sum})")
+            }
+            _ => return None,
+        })
+    }
+
+    /// Fold split-wave64 cross-half `v_readlane_b32` reduction tails (and direct `(L, L^32)` pairs)
+    /// into a single `xcl_x_meet()` exchange. Both halves already receive both `v[L]` and `v[L^32]`
+    /// from the first exchange, so the trailing `v_readlane_b32` of the updated lane needs no
+    /// second exchange.
+    fn try_emit_x64_reduction_tail(&mut self, rest: &[Decoded]) -> Option<usize> {
+        let (dst1, v1, l1) = self.x64_const_readlane(&rest[0])?;
+        let l2 = l1 ^ 32;
+        let lane32 = l1 & 31;
+
+        // 1. Direct pair: v_readlane(s1, v, L) ; v_readlane(s2, v, L^32)
+        if rest.len() >= 2 {
+            if let Some((dst2, v2, l_b)) = self.x64_const_readlane(&rest[1]) {
+                if v2 == v1 && l_b == l2 {
+                    self.line(&format!("// {:04x}: {}", rest[0].pc, rdna2::format(&rest[0])));
+                    self.line(&format!("// {:04x}: {}", rest[1].pc, rdna2::format(&rest[1])));
+                    self.cur_pc = rest[1].pc;
+                    let v = self.vreg(v1);
+                    let t = self.t();
+                    self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
+                    self.line(&format!("xcl_x_put(0u, {t}_m);"));
+                    self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                    self.line(&format!("uint {t}_r1 = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
+                    self.line(&format!("uint {t}_r2 = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
+                    self.write32(&dst1, &format!("{t}_r1"));
+                    self.write32(&dst2, &format!("{t}_r2"));
+                    return Some(2);
+                }
+            }
+        }
+
+        // 2. 32-bit reduction tail: v_readlane(s1, v, L) ; v_op(v, s1, v) ; v_readlane(s2, v, L^32)
+        if rest.len() >= 3 {
+            if let (&Dst::S(s1), Some((dst2, v2, l_b))) = (&dst1, self.x64_const_readlane(&rest[2])) {
+                if s1 != 126 && s1 != 127 && v2 == v1 && l_b == l2 {
+                    if let Some(s_first) = Self::x64_match_binary_valu(&rest[1], v1, s1) {
+                        let t = self.t();
+                        let (r1, r2) = (format!("{t}_r1"), format!("{t}_r2"));
+                        let (lhs, rhs) = if s_first { (r1.as_str(), r2.as_str()) } else { (r2.as_str(), r1.as_str()) };
+                        if let Some(expr) = self.x64_reduction_expr32(rest[1].inst.name, lhs, rhs, &r2) {
+                            self.line(&format!("// {:04x}: {}", rest[0].pc, rdna2::format(&rest[0])));
+                            self.cur_pc = rest[0].pc;
+                            let v = self.vreg(v1);
+                            self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
+                            self.line(&format!("xcl_x_put(0u, {t}_m);"));
+                            self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                            self.line(&format!("uint {r1} = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
+                            self.line(&format!("uint {r2} = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
+                            self.write32(&Dst::S(s1), &r1);
+                            // Emit the VALU instruction normally so all 64 lanes of v stay exact
+                            self.inst(&rest[1], rest[2].pc);
+                            self.line(&format!("// {:04x}: {}", rest[2].pc, rdna2::format(&rest[2])));
+                            self.cur_pc = rest[2].pc;
+                            let exec_w = self.sreg(if l2 < 32 { 126 } else { 127 });
+                            let mask = 1u32 << (l2 & 31);
+                            self.line(&format!("uint {t}_out = (({exec_w} & {mask:#x}u) != 0u) ? ({expr}) : {r2};"));
+                            self.write32(&dst2, &format!("{t}_out"));
+                            return Some(3);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 64-bit reduction tail:
+        //    v_readlane(s, v, L) ; v_readlane(s+1, v+1, L) ; v_add_f64 v[v:v+1], s[s:s+1], v[v:v+1] ;
+        //    v_readlane(o0, v, L^32) ; v_readlane(o1, v+1, L^32)
+        if rest.len() >= 5 && rest[2].inst.name == "V_ADD_F64" {
+            if let (&Dst::S(s_lo), Some((Dst::S(s_hi), v_hi, l_hi)), Some((out_lo, vo0, lo0)), Some((out_hi, vo1, lo1))) = (
+                &dst1,
+                self.x64_const_readlane(&rest[1]),
+                self.x64_const_readlane(&rest[3]),
+                self.x64_const_readlane(&rest[4]),
+            ) {
+                if s_hi == s_lo + 1
+                    && s_lo != 126
+                    && s_lo != 127
+                    && s_hi != 126
+                    && s_hi != 127
+                    && v_hi == v1 + 1
+                    && l_hi == l1
+                    && vo0 == v1
+                    && vo1 == v1 + 1
+                    && lo0 == l2
+                    && lo1 == l2
+                {
+                    if let Some(s_first) = Self::x64_match_binary_valu(&rest[2], v1, s_lo) {
+                        self.x64_words = self.x64_words.max(2);
+                        self.line(&format!("// {:04x}: {}", rest[0].pc, rdna2::format(&rest[0])));
+                        self.line(&format!("// {:04x}: {}", rest[1].pc, rdna2::format(&rest[1])));
+                        self.cur_pc = rest[1].pc;
+                        let (vl, vh) = (self.vreg(v1), self.vreg(v1 + 1));
+                        let t = self.t();
+                        self.line(&format!("uint {t}_ml = WaveReadLaneAt({vl}, {lane32}u);"));
+                        self.line(&format!("uint {t}_mh = WaveReadLaneAt({vh}, {lane32}u);"));
+                        self.line(&format!("xcl_x_put(0u, {t}_ml); xcl_x_put(1u, {t}_mh);"));
+                        self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+                        self.line(&format!("uint {t}_ol = {t}_ok ? xcl_x_get(0u) : 0u;"));
+                        self.line(&format!("uint {t}_oh = {t}_ok ? xcl_x_get(1u) : 0u;"));
+                        let (h1, h2) = (l1 >> 5, l2 >> 5);
+                        self.line(&format!("uint {t}_l1 = xcl_half == {h1}u ? {t}_ml : {t}_ol;"));
+                        self.line(&format!("uint {t}_h1 = xcl_half == {h1}u ? {t}_mh : {t}_oh;"));
+                        self.line(&format!("uint {t}_l2 = xcl_half == {h2}u ? {t}_ml : {t}_ol;"));
+                        self.line(&format!("uint {t}_h2 = xcl_half == {h2}u ? {t}_mh : {t}_oh;"));
+                        self.write32(&Dst::S(s_lo), &format!("{t}_l1"));
+                        self.write32(&Dst::S(s_hi), &format!("{t}_h1"));
+                        self.inst(&rest[2], rest[3].pc);
+                        self.line(&format!("// {:04x}: {}", rest[3].pc, rdna2::format(&rest[3])));
+                        self.line(&format!("// {:04x}: {}", rest[4].pc, rdna2::format(&rest[4])));
+                        self.cur_pc = rest[4].pc;
+                        let (d1, d2) = (format!("asdouble({t}_l1, {t}_h1)"), format!("asdouble({t}_l2, {t}_h2)"));
+                        let sum = if s_first { format!("{d1} + {d2}") } else { format!("{d2} + {d1}") };
+                        self.line(&format!("double {t}_d = {sum}; uint {t}_sl, {t}_sh; asuint({t}_d, {t}_sl, {t}_sh);"));
+                        let exec_w = self.sreg(if l2 < 32 { 126 } else { 127 });
+                        let mask = 1u32 << (l2 & 31);
+                        self.line(&format!("bool {t}_act = ({exec_w} & {mask:#x}u) != 0u;"));
+                        self.line(&format!("uint {t}_outl = {t}_act ? {t}_sl : {t}_l2;"));
+                        self.line(&format!("uint {t}_outh = {t}_act ? {t}_sh : {t}_h2;"));
+                        self.write32(&out_lo, &format!("{t}_outl"));
+                        self.write32(&out_hi, &format!("{t}_outh"));
+                        return Some(5);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);

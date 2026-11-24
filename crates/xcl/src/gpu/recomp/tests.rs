@@ -5790,6 +5790,140 @@ fn gpu_split_wave64_lane_local_masks() {
     }
 }
 
+/// Split-wave64 reduction-tail folding rules: 32-bit reduction tails, 64-bit `v_add_f64` tails,
+/// and direct `(L, L^32)` pairs fold into one `xcl_x_meet()`, while modifiers, mismatched lanes,
+/// `EXEC` writes, jump targets, and native wave64 stay untouched.
+#[test]
+fn split_wave64_reduction_tail_rules() {
+    let split = Options { mode: Mode::Kernel, wave64: true, split_wave64: true, ..Default::default() };
+
+    // 32-bit reduction tail: v_readlane(s8, v2, 32) ; v_min_u32 v2, s8, v2 ; v_readlane(s12, v2, 0)
+    let tail32 = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
+    ]);
+    let t = translate(&tail32, &split).unwrap();
+    assert_eq!(t.hlsl.matches("xcl_x_meet() ?").count(), 1 + 3, "1 folded meet + 3 in prelude:\n{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+
+    // Native wave64 is unchanged
+    let t_native = translate(&tail32, &Options { mode: Mode::Kernel, wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(!t_native.hlsl.contains("xcl_x_meet"));
+
+    // 64-bit v_add_f64 reduction tail: 4 readlanes -> 1 2-word meet
+    let tail64 = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 3), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", 2), ("SRC1", V + 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 128)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 3), ("SRC1", 128)], None),
+    ]);
+    let t = translate(&tail64, &split).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_meet();").count(), 1, "64-bit tail shares 1 meet");
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+    assert!(t.hlsl.contains("#define XCL_X_SLOT 2u"));
+
+    // Direct (L, L^32) pair: 2 readlanes -> 1 meet
+    let direct = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 128 + 37)], None),
+    ]);
+    let t = translate(&direct, &split).unwrap();
+    assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
+
+    // Negative guards: CLAMP modifier, mismatched lanes, jump target in middle
+    let clamped = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 8), ("SRC1", V + 2), ("CLAMP", 1)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
+    ]);
+    assert_eq!(translate(&clamped, &split).unwrap().hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    let mismatched = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128 + 1)], None),
+    ]);
+    assert_eq!(translate(&mismatched, &split).unwrap().hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+
+    let branched = prog(&[
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)], None), // targets v_min_u32 (past 8-byte VOP3 readlane)
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
+    ]);
+    assert_eq!(translate(&branched, &split).unwrap().hlsl.matches("= xcl_x_rla_uniform(").count(), 2);
+}
+
+/// GPU verification of folded split-wave64 reduction tails: 32-bit `v_min_u32` / `v_add_f32` /
+/// `v_add_f16` (preserving high 16 bits), 64-bit `v_add_f64`, inactive lane 0 under `EXEC`, and
+/// direct `(L, L^32)` pair.
+#[test]
+fn gpu_split_wave64_reduction_tails() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // 1. v_min_u32 reduction tail: v0[32] & v0[0] -> s10 = v0[32], s11 = min(v0[32], v0[0])
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", 128 + 32)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 0), ("SRC0", 10), ("VSRC1", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", 128)], None),
+        // 2. v_add_f32 reduction tail (swapped operand order VOP3: v1, s12)
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V + 1), ("SRC1", 12)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", 128)], None),
+        // 3. v_add_f16 reduction tail: high 16 bits of v2[0] must stay intact
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F16", "ENC_VOP2", &[("VDST", 2), ("SRC0", 14), ("VSRC1", 2)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 2), ("SRC1", 128)], None),
+        // 4. 64-bit v_add_f64 reduction tail on v[4:5] -> s[16:17]
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 4), ("SRC1", 128 + 32)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 5), ("SRC1", 128 + 32)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", 16), ("SRC1", V + 4)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 4), ("SRC1", 128)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 5), ("SRC1", 128)], None),
+        // 5. Direct (lane 5, lane 37) pair on v6 -> s18, s19
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 6), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V + 6), ("SRC1", 128 + 37)], None),
+        // 6. Lane 0 masked off in EXEC: v_add_nc_u32 must NOT alter lane 0, so s21 stays old v7[0]
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 7), ("SRC1", 128 + 32)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 20), ("VSRC1", 7)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 7), ("SRC1", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "all 6 patterns folded:\n{}", t.hlsl);
+    }
+    let mut st = KernelState::default();
+    let d0 = 123456.75f64.to_bits();
+    let d32 = 876543.125f64.to_bits();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = match l { 0 => 500, 32 => 123, _ => 999 };
+        r[1] = match l { 0 => 1.5f32.to_bits(), 32 => 2.25f32.to_bits(), _ => 0 };
+        // f16: 1.5 (0x3E00) + 2.5 (0x4100) = 4.0 (0x4400); high 16 bits = 0xCAFE on lane 0
+        r[2] = match l { 0 => 0xCAFE_3E00, 32 => 0xBEEF_4100, _ => 0 };
+        let db = match l { 0 => d0, 32 => d32, _ => 0 };
+        r[4] = db as u32;
+        r[5] = (db >> 32) as u32;
+        r[6] = 0x6000 + l as u32;
+        r[7] = match l { 0 => 0x1111, 32 => 0x2222, _ => 0 };
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[10], 123, "v_min_u32 s_tmp = v0[32]");
+    assert_eq!(r.sgpr[11], 123, "v_min_u32 s_out = min(500, 123)");
+    assert_eq!(r.vgpr[0][0], 123, "v0[0] updated in VGPR too");
+    assert_eq!(r.sgpr[13], 3.75f32.to_bits(), "v_add_f32 reduction");
+    assert_eq!(r.sgpr[15], 0xCAFE_4400, "v_add_f16 reduction preserves high 16 bits");
+    let got_d = (r.sgpr[16] as u64) | ((r.sgpr[17] as u64) << 32);
+    assert_eq!(got_d, (123456.75f64 + 876543.125f64).to_bits(), "v_add_f64 64-bit reduction");
+    assert_eq!(r.sgpr[18], 0x6005, "direct pair lane 5");
+    assert_eq!(r.sgpr[19], 0x6025, "direct pair lane 37");
+    assert_eq!(r.sgpr[20], 0x2222, "inactive-lane-0 s_tmp still reads lane 32");
+    assert_eq!(r.sgpr[21], 0x1111, "inactive-lane-0 s_out keeps unmodified old v7[0]");
+}
+
 /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
 /// SDWA compare into its SDST, `s_bitset1`, `s_movreld`) or through a read the operand
 /// tables do not show (`s_movrels`, an SMEM register offset, an SDWA scalar src1): each is
