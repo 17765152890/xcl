@@ -1495,15 +1495,15 @@ impl Em {
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
+            self.line(&format!("uint64_t {t}_off = (uint64_t){} + (uint64_t){soff};", hex(imm)));
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
-            self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
+            self.line(&format!("uint64_t {t}_lim = select({t}_st == 0u, (uint64_t){d2}, (uint64_t){d2} * (uint64_t){t}_st);"));
             if self.opt.mem_windows > 1 {
-                self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
+                self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + {t}_off;"));
                 self.window_read(&format!("(uint)({t}_ea >> 32)"));
                 self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
             } else {
-                self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+                self.line(&format!("uint {t}_a = ({d0} + (uint){t}_off) & ~3u;"));
             }
             // Branch-free: a dword past num_records reads offset 0 (always in the window) and
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
@@ -1517,7 +1517,11 @@ impl Em {
                 for g in 0..count.div_ceil(4) {
                     let n = (count - 4 * g).min(4);
                     let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
-                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
+                    let cmps = (0..4)
+                        .map(|k| format!("{t}_off + (uint64_t){}u < {t}_lim", 16 * g + 4 * k.min(n - 1)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.line(&format!("bool4 {t}_in{g} = bool4({cmps});"));
                     self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
                     vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
                 }
@@ -1733,12 +1737,15 @@ impl Em {
                 self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
             } else {
                 let bits = 8 * n;
+                self.line(&format!("bool {t}_act = {act};"));
+                self.line(&format!("bool {t}_ok = {ok};"));
+                self.line(&format!("uint {t}_raw = ld_raw(select(and({t}_act, {t}_ok), {t}_a, 0u)).x;"));
                 let val = if signed {
-                    format!("(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                    format!("(uint)(((int)({t}_raw << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
-                    format!("(ld_raw({t}_a).x & {}u)", (1u64 << bits) - 1)
+                    format!("({t}_raw & {}u)", (1u64 << bits) - 1)
                 };
-                self.line(&format!("if ({act}) {v} = {ok} ? {val} : 0u;"));
+                self.line(&format!("{v} = select({t}_act, select({t}_ok, {val}, 0u), {v});"));
             }
             return Ok(());
         }
@@ -1777,10 +1784,11 @@ impl Em {
             BufKind::FormatLoad => {
                 // format from the instruction (tbuffer) or from the V# (dword3 [18:12]); DST_SEL from the V#
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
+                self.line(&format!("bool {t}_act = {act};"));
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
-                self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                self.line(&format!("uint4 {t}_r = ld_raw(select(and({t}_act, {t}_ok), {t}_a, 0u));"));
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
                 ));
@@ -1801,7 +1809,7 @@ impl Em {
                             assigns.push(format!("{v} = {t}_ok ? ({lo} | ({hi} << 16)) : 0u;"));
                         }
                     }
-                    self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
+                    self.line(&format!("if ({t}_act) {{ {} }}", assigns.join(" ")));
                     return Ok(());
                 }
                 let mut assigns = Vec::new();
@@ -1809,7 +1817,7 @@ impl Em {
                     let v = self.vreg(vdata + i);
                     assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
                 }
-                self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
+                self.line(&format!("if ({t}_act) {{ {} }}", assigns.join(" ")));
             }
             BufKind::FormatStore => {
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
@@ -3772,8 +3780,10 @@ impl Em {
         if store {
             self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
         } else {
-            let raw = format!("select({ok}, ld_raw({t}_a).x, 0u)");
-            self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
+            self.line(&format!("bool {t}_act = {act};"));
+            self.line(&format!("bool {t}_ok = {ok};"));
+            let raw = format!("select({t}_ok, ld_raw(select(and({t}_act, {t}_ok), {t}_a, 0u)).x, 0u)");
+            self.line(&format!("if ({t}_act) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
         }
         Ok(())
     }
