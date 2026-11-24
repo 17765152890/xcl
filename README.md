@@ -129,7 +129,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   window stays open until Enter.
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
-- **The game folder is never modified** – writes go to the overlay.
+- **The game folder is never modified** – writes go to the overlay. Creating a file or directory beneath an existing virtual file is refused before creating overlay parents, so the failed operation cannot hide that file.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
