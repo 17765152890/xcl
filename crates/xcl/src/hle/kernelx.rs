@@ -1170,6 +1170,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
+                lazy::unmark(at);
                 note_mapping_at(at);
             }
         }
@@ -2110,6 +2111,31 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&page_index(pages[0]).unwrap()));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
+        }
+    }
+
+    #[test]
+    fn free_physical_pages_unmarks_lazy_away_mapping() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = 1usize;
+            let mut page = 0usize;
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, &mut page), 1);
+            let home = page_home(page).expect("page home");
+            if !u.is_sparse(home) {
+                FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut page);
+                return;
+            }
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut page) as usize, r);
+            assert!(!committed_page(r), "fresh page mapped into reservation starts lazy");
+            // Freeing the physical page directly must drop the lazy entry so `r` is not
+            // silently committed later by `lazy::ensure` or the VEH handler.
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut page), 1);
+            lazy::ensure(r, 4);
+            assert!(!committed_page(r), "freed away-mapped page must not remain in lazy::LAZY");
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 
