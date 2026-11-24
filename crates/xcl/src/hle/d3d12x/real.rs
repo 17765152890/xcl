@@ -802,13 +802,16 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // methods the newer console layout keeps at other slots: picked at each call
     if kind == Kind::CommandList {
         let older_handlers = console_slots(kind);
-        for (newer, older) in NEWER_LIST_SLOTS {
-            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
+        let entries = NEWER_LIST_SLOTS
+            .iter()
+            .filter_map(|&(newer, older)| older_handlers.iter().find(|e| e.0 == older).map(|&(_, f)| (newer, f)))
+            .chain(NEWER_LIST_REMAP.iter().filter(|&&(_, p)| p < public).map(|&(newer, p)| (newer, pc[1 + p])));
+        for (newer, f) in entries {
             if newer >= total {
                 continue;
             }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
-            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+            let orig = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc: orig, newer_layout: &QUEUE_SHIFTED });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -4926,6 +4929,9 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 /// command list slots of the newer layout → the older layout's slot of the same method
 const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
 
+/// remapped PC methods shifted by +2 in the newer console command list layout (RSSetShadingRate / RSSetShadingRateImage: #124/#125 -> #126/#127, PC #77/#78)
+const NEWER_LIST_REMAP: [(usize, usize); 2] = [(126, 77), (127, 78)];
+
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
 pub(super) fn note_newer_device_method(slot: usize) {
@@ -5624,6 +5630,15 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn newer_list_remap_covers_shifted_shading_rate_slots() {
+        assert_eq!(NEWER_LIST_REMAP, [(126, 77), (127, 78)]);
+        let remap = console_remap(Kind::CommandList);
+        for &(newer, pc_slot) in &NEWER_LIST_REMAP {
+            assert!(remap.contains(&(newer - 2, pc_slot)), "expected older slot {} -> PC #{pc_slot} in console_remap", newer - 2);
+        }
     }
 }
 
