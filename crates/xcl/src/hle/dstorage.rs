@@ -33,9 +33,10 @@
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::AsRawHandle;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use windows_sys::core::GUID;
@@ -53,6 +54,7 @@ const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
 const E_PENDING: HRESULT = 0x8000_000Au32 as i32;
 const E_INVALIDARG: HRESULT = 0x8007_0057u32 as i32;
 const E_ABORT: HRESULT = 0x8000_4004u32 as i32;
+const E_OUTOFMEMORY: HRESULT = 0x8007_000Eu32 as i32;
 const E_QUEUE_CAPACITY: HRESULT = 0x8924_0003u32 as i32;
 const E_END_OF_FILE: HRESULT = 0x8924_0007u32 as i32;
 const E_ACCESS_VIOLATION: HRESULT = 0x8924_0009u32 as i32;
@@ -758,40 +760,493 @@ fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), H
 static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DECOMPRESS_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COPY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// (requests run, bytes delivered, requests failed) so far
+static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable detailed nano-level timing breakdown counters (QPC measurements).
+pub fn set_profiling_enabled(enabled: bool) {
+    PROFILING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether detailed profiling counters are enabled.
+pub fn is_profiling_enabled() -> bool {
+    PROFILING_ENABLED.load(Ordering::Relaxed)
+}
+
+/// (requests run, bytes scheduled by those requests, requests failed) so far.
 pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
+}
+
+/// (read_nanos, decompress_nanos, copy_nanos) accumulated across all executions.
+pub fn timing_breakdown() -> (u64, u64, u64) {
+    (READ_NANOS.load(Ordering::Relaxed), DECOMPRESS_NANOS.load(Ordering::Relaxed), COPY_NANOS.load(Ordering::Relaxed))
+}
+
+pub fn reset_timing_breakdown() {
+    READ_NANOS.store(0, Ordering::Relaxed);
+    DECOMPRESS_NANOS.store(0, Ordering::Relaxed);
+    COPY_NANOS.store(0, Ordering::Relaxed);
+}
+
+static RETIREMENT_PROFILING: AtomicBool = AtomicBool::new(false);
+static RETIREMENT_TIMINGS: Mutex<Vec<(u64, Instant)>> = Mutex::new(Vec::new());
+
+/// Record request tags and completion times after retirement, for benchmark latency sampling.
+pub fn set_retirement_profiling_enabled(enabled: bool) {
+    RETIREMENT_PROFILING.store(enabled, Ordering::Relaxed);
+}
+
+pub fn take_retirement_timings() -> Vec<(u64, Instant)> {
+    std::mem::take(&mut *RETIREMENT_TIMINGS.lock().unwrap())
+}
+
+fn record_retirement(tag: u64) {
+    if RETIREMENT_PROFILING.load(Ordering::Relaxed) {
+        let finished = Instant::now();
+        RETIREMENT_TIMINGS.lock().unwrap().push((tag, finished));
+    }
+}
+
+/// Logical staging capacities and observed decode activity for one benchmark process.
+/// Staging covers buffer bytes and live codec state, excluding allocator overhead.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PipelineMetrics {
+    pub worker_count: usize,
+    pub budget_bytes: usize,
+    pub current_staging_bytes: usize,
+    pub peak_staging_bytes: usize,
+    pub active_jobs: usize,
+    pub peak_active_jobs: usize,
+    pub queued_jobs: usize,
+    pub peak_queued_jobs: usize,
+    pub peak_outstanding_jobs: usize,
+    pub jobs_started: usize,
+    pub jobs_completed: usize,
+    pub worker_jobs_started: usize,
+    pub worker_jobs_completed: usize,
+    pub pipeline_drains: usize,
+    pub budget_waits: usize,
+    pub active_job_nanos: u64,
+}
+
+#[derive(Default)]
+struct PipelineCounters {
+    current_staging_bytes: AtomicUsize,
+    peak_staging_bytes: AtomicUsize,
+    active_jobs: AtomicUsize,
+    peak_active_jobs: AtomicUsize,
+    queued_jobs: AtomicUsize,
+    peak_queued_jobs: AtomicUsize,
+    outstanding_jobs: AtomicUsize,
+    peak_outstanding_jobs: AtomicUsize,
+    jobs_started: AtomicUsize,
+    jobs_completed: AtomicUsize,
+    worker_jobs_started: AtomicUsize,
+    worker_jobs_completed: AtomicUsize,
+    pipeline_drains: AtomicUsize,
+    budget_waits: AtomicUsize,
+    active_job_nanos: AtomicU64,
+}
+
+fn add_and_peak(current: &AtomicUsize, peak: &AtomicUsize, amount: usize) {
+    let now = current.fetch_add(amount, Ordering::Relaxed) + amount;
+    peak.fetch_max(now, Ordering::Relaxed);
+}
+
+impl PipelineCounters {
+    fn snapshot(&self, worker_count: usize, budget_bytes: usize) -> PipelineMetrics {
+        PipelineMetrics {
+            worker_count,
+            budget_bytes,
+            current_staging_bytes: self.current_staging_bytes.load(Ordering::Relaxed),
+            peak_staging_bytes: self.peak_staging_bytes.load(Ordering::Relaxed),
+            active_jobs: self.active_jobs.load(Ordering::Relaxed),
+            peak_active_jobs: self.peak_active_jobs.load(Ordering::Relaxed),
+            queued_jobs: self.queued_jobs.load(Ordering::Relaxed),
+            peak_queued_jobs: self.peak_queued_jobs.load(Ordering::Relaxed),
+            peak_outstanding_jobs: self.peak_outstanding_jobs.load(Ordering::Relaxed),
+            jobs_started: self.jobs_started.load(Ordering::Relaxed),
+            jobs_completed: self.jobs_completed.load(Ordering::Relaxed),
+            worker_jobs_started: self.worker_jobs_started.load(Ordering::Relaxed),
+            worker_jobs_completed: self.worker_jobs_completed.load(Ordering::Relaxed),
+            pipeline_drains: self.pipeline_drains.load(Ordering::Relaxed),
+            budget_waits: self.budget_waits.load(Ordering::Relaxed),
+            active_job_nanos: self.active_job_nanos.load(Ordering::Relaxed),
+        }
+    }
+
+    fn stage(&self, size: usize) {
+        add_and_peak(&self.current_staging_bytes, &self.peak_staging_bytes, size);
+    }
+
+    fn unstage(&self, size: usize) {
+        self.current_staging_bytes.fetch_sub(size, Ordering::Relaxed);
+    }
+
+    fn start_decode(&self, worker: bool) -> ActiveDecode<'_> {
+        self.jobs_started.fetch_add(1, Ordering::Relaxed);
+        if worker {
+            self.worker_jobs_started.fetch_add(1, Ordering::Relaxed);
+        }
+        add_and_peak(&self.active_jobs, &self.peak_active_jobs, 1);
+        ActiveDecode { counters: self, started: Instant::now(), worker }
+    }
+}
+
+struct ActiveDecode<'a> {
+    counters: &'a PipelineCounters,
+    started: Instant,
+    worker: bool,
+}
+
+impl Drop for ActiveDecode<'_> {
+    fn drop(&mut self) {
+        self.counters.active_job_nanos.fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.counters.active_jobs.fetch_sub(1, Ordering::Relaxed);
+        self.counters.jobs_completed.fetch_add(1, Ordering::Relaxed);
+        if self.worker {
+            self.counters.worker_jobs_completed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct ObservedStaging<'a> {
+    counters: &'a PipelineCounters,
+    bytes: usize,
+}
+
+impl<'a> ObservedStaging<'a> {
+    fn new(counters: &'a PipelineCounters, bytes: usize) -> Self {
+        counters.stage(bytes);
+        Self { counters, bytes }
+    }
+
+    fn grow(&mut self, bytes: usize) {
+        self.counters.stage(bytes - self.bytes);
+        self.bytes = bytes;
+    }
+}
+
+impl Drop for ObservedStaging<'_> {
+    fn drop(&mut self) {
+        self.counters.unstage(self.bytes);
+    }
+}
+
+static SEQUENTIAL_METRICS: OnceLock<PipelineCounters> = OnceLock::new();
+
+fn sequential_metrics() -> Option<&'static PipelineCounters> {
+    static MEASURE: OnceLock<bool> = OnceLock::new();
+    MEASURE.get_or_init(|| env_enabled("XCL_DSTORAGE_MEASURE")).then(|| {
+        if let Some(Some(pool)) = DECOMPRESS_POOL.get() {
+            &pool.shared.budget.metrics
+        } else {
+            SEQUENTIAL_METRICS.get_or_init(PipelineCounters::default)
+        }
+    })
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Decode a zlib stream into a caller-provided contiguous buffer with no output growth.
+/// Miniz validates the zlib checksum and uses an inline DecompressorOxide as its codec state.
+pub fn decompress_zlib_into(compressed: &[u8], output: &mut [u8]) -> Result<(), HRESULT> {
+    match miniz_oxide::inflate::decompress_slice_iter_to_slice(output, std::iter::once(compressed), true, false) {
+        Ok(written) if written == output.len() => Ok(()),
+        _ => Err(E_ZLIB_DATA),
+    }
+}
+
+const CODEC_STATE_BYTES: usize = std::mem::size_of::<miniz_oxide::inflate::core::DecompressorOxide>();
+
+struct StagingBudget {
+    max: usize,
+    used: Mutex<usize>,
+    capacity: Condvar,
+    metrics: PipelineCounters,
+}
+
+impl StagingBudget {
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
+        let mut used = self.used.lock().unwrap();
+        if bytes > self.max - *used {
+            return None;
+        }
+        *used += bytes;
+        Some(Reservation { budget: Arc::clone(self), bytes })
+    }
+
+    fn wait_for_capacity(&self, bytes: usize, closed: &AtomicBool) {
+        let used = self.used.lock().unwrap();
+        drop(self.capacity.wait_while(used, |used| bytes > self.max - *used && !closed.load(Ordering::Acquire)).unwrap());
+    }
+
+    fn wake_waiters(&self) {
+        let _used = self.used.lock().unwrap();
+        self.capacity.notify_all();
+    }
+}
+
+/// Reserved bytes travel with their owners through the decode queue and FIFO retirement.
+/// The reservation and measurement fields of a buffer drop after the buffer allocation.
+struct Reservation {
+    budget: Arc<StagingBudget>,
+    bytes: usize,
+}
+
+impl Reservation {
+    fn split(&mut self, bytes: usize) -> Self {
+        self.bytes -= bytes;
+        Self { budget: Arc::clone(&self.budget), bytes }
+    }
+
+    fn measure(self) -> MeasuredReservation {
+        self.budget.metrics.stage(self.bytes);
+        MeasuredReservation(self)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap();
+        *used -= self.bytes;
+        self.budget.capacity.notify_all();
+    }
+}
+
+struct MeasuredReservation(Reservation);
+
+impl Drop for MeasuredReservation {
+    fn drop(&mut self) {
+        self.0.budget.metrics.unstage(self.0.bytes);
+    }
+}
+
+struct StagingBuffer {
+    bytes: Box<[u8]>,
+    _allocation: MeasuredReservation,
+}
+
+impl StagingBuffer {
+    fn new(reservation: Reservation) -> Result<Self, HRESULT> {
+        let len = reservation.bytes;
+        let bytes = if len == 0 {
+            Box::default()
+        } else {
+            let layout = std::alloc::Layout::array::<u8>(len).map_err(|_| E_OUTOFMEMORY)?;
+            // SAFETY: global allocator and the u8 slice's box use the same nonempty
+            // layout. alloc_zeroed initializes every byte, and ownership moves to Box.
+            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+            if raw.is_null() {
+                return Err(E_OUTOFMEMORY);
+            }
+            unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(raw, len)) }
+        };
+        Ok(Self { bytes, _allocation: reservation.measure() })
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestEvent {
+    BeforeDecode(u64),
+    Prepared(u64),
+    BeforeRetire(u64),
+    Retired(u64),
+    BudgetWait,
+}
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn(TestEvent) + Send + Sync>;
+
+struct DecompressTask {
+    seq: u64,
+    compressed: StagingBuffer,
+    output: Reservation,
+    codec_state: Reservation,
+    target_size: usize,
+    tx: mpsc::Sender<DecompressResult>,
+    #[cfg(test)]
+    hook: Option<TestHook>,
+}
+
+struct DecompressResult {
+    seq: u64,
+    result: Result<StagingBuffer, HRESULT>,
+}
+
+struct PoolQueue {
+    tasks: VecDeque<DecompressTask>,
+    shutdown: bool,
+}
+
+struct SharedPool {
+    queue: Mutex<PoolQueue>,
+    work_available: Condvar,
+    budget: Arc<StagingBudget>,
+}
+
+struct DecompressPool {
+    shared: Arc<SharedPool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl DecompressPool {
+    fn new(workers: usize, budget_bytes: usize) -> Option<Arc<Self>> {
+        if workers == 0 {
+            return None;
+        }
+        let mut pool = Self {
+            shared: Arc::new(SharedPool {
+                queue: Mutex::new(PoolQueue { tasks: VecDeque::new(), shutdown: false }),
+                work_available: Condvar::new(),
+                budget: Arc::new(StagingBudget {
+                    max: budget_bytes,
+                    used: Mutex::new(0),
+                    capacity: Condvar::new(),
+                    metrics: PipelineCounters::default(),
+                }),
+            }),
+            workers: Vec::with_capacity(workers),
+        };
+        for id in 0..workers {
+            let shared = Arc::clone(&pool.shared);
+            match std::thread::Builder::new().name(format!("xcl-ds-decomp-{id}")).spawn(move || Self::worker_loop(shared)) {
+                Ok(worker) => pool.workers.push(worker),
+                Err(err) => {
+                    crate::xlog_warn!("DirectStorage: could not start decompression workers ({err}); using sequential requests");
+                    return None;
+                }
+            }
+        }
+        Some(Arc::new(pool))
+    }
+
+    fn worker_loop(shared: Arc<SharedPool>) {
+        let counters = &shared.budget.metrics;
+        loop {
+            let task = {
+                let queue = shared.queue.lock().unwrap();
+                let mut queue = shared.work_available.wait_while(queue, |q| q.tasks.is_empty() && !q.shutdown).unwrap();
+                let Some(task) = queue.tasks.pop_front() else { break };
+                counters.queued_jobs.fetch_sub(1, Ordering::Relaxed);
+                task
+            };
+            let DecompressTask { seq, compressed, output, codec_state, target_size, tx, #[cfg(test)] hook } = task;
+            // A worker owns each reservation until the associated allocation goes away.
+            // Convert a panicking task into a completion so its queue cannot wait forever.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    hook(TestEvent::BeforeDecode(seq));
+                }
+                let mut output = StagingBuffer::new(output)?;
+                let result = {
+                    let _state = codec_state.measure();
+                    let active = counters.start_decode(true);
+                    let result = decompress_zlib_into(&compressed.bytes, &mut output.bytes[..target_size]);
+                    if is_profiling_enabled() {
+                        DECOMPRESS_NANOS.fetch_add(active.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    result
+                };
+                result?;
+                Ok(output)
+            }))
+            .unwrap_or(Err(E_ABORT));
+            counters.outstanding_jobs.fetch_sub(1, Ordering::Relaxed);
+            let _ = tx.send(DecompressResult { seq, result });
+        }
+    }
+
+    fn dispatch(&self, task: DecompressTask) {
+        let mut queue = self.shared.queue.lock().unwrap();
+        let counters = &self.shared.budget.metrics;
+        add_and_peak(&counters.queued_jobs, &counters.peak_queued_jobs, 1);
+        add_and_peak(&counters.outstanding_jobs, &counters.peak_outstanding_jobs, 1);
+        queue.tasks.push_back(task);
+        self.shared.work_available.notify_one();
+    }
+
+    fn metrics(&self) -> PipelineMetrics {
+        self.shared.budget.metrics.snapshot(self.workers.len(), self.shared.budget.max)
+    }
+}
+
+impl Drop for DecompressPool {
+    fn drop(&mut self) {
+        self.shared.queue.lock().unwrap().shutdown = true;
+        self.shared.work_available.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+// The process owns the global pool after its first use. A scoped owner, such as
+// an isolated test pool, shuts down and joins its workers on the last drop.
+static DECOMPRESS_POOL: OnceLock<Option<Arc<DecompressPool>>> = OnceLock::new();
+
+fn get_decompress_pool() -> Option<Arc<DecompressPool>> {
+    DECOMPRESS_POOL.get_or_init(|| {
+        if !env_enabled("XCL_DSTORAGE_PARALLEL_DECOMPRESS") {
+            return None;
+        }
+        let workers = std::env::var("XCL_DSTORAGE_WORKERS").ok().and_then(|value| value.parse().ok()).unwrap_or(4).clamp(1, 16);
+        let budget_mib = std::env::var("XCL_DSTORAGE_MEMORY_BUDGET_MIB").ok().and_then(|value| value.parse().ok()).unwrap_or(32).clamp(1, 1024);
+        DecompressPool::new(workers, budget_mib * 1024 * 1024)
+    }).clone()
+}
+
+pub fn pipeline_metrics() -> PipelineMetrics {
+    if let Some(Some(pool)) = DECOMPRESS_POOL.get() {
+        pool.metrics()
+    } else {
+        SEQUENTIAL_METRICS.get().map_or(PipelineMetrics::default(), |counters| counters.snapshot(0, 0))
+    }
+}
+
+fn note_request(r: &Request) {
+    let n = r.destination_size as usize;
+    // the first requests: where a title's data goes and how it is packed
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    if k < 16 || k.is_power_of_two() {
+        crate::xlog_info!(
+            "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
+            r.options,
+            if r.memory_source() { "memory" } else { "file" },
+            if r.zlib() { ", zlib" } else { "" },
+            r.destination,
+            if r.dest_physical_pages() { " (physical pages)" } else { "" },
+            r.destination_page_offset,
+            r.source_size,
+            r.intermediate_size
+        );
+    }
 }
 
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
-    {
-        // the first requests: where a title's data goes and how it is packed
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let k = N.fetch_add(1, Ordering::Relaxed);
-        REQUESTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        if k < 16 || k.is_power_of_two() {
-            crate::xlog_info!(
-                "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
-                r.options,
-                if r.memory_source() { "memory" } else { "file" },
-                if r.zlib() { ", zlib" } else { "" },
-                r.destination,
-                if r.dest_physical_pages() { " (physical pages)" } else { "" },
-                r.destination_page_offset,
-                r.source_size,
-                r.intermediate_size
-            );
-        }
-    }
+    note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
+    let metrics = sequential_metrics();
+    let _source_staging;
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
+        _source_staging = metrics.map(|m| ObservedStaging::new(m, b.capacity()));
+        let t0 = if is_profiling_enabled() { Some(std::time::Instant::now()) } else { None };
         if r.source_physical_pages() {
             let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
@@ -805,11 +1260,19 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
             }
         }
+        if let Some(t0) = t0 {
+            READ_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
         let mut b = vec![0u8; r.source_size as usize];
+        _source_staging = metrics.map(|m| ObservedStaging::new(m, b.capacity()));
+        let t0 = if is_profiling_enabled() { Some(std::time::Instant::now()) } else { None };
         read_exact_at(&f, r.offset, &mut b)?;
+        if let Some(t0) = t0 {
+            READ_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         b
     };
 
@@ -817,27 +1280,39 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         return Err(E_DECOMPRESSION);
     }
 
+    let mut _output_staging;
     let payload: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        let t0 = if is_profiling_enabled() { Some(std::time::Instant::now()) } else { None };
+        let result = {
+            let _state = metrics.map(|m| ObservedStaging::new(m, CODEC_STATE_BYTES));
+            let _active = metrics.map(|m| m.start_decode(false));
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len)
+        };
+        let mut d = result.map_err(|_| E_ZLIB_DATA)?;
+        // The original decoder allocates and can grow its Vec inside miniz.
+        // This measures the returned capacity, not transient reallocations.
+        _output_staging = metrics.map(|m| ObservedStaging::new(m, d.capacity()));
         if d.len() != stage1_len {
             return Err(E_ZLIB_DATA);
         }
         if d.len() < n {
             d.resize(n, 0);
+            if let Some(staging) = &mut _output_staging {
+                staging.grow(d.capacity());
+            }
+        }
+        if let Some(t0) = t0 {
+            DECOMPRESS_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         d
     } else {
+        _output_staging = None;
         src
     };
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
         let late: Vec<usize>;
         let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
             late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
@@ -845,11 +1320,20 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         } else {
             pages
         };
-        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+        let t0 = if is_profiling_enabled() { Some(std::time::Instant::now()) } else { None };
+        let ok = crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]);
+        if let Some(t0) = t0 {
+            COPY_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        if !ok {
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
+        let t0 = if is_profiling_enabled() { Some(std::time::Instant::now()) } else { None };
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        if let Some(t0) = t0 {
+            COPY_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
     Ok(())
 }
@@ -922,6 +1406,161 @@ struct FirstError {
     file: Vec<u16>,
 }
 
+struct InFlightTask {
+    seq: u64,
+    req: Request,
+    file: Option<Arc<FileInner>>,
+}
+
+struct Pipeline<'a> {
+    queue: &'a QueueInner,
+    pool: Arc<DecompressPool>,
+    tx: mpsc::Sender<DecompressResult>,
+    rx: mpsc::Receiver<DecompressResult>,
+    in_flight: VecDeque<InFlightTask>,
+    completed: HashMap<u64, Result<StagingBuffer, HRESULT>>,
+    outstanding_workers: usize,
+}
+
+impl<'a> Pipeline<'a> {
+    fn new(queue: &'a QueueInner, pool: Arc<DecompressPool>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { queue, pool, tx, rx, in_flight: VecDeque::new(), completed: HashMap::new(), outstanding_workers: 0 }
+    }
+
+    fn charge(&self, req: &Request, stage1_len: usize) -> Option<usize> {
+        let cost = (req.source_size as usize)
+            .checked_add(stage1_len.max(req.destination_size as usize))?
+            .checked_add(CODEC_STATE_BYTES)?;
+        (cost <= self.pool.shared.budget.max).then_some(cost)
+    }
+
+    fn retire_ready(&mut self, since_status: &mut HRESULT) {
+        while let Some(front) = self.in_flight.front() {
+            let Some(result) = self.completed.remove(&front.seq) else { break };
+            let task = self.in_flight.pop_front().unwrap();
+            if !self.queue.closed.load(Ordering::Acquire) {
+                self.queue.retire_one(task, result, since_status);
+            }
+        }
+    }
+
+    fn accept(&mut self, result: DecompressResult, since_status: &mut HRESULT) {
+        let seq = result.seq;
+        self.outstanding_workers -= 1;
+        self.completed.insert(seq, result.result);
+        self.retire_ready(since_status);
+        #[cfg(test)]
+        self.queue.notify_test(TestEvent::Prepared(seq));
+    }
+
+    fn collect_ready(&mut self, since_status: &mut HRESULT) {
+        self.retire_ready(since_status);
+        while let Ok(result) = self.rx.try_recv() {
+            self.accept(result, since_status);
+        }
+    }
+
+    fn wait_for_result(&mut self, since_status: &mut HRESULT) {
+        // All dispatched workers send a completion even if an individual decoder panics.
+        // In particular, do not block on this channel for a queue containing only ready errors.
+        if self.outstanding_workers != 0 {
+            if let Ok(result) = self.rx.recv() {
+                self.accept(result, since_status);
+                return;
+            }
+            self.outstanding_workers = 0;
+        }
+        for task in &self.in_flight {
+            self.completed.entry(task.seq).or_insert(Err(E_ABORT));
+        }
+        self.retire_ready(since_status);
+    }
+
+    fn reserve(&mut self, cost: usize, since_status: &mut HRESULT) -> Option<Reservation> {
+        loop {
+            self.collect_ready(since_status);
+            if self.queue.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let budget = &self.pool.shared.budget;
+            if let Some(reservation) = budget.try_reserve(cost) {
+                return Some(reservation);
+            }
+            budget.metrics.budget_waits.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            self.queue.notify_test(TestEvent::BudgetWait);
+            if self.in_flight.is_empty() {
+                // With no local reservations left, another queue owns the bytes.
+                budget.wait_for_capacity(cost, &self.queue.closed);
+            } else {
+                self.wait_for_result(since_status);
+            }
+        }
+    }
+
+    fn drain(&mut self, since_status: &mut HRESULT) {
+        if self.in_flight.is_empty() {
+            return;
+        }
+        self.pool.shared.budget.metrics.pipeline_drains.fetch_add(1, Ordering::Relaxed);
+        self.collect_ready(since_status);
+        while !self.in_flight.is_empty() {
+            self.wait_for_result(since_status);
+        }
+    }
+
+    fn start(&mut self, task: InFlightTask, stage1_len: usize, cost: usize, since_status: &mut HRESULT) {
+        let seq = task.seq;
+        let req = task.req;
+        if self.queue.is_cancelled(seq, req.tag) {
+            return;
+        }
+        let Some(mut reservation) = self.reserve(cost, since_status) else { return };
+        // A request waiting for budget has not started. Check once more before preparing it,
+        // then never reconsider cancellation during decode or retirement.
+        if self.queue.closed.load(Ordering::Acquire) || self.queue.is_cancelled(seq, req.tag) {
+            return;
+        }
+        note_request(&req);
+        let loaded = (|| {
+            if !writable(req.destination as usize, req.destination_size as usize) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            let handle = task.file.as_ref().and_then(|file| file.handle()).ok_or(E_FILE_HANDLE)?;
+            let mut input = StagingBuffer::new(reservation.split(req.source_size as usize))?;
+            let start = is_profiling_enabled().then(Instant::now);
+            let result = read_exact_at(&handle, req.offset, &mut input.bytes);
+            if let Some(start) = start {
+                READ_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            result?;
+            Ok(input)
+        })();
+        self.in_flight.push_back(task);
+        match loaded {
+            Ok(compressed) => {
+                let codec_state = reservation.split(CODEC_STATE_BYTES);
+                self.outstanding_workers += 1;
+                self.pool.dispatch(DecompressTask {
+                    seq,
+                    compressed,
+                    output: reservation,
+                    codec_state,
+                    target_size: stage1_len,
+                    tx: self.tx.clone(),
+                    #[cfg(test)]
+                    hook: self.queue.test_hook.get().cloned(),
+                });
+            }
+            Err(hr) => {
+                self.completed.insert(seq, Err(hr));
+                drop(reservation);
+            }
+        }
+    }
+}
+
 struct QueueInner {
     desc: [u8; 0x18],
     source_memory: bool,
@@ -933,8 +1572,12 @@ struct QueueInner {
     closed: AtomicBool,
     error_event: usize,
     errors: Mutex<(u32, Option<FirstError>)>,
-    /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
+    /// The value of XCL_DSTORAGE_BCPACK_FILL when the queue was made.
     bcpack_fill: AtomicBool,
+    #[cfg(test)]
+    pool_override: OnceLock<Option<Arc<DecompressPool>>>,
+    #[cfg(test)]
+    test_hook: OnceLock<TestHook>,
 }
 
 impl QueueInner {
@@ -951,10 +1594,156 @@ impl QueueInner {
 
     fn is_cancelled(&self, seq: u64, tag: u64) -> bool {
         let mut rules = self.cancels.lock().unwrap();
-        // Worker processes requests in strictly increasing `seq` order, so rules with
-        // `up_to_seq < seq` can never match this or any later request.
+        // Requests begin in strictly increasing sequence order.
         rules.retain(|r| r.up_to_seq >= seq);
         rules.iter().any(|r| tag & r.mask == r.value)
+    }
+
+    fn update_error(&self, hr: HRESULT, req: Request, file: Option<&FileInner>, since_status: &mut HRESULT) {
+        self.fail(hr, req, file);
+        if *since_status >= 0 {
+            *since_status = hr;
+        }
+    }
+
+    #[cfg(test)]
+    fn notify_test(&self, event: TestEvent) {
+        if let Some(hook) = self.test_hook.get() {
+            hook(event);
+        }
+    }
+
+    fn get_pool(&self) -> Option<Arc<DecompressPool>> {
+        #[cfg(test)]
+        if let Some(pool) = self.pool_override.get() {
+            return pool.clone();
+        }
+        get_decompress_pool()
+    }
+
+    fn wake_budget_waiters(&self) {
+        #[cfg(test)]
+        let pool = self.pool_override.get().or_else(|| DECOMPRESS_POOL.get());
+        #[cfg(not(test))]
+        let pool = DECOMPRESS_POOL.get();
+        if let Some(Some(pool)) = pool {
+            pool.shared.budget.wake_waiters();
+        }
+    }
+
+    fn retire_one(&self, task: InFlightTask, result: Result<StagingBuffer, HRESULT>, since_status: &mut HRESULT) {
+        #[cfg(test)]
+        self.notify_test(TestEvent::BeforeRetire(task.seq));
+        let result = result.and_then(|payload| {
+            let n = task.req.destination_size as usize;
+            // Destination access may have changed since preparation. Preserve an earlier
+            // preparation error, and revalidate only when there are bytes to deliver.
+            if !writable(task.req.destination as usize, n) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            if n != 0 {
+                let start = is_profiling_enabled().then(Instant::now);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(payload.bytes.as_ptr(), task.req.destination as *mut u8, n);
+                }
+                if let Some(start) = start {
+                    COPY_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+            // payload and its reservation drop here, after the final copy.
+            Ok(())
+        });
+        if let Err(hr) = result {
+            self.update_error(hr, task.req, task.file.as_deref(), since_status);
+        }
+        record_retirement(task.req.tag);
+        #[cfg(test)]
+        self.notify_test(TestEvent::Retired(task.seq));
+    }
+
+    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
+        struct ActiveGuard<'a>(&'a QueueInner);
+        impl Drop for ActiveGuard<'_> {
+            fn drop(&mut self) {
+                *self.0.worker_active.0.lock().unwrap() = false;
+                self.0.worker_active.1.notify_all();
+            }
+        }
+        let _active = ActiveGuard(self);
+        let mut since_status = S_OK;
+        let mut pipeline = self.get_pool().map(|pool| Pipeline::new(self, pool));
+
+        for batch in rx {
+            for e in batch {
+                if self.closed.load(Ordering::Acquire) {
+                    if let Entry::Status(s, i) = e {
+                        if let Some(slot) = s.slots.get(i as usize) {
+                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(pipeline) = &mut pipeline {
+                    if let Entry::Request { seq, req, ref file, .. } = e {
+                        let n = req.destination_size as usize;
+                        let stage1_len = if req.intermediate_size == 0 { n } else { req.intermediate_size as usize };
+                        let eligible = req.zlib() && !req.memory_source() && !req.dest_physical_pages() && req.swizzle() == 0 && req.bcpack() == 0;
+                        if eligible {
+                            if let Some(cost) = pipeline.charge(&req, stage1_len) {
+                                pipeline.start(InFlightTask { seq, req, file: file.clone() }, stage1_len, cost, &mut since_status);
+                                continue;
+                            }
+                        }
+                    }
+                    pipeline.drain(&mut since_status);
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    if let Entry::Status(s, i) = e {
+                        if let Some(slot) = s.slots.get(i as usize) {
+                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
+                        }
+                    }
+                    continue;
+                }
+                match e {
+                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                        if !self.is_cancelled(seq, req.tag) {
+                            if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                                self.update_error(hr, req, file.as_deref(), &mut since_status);
+                            }
+                            record_retirement(req.tag);
+                            #[cfg(test)]
+                            self.notify_test(TestEvent::Retired(seq));
+                        }
+                    }
+                    Entry::Refused { hr, req, file, fill } => {
+                        if let Some(target) = &fill {
+                            unsafe { bcpack_fill(&req, target) };
+                        }
+                        self.update_error(hr, req, file.as_deref(), &mut since_status);
+                        record_retirement(req.tag);
+                    }
+                    Entry::Status(s, i) => {
+                        if let Some(slot) = s.slots.get(i as usize) {
+                            slot.store(since_status, Ordering::Release);
+                        }
+                        since_status = S_OK;
+                    }
+                    Entry::Signal(fence, value) => unsafe {
+                        fence.signal(value);
+                    },
+                    #[cfg(test)]
+                    Entry::Gate(b) => {
+                        b.wait();
+                    }
+                }
+            }
+            // Submitting a batch promises independent progress, even if it contains
+            // neither a status nor a fence and the producer never submits again.
+            if let Some(pipeline) = &mut pipeline {
+                pipeline.drain(&mut since_status);
+            }
+        }
     }
 
     fn submit(self: &Arc<Self>) {
@@ -987,68 +1776,6 @@ impl QueueInner {
         // Release `worker` before dropping any unsent `batch` returned in `Err`.
         drop(w);
         drop(sent);
-    }
-
-    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
-        struct ActiveGuard<'a>(&'a QueueInner);
-        impl Drop for ActiveGuard<'_> {
-            fn drop(&mut self) {
-                *self.0.worker_active.0.lock().unwrap() = false;
-                self.0.worker_active.1.notify_all();
-            }
-        }
-        let _active = ActiveGuard(self);
-        // the first failure of the requests since the last status entry
-        let mut since_status = S_OK;
-        for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
-                    }
-                    continue;
-                }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
-                    }
-                    Entry::Refused { hr, req, file, fill } => {
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
-                        }
-                        self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
-                    }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
-                    }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
-                    }
-                }
-            }
-        }
     }
 
     fn enqueue(self: &Arc<Self>, e: Entry) {
@@ -1155,6 +1882,10 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        #[cfg(test)]
+        pool_override: OnceLock::new(),
+        #[cfg(test)]
+        test_hook: OnceLock::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1321,6 +2052,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
         // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
+    q.wake_budget_waiters();
     // Wait outside queue locks so no in-flight worker request can still touch caller buffers
     // after `Close()` returns (including for concurrent `Close()` callers).
     let (lock, cvar) = &q.worker_active;
@@ -2289,3 +3021,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dstorage/parallel_tests.rs"]
+mod parallel_tests;
