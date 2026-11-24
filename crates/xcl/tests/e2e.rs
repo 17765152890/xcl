@@ -97,8 +97,13 @@ fn test_title_runs_and_game_folder_is_untouched() {
         dll.display()
     );
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
-    let _ = std::fs::remove_dir_all(&root);
+    // Each test process owns its fixture and keeps its reports available after the run.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("e2e-{}-{nonce}", std::process::id()));
     let game = root.join("game");
     let data = root.join("data");
     copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
