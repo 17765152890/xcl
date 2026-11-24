@@ -834,7 +834,43 @@ impl Pipelines {
     }
 }
 
+/// `--pipelines`: DXIL size from which a compute program's pipeline is made after all the others.
+/// A retail title's pack has three such programs right after record 22 600 (13 – 29 MB of DXIL:
+/// screen-probe passes unrolled to 88 863 console instructions). The NVIDIA driver alone had not
+/// built the smallest after 14 minutes; in the pass, the compiles that queued behind them stopped
+/// it at that record, its memory growing, before the rest of the pack was made.
+const GIANT_DXIL: usize = 4 << 20;
+
+/// Programs kept for the end of the pass (`GIANT_DXIL`), with their names and DXIL sizes.
+struct Giants<T> {
+    min: usize,
+    kept: Mutex<Vec<(String, usize, T)>>,
+}
+
+impl<T> Giants<T> {
+    fn new(min: usize) -> Self {
+        Giants { min, kept: Mutex::new(Vec::new()) }
+    }
+
+    /// `item` (`len` bytes of DXIL) back to be made now, or `None`: kept for the end
+    fn now_or_later(&self, name: &str, len: usize, item: T) -> Option<T> {
+        if len < self.min {
+            return Some(item);
+        }
+        self.kept.lock().unwrap().push((name.to_string(), len, item));
+        None
+    }
+
+    /// The kept programs, smallest first
+    fn take(&self) -> Vec<(String, usize, T)> {
+        let mut kept = std::mem::take(&mut *self.kept.lock().unwrap());
+        kept.sort_by_key(|(_, len, _)| *len);
+        kept
+    }
+}
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+    let giants: Giants<recomp::pso::Compiled> = Giants::new(GIANT_DXIL);
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -885,7 +921,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                if let Some(c) = giants.now_or_later(&name, c.dxil.len(), c) {
+                                    p.make(&c);
+                                }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -947,6 +985,20 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    // the giants last, one at a time, each named before the driver gets it: stopping the pass
+    // here keeps everything made before
+    if let Some(p) = pipelines {
+        let late = giants.take();
+        if !late.is_empty() {
+            println!("{} compute programs of {} MB of DXIL or more, made last (the driver can take 15 minutes or more over each):", late.len(), GIANT_DXIL >> 20);
+            for (name, len, c) in late {
+                println!("  {name}: {} KB of DXIL …", len >> 10);
+                let started = std::time::Instant::now();
+                p.make(&c);
+                println!("    done in {:.0} s", started.elapsed().as_secs_f64());
+            }
+        }
+    }
     println!(
         "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
         compiled.into_inner(),
@@ -1275,6 +1327,19 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn pipelines_of_giant_programs_are_kept_for_the_end_smallest_first() {
+        let g = Giants::new(GIANT_DXIL);
+        assert_eq!(g.now_or_later("small", 300 << 10, 1), Some(1));
+        assert_eq!(g.now_or_later("just under", GIANT_DXIL - 1, 2), Some(2));
+        assert_eq!(g.now_or_later("probes", 29 << 20, 3), None);
+        assert_eq!(g.now_or_later("rays", 13 << 20, 4), None);
+        assert_eq!(g.now_or_later("at the limit", GIANT_DXIL, 5), None);
+        let late: Vec<(String, i32)> = g.take().into_iter().map(|(name, _, item)| (name, item)).collect();
+        assert_eq!(late, vec![("at the limit".into(), 5), ("rays".into(), 4), ("probes".into(), 3)]);
+        assert!(g.take().is_empty(), "taken once");
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
