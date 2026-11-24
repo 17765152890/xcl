@@ -95,8 +95,9 @@ class Sections(unittest.TestCase):
 
     def test_untouched_template_is_refused(self):
         path = os.path.join(HERE, "..", ".github", "pull_request_template.md")
+        # the hints under each heading are comments: none of them counts as a result
         with open(path, encoding="utf-8") as f:
-            self.assertIn(empty("Not tested"), problems(f.read()))
+            self.assertEqual(problems(f.read()), [empty(s) for s in ("Tested", "Not tested", "AI use")])
 
     def test_text_in_bold_is_text(self):
         # a line in bold that is not a heading of the outline does not end the section

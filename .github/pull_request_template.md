@@ -4,8 +4,9 @@
 -
 
 **Tested**
-- hardware (GPU + driver, CPU), Rust version, debug / release:
-- `cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)
+<!-- hardware (GPU + driver, CPU), Rust version, debug / release;
+     `cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …) -->
+-
 
 **Regression run**
 <!-- Required when the PR changes crates/xcl/src outside tests: `scripts/smoke.ps1` on a real title,
@@ -20,4 +21,5 @@ PR:
 -
 
 **AI use**
-- none / tool and model, and what it did
+<!-- none / tool and model, and what it did -->
+-
