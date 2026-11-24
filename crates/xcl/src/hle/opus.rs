@@ -407,7 +407,7 @@ fn vorbis_mapping(channels: u8) -> Option<(u8, u8, &'static [u8])> {
         4 => Some((2, 2, &[0, 1, 2, 3])),
         5 => Some((3, 2, &[0, 4, 1, 2, 3])),
         6 => Some((4, 2, &[0, 4, 1, 2, 3, 5])),
-        7 => Some((4, 3, &[0, 4, 1, 2, 3, 5, 6])),
+        7 => Some((5, 2, &[0, 4, 1, 2, 3, 5, 6])),
         8 => Some((5, 3, &[0, 6, 1, 2, 3, 4, 5, 7])),
         _ => None,
     }
@@ -1608,6 +1608,27 @@ pub(crate) mod tests {
             assert_eq!(h.pre_skip, 312);
             assert_eq!(h.output_gain, -256);
             assert_eq!(h.mapping_family, if ch <= 2 { 0 } else { 1 });
+        }
+    }
+
+    /// The channel mappings of RFC 7845, section 5.1.1.2 (family 1): stream count, coupled stream
+    /// count and the mapping table, for 3 to 8 channels. 6.1 is 5 streams, 2 of them coupled
+    /// (L/R and SL/SR; C, BC and LFE are single) – streams + coupled = channels holds for a
+    /// wrong table as well, so the values are listed.
+    #[test]
+    fn opus_head_vorbis_channel_mappings_match_rfc7845() {
+        let table: [(u8, u8, u8, &[u8]); 6] = [
+            (3, 2, 1, &[0, 2, 1]),
+            (4, 2, 2, &[0, 1, 2, 3]),
+            (5, 3, 2, &[0, 4, 1, 2, 3]),
+            (6, 4, 2, &[0, 4, 1, 2, 3, 5]),
+            (7, 5, 2, &[0, 4, 1, 2, 3, 5, 6]),
+            (8, 5, 3, &[0, 6, 1, 2, 3, 4, 5, 7]),
+        ];
+        for (ch, streams, coupled, mapping) in table {
+            let h = parse_opus_head(&build_opus_head(ch, 48_000, 0, 0)).unwrap();
+            assert_eq!((h.stream_count, h.coupled_count, h.mapping.as_slice()), (streams, coupled, mapping), "{ch} channels");
+            assert_eq!(h.stream_count as usize + h.coupled_count as usize, ch as usize);
         }
     }
 
