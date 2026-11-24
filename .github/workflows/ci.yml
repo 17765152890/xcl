@@ -33,6 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # the unit tests of the scripts (scripts/test_*.py, e.g. the PR checker's): seconds, so
+      # before the build. The PR checks workflow runs main's checker, never a PR's copy.
+      - name: Script tests (Python)
+        run: python -B -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Rust (stable, MSVC)
         run: |
           rustup toolchain install stable --profile minimal
