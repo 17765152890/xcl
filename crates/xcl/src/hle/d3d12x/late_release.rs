@@ -122,12 +122,10 @@ pub unsafe fn hold(res: usize) {
     });
 }
 
-/// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
-/// upload ones.
-pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
-    }
+/// All queues XCL knows of whose in-flight work may still reference a released resource:
+/// the title's queues, the sparse tile-mapping queue, the tiled-texture mapping queues, and the
+/// title-texture upload queues.
+unsafe fn drain_queues() -> Vec<ID3D12CommandQueue> {
     let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
     for raw in super::present::known_queues() {
         let raw = raw as *mut c_void;
@@ -136,7 +134,18 @@ pub unsafe fn drain_known(seal_now: bool) {
         }
     }
     queues.extend(super::sparse::queue());
+    queues.extend(super::vram::queues());
     queues.extend(super::title_textures::upload_queues());
+    queues
+}
+
+/// Release what every queue XCL knows of is past: the title's, the tile-mapping ones, the
+/// upload ones.
+pub unsafe fn drain_known(seal_now: bool) {
+    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+        return;
+    }
+    let queues = drain_queues();
     let gone = match HELD.lock().unwrap().as_mut() {
         Some(h) => h.drain(&queues, seal_now),
         None => return,
@@ -207,5 +216,70 @@ mod tests {
         held.open.push(0x1000);
         assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
         assert!(held.is_empty());
+    }
+
+    /// `drain_queues` includes the tiled-texture tile-mapping queue from `vram::Pages`, so a
+    /// released texture stays held while `UpdateTileMappings` is still in flight on it.
+    #[test]
+    fn drain_queues_waits_for_vram_tile_mapping_queue() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 128,
+                Height: 128,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut p = std::ptr::null_mut();
+            let hr = super::super::vram::place_pages(dev.as_raw(), 0x77_0000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(0x1_0000), riid, &mut p);
+            if !hr.is_some_and(|h| h >= 0) || p.is_null() {
+                return crate::gpu::recomp::runner::skip_test("no reserved textures");
+            }
+            let placed = ID3D12Resource::from_raw(p);
+
+            let vram_qs = super::super::vram::queues();
+            assert!(!vram_qs.is_empty(), "vram::place_pages must register its tile-mapping queue");
+            let vq = vram_qs.last().unwrap().clone();
+            let all = drain_queues();
+            assert!(all.iter().any(|q| q.as_raw() == vq.as_raw()), "drain_queues must include the vram tile-mapping queue");
+
+            // Stall the vram tile-mapping queue on an unsignaled gate; a batch sealed against
+            // `drain_queues()` must remain held until the gate signals.
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            vq.Wait(&gate, 1).unwrap();
+            let mut held = Held::default();
+            held.open.push(0x2000);
+            assert!(held.drain(&all, true).is_empty(), "batch must stay held while vram tile-mapping queue is blocked");
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(held.drain(&all, false).is_empty(), "still held before gate signals");
+
+            gate.Signal(1).unwrap();
+            let start = Instant::now();
+            let mut gone = Vec::new();
+            while gone.is_empty() && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+                gone = held.drain(&all, false);
+            }
+            assert_eq!(gone, vec![0x2000], "batch must release once vram tile-mapping queue passes");
+            // Unmap immediately before dropping so no idle page lingers to be swept during another test.
+            super::super::vram::unmap_superseded(&placed);
+            drop(placed);
+        }
     }
 }
