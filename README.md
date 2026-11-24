@@ -85,7 +85,12 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
 - **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
   when no XInput controller is connected – buttons, sticks and triggers; a wired DualSense rumbles
-  too. No light bar control.
+  too. No light bar control. A wired DualSense plays the title's trigger rumble on its adaptive
+  triggers, and with `haptics = "auto"` the rumble on its haptic actuators when its audio output
+  has 4 channels (it can cost frames): `[dualsense]` in `xcl.toml` – `triggers` ("vibration",
+  "resistance", "off"), `trigger_strength`, `trigger_resistance` (0–1, a resistance between
+  rumbles), `haptics` ("rumble" default, "auto", "off"), `rumble_strength`, `haptics_device`
+  (part of the audio output's name).
   `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,

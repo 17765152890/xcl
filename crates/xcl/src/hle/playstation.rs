@@ -3,9 +3,12 @@
 //! one had no gamepad. They are read here as HID devices: a thread reads the first one found
 //! (input report 0x01; a DualShock 4 over Bluetooth sends the same first bytes as over USB) and
 //! `gameinput::poll` uses it when no XInput controller answers. A DualSense over USB also
-//! takes the title's rumble (compatible vibration), sent by a thread of its own whenever it
-//! changes; sending it also sets the light bar and player LEDs to their defaults. Reads are
-//! overlapped, so `shutdown` (at process exit) can stop them and the motors.
+//! takes the title's rumble, sent by a thread of its own whenever it changes; sending it also
+//! sets the light bar and player LEDs to their defaults. The low and high levels play as
+//! compatible vibration, or with `haptics = "auto"` on its haptic actuators through its USB
+//! audio channels 3–4 (`dualsense_haptics`) when that output has 4 channels; the trigger levels
+//! become adaptive trigger effects (`[dualsense]` in `xcl.toml`). Reads are overlapped, so `shutdown` (at process exit)
+//! can stop them, the motors and the triggers.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -17,8 +20,10 @@ use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile, 
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-use super::dualsense_report as report;
+use super::dualsense_haptics as haptics;
+use super::dualsense_report::{self as report, TriggerEffect};
 use super::gameinput::*;
+use crate::config::DualSenseConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Layout {
@@ -153,6 +158,16 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
         if out.is_some() { ", with rumble" } else { "" }
     );
     with_output(|o| *o = Output { conn: out.map(|h| h as usize), rumble: o.rumble, sent: None });
+    let cfg = &crate::state::config().dualsense;
+    if out.is_some() && cfg.haptics.eq_ignore_ascii_case("auto") {
+        // (finding and starting the audio output can take a moment: not on the reading thread)
+        let device = cfg.haptics_device.clone();
+        let _ = std::thread::Builder::new().name("xcl dualsense haptics start".into()).spawn(move || {
+            if haptics::start(&device) {
+                with_output(|o| o.play_haptics());
+            }
+        });
+    }
     let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
     let mut buf = [0u8; 128];
     let mut odd = false;
@@ -168,6 +183,7 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
         }
     }
     READ_HANDLE.store(0, Ordering::Release);
+    haptics::stop();
     if let Some(c) = with_output(|o| o.conn.take()) {
         unsafe { CloseHandle(c as HANDLE) };
     }
@@ -185,20 +201,74 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
 struct Output {
     /// the write handle of a connected DualSense
     conn: Option<usize>,
-    /// the title's levels: low and high motor
-    rumble: [f32; 2],
+    /// the title's levels: low and high motor, left and right trigger
+    rumble: [f32; 4],
     sent: Option<[u8; 48]>,
+}
+
+/// A trigger's effect for the title's trigger rumble `level` (0..1).
+fn trigger_effect(level: f32, cfg: &DualSenseConfig) -> TriggerEffect {
+    let step = |v: f32| (v.clamp(0.0, 1.0) * 8.0).round() as u8;
+    let strength = cfg.trigger_strength.clamp(0.0, 1.0);
+    let base = step(cfg.trigger_resistance * strength);
+    let resting = if base > 0 { TriggerEffect::Feedback { start: 0, strength: base } } else { TriggerEffect::Off };
+    match cfg.triggers.to_ascii_lowercase().as_str() {
+        "off" => TriggerEffect::Off,
+        "resistance" => match step(level * strength).max(base) {
+            0 => TriggerEffect::Off,
+            s => TriggerEffect::Feedback { start: 0, strength: s },
+        },
+        // "vibration" (default): a buzz, stronger and a little faster with the level
+        _ => match step(level * strength) {
+            0 => resting,
+            a => TriggerEffect::Vibration { start: 0, amplitude: a, frequency: 30 + (level.clamp(0.0, 1.0) * 30.0) as u8 },
+        },
+    }
+}
+
+/// The motor levels after the settings (0..1, low and high).
+fn motor_levels(rumble: [f32; 4], cfg: &DualSenseConfig) -> (f32, f32) {
+    if cfg.haptics.eq_ignore_ascii_case("off") {
+        return (0.0, 0.0);
+    }
+    let k = cfg.rumble_strength.clamp(0.0, 1.0);
+    (rumble[0].clamp(0.0, 1.0) * k, rumble[1].clamp(0.0, 1.0) * k)
+}
+
+/// The output report for the title's levels: the motors as compatible vibration, or left to
+/// the audio haptics while those play.
+fn levels_report(rumble: [f32; 4], cfg: &DualSenseConfig, haptics: bool) -> [u8; 48] {
+    let b = |v: f32| (v * 255.0) as u8;
+    let (lo, hi) = motor_levels(rumble, cfg);
+    report::Output {
+        rumble: (!haptics).then(|| (b(lo), b(hi))),
+        left_trigger: trigger_effect(rumble[2], cfg),
+        right_trigger: trigger_effect(rumble[3], cfg),
+        ..Default::default()
+    }
+    .usb()
 }
 
 impl Output {
     /// The output report to send now: None while it is the one last sent.
     fn next_report(&mut self) -> Option<[u8; 48]> {
-        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
-        let r = report::Output { rumble: Some((b(self.rumble[0]), b(self.rumble[1]))), ..Default::default() }.usb();
+        self.next_report_with(&crate::state::config().dualsense, haptics::running())
+    }
+
+    fn next_report_with(&mut self, cfg: &DualSenseConfig, haptics: bool) -> Option<[u8; 48]> {
+        let r = levels_report(self.rumble, cfg, haptics);
         (self.sent != Some(r)).then(|| {
             self.sent = Some(r);
             r
         })
+    }
+
+    /// Hands the motor levels to the audio haptics while those play.
+    fn play_haptics(&self) {
+        if haptics::running() {
+            let (lo, hi) = motor_levels(self.rumble, &crate::state::config().dualsense);
+            haptics::set(lo, hi);
+        }
     }
 }
 
@@ -235,8 +305,9 @@ fn writer() {
     }
 }
 
-/// The title's rumble (0..1, low and high motor); false when no DualSense takes it.
-pub fn rumble(low: f32, high: f32) -> bool {
+/// The title's rumble (0..1: low and high motor, left and right trigger); false when no
+/// DualSense takes it.
+pub fn rumble(low: f32, high: f32, left_trigger: f32, right_trigger: f32) -> bool {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if !STARTED.swap(true, Ordering::Relaxed) {
         if let Err(e) = std::thread::Builder::new().name("xcl playstation output".into()).spawn(writer) {
@@ -244,17 +315,19 @@ pub fn rumble(low: f32, high: f32) -> bool {
         }
     }
     with_output(|o| {
-        o.rumble = [low, high];
+        o.rumble = [low, high, left_trigger, right_trigger];
+        o.play_haptics();
         o.conn.is_some()
     })
 }
 
-/// At process exit: a pending read is cancelled and the motors stopped (a DualSense keeps
-/// rumbling at the last level it was sent until it is switched off).
+/// At process exit: a pending read is cancelled, the motors stopped and the triggers let go (a
+/// DualSense keeps the last rumble and trigger effect it was sent until it is switched off).
 pub fn shutdown() {
     if SHUTDOWN.swap(true, Ordering::AcqRel) {
         return;
     }
+    haptics::stop();
     unsafe { SetEvent(stop_event()) };
     let h = READ_HANDLE.load(Ordering::Acquire);
     if h != 0 {
@@ -264,10 +337,7 @@ pub fn shutdown() {
     if let Ok(mut g) = OUTPUT.try_lock() {
         if let Some(o) = g.as_mut() {
             if let (Some(c), Some(_)) = (o.conn, o.sent) {
-                o.rumble = [0.0; 2];
-                if let Some(r) = o.next_report() {
-                    write(c, &r);
-                }
+                write(c, &report::Output::default().usb());
             }
         }
     }
@@ -320,14 +390,54 @@ mod tests {
     /// report is sent only when it changes.
     #[test]
     fn dualsense_rumble_is_sent_when_it_changes() {
-        let mut o = Output { rumble: [1.0, 0.5], ..Output::default() };
-        let r = o.next_report().unwrap();
+        // (the settings and the haptics state passed in: another test can connect a real
+        // DualSense and start its haptics in this process)
+        let cfg = DualSenseConfig::default();
+        let mut o = Output { rumble: [1.0, 0.5, 0.0, 0.0], ..Output::default() };
+        let r = o.next_report_with(&cfg, false).unwrap();
         assert_eq!((r[0], r[1] & 0x03, r[3], r[4]), (0x02, 0x03, 127, 255));
-        assert_eq!(o.next_report(), None);
-        o.rumble = [0.0, 0.0];
-        let r = o.next_report().unwrap();
+        assert_eq!(o.next_report_with(&cfg, false), None);
+        o.rumble = [0.0; 4];
+        let r = o.next_report_with(&cfg, false).unwrap();
         assert_eq!((r[3], r[4]), (0, 0));
-        assert_eq!(o.next_report(), None);
+        assert_eq!(o.next_report_with(&cfg, false), None);
+    }
+
+    /// The title's trigger rumble as adaptive trigger effects under the settings.
+    #[test]
+    fn trigger_rumble_becomes_trigger_effects() {
+        let mut cfg = DualSenseConfig::default();
+        assert_eq!(trigger_effect(0.0, &cfg), TriggerEffect::Off);
+        assert_eq!(trigger_effect(1.0, &cfg), TriggerEffect::Vibration { start: 0, amplitude: 8, frequency: 60 });
+        assert_eq!(trigger_effect(0.5, &cfg), TriggerEffect::Vibration { start: 0, amplitude: 4, frequency: 45 });
+        cfg.trigger_strength = 0.5;
+        assert_eq!(trigger_effect(1.0, &cfg), TriggerEffect::Vibration { start: 0, amplitude: 4, frequency: 60 });
+        // a resting resistance between rumbles
+        cfg.trigger_resistance = 0.5;
+        assert_eq!(trigger_effect(0.0, &cfg), TriggerEffect::Feedback { start: 0, strength: 2 });
+        cfg.triggers = "resistance".into();
+        cfg.trigger_strength = 1.0;
+        assert_eq!(trigger_effect(0.0, &cfg), TriggerEffect::Feedback { start: 0, strength: 4 });
+        assert_eq!(trigger_effect(1.0, &cfg), TriggerEffect::Feedback { start: 0, strength: 8 });
+        cfg.triggers = "off".into();
+        assert_eq!(trigger_effect(1.0, &cfg), TriggerEffect::Off);
+    }
+
+    /// Motors as compatible vibration, or left to the haptics while those play; strength and
+    /// "off" apply to both.
+    #[test]
+    fn rumble_levels_go_to_the_motors_or_the_haptics() {
+        let mut cfg = DualSenseConfig::default();
+        let r = levels_report([1.0, 0.5, 0.0, 1.0], &cfg, false);
+        assert_eq!((r[1] & 0x0F, r[3], r[4]), (0x0F, 127, 255));
+        assert_eq!(r[11..22], TriggerEffect::Vibration { start: 0, amplitude: 8, frequency: 60 }.block(), "right trigger");
+        assert_eq!(r[22], 0x05, "left trigger off");
+        let r = levels_report([1.0, 0.5, 0.0, 0.0], &cfg, true);
+        assert_eq!((r[1] & 0x0F, r[3], r[4]), (0x0C, 0, 0), "the actuators are the audio haptics'");
+        cfg.rumble_strength = 0.5;
+        assert_eq!(motor_levels([1.0, 0.5, 0.0, 0.0], &cfg), (0.5, 0.25));
+        cfg.haptics = "off".into();
+        assert_eq!(motor_levels([1.0, 1.0, 0.0, 0.0], &cfg), (0.0, 0.0));
     }
 
     /// A DualShock 4 report and a DualSense USB report with the same input give the same

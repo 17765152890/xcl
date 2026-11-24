@@ -588,11 +588,11 @@ unsafe extern "system" fn motor_powered_on(_this: *mut Object, _motor: u32) -> b
     false
 }
 /// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors, or a
-/// DualSense's
+/// DualSense's motors (or haptics) and adaptive triggers
 unsafe extern "system" fn set_rumble_state(_this: *mut Object, p: *const [f32; 4]) {
-    let (lo, hi) = if p.is_null() { (0.0, 0.0) } else { ((*p)[0], (*p)[1]) };
+    let [lo, hi, lt, rt] = if p.is_null() { [0.0; 4] } else { *p };
     // the gamepad is a DualSense when no XInput controller answers (`playstation`)
-    if !PAD_CONNECTED.load(Ordering::Relaxed) && super::playstation::rumble(lo, hi) {
+    if !PAD_CONNECTED.load(Ordering::Relaxed) && super::playstation::rumble(lo, hi, lt, rt) {
         return;
     }
     let Some((_, set)) = xinput() else { return };
