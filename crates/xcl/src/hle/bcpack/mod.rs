@@ -259,13 +259,13 @@ impl Tables {
     }
 }
 
-/// Unpacks `src` (BC number `bc`, 1, 3, 4 and 5; BC6H and BC7 are not decoded yet) into `dst`, whose length gives
+/// Unpacks `src` (BC number `bc`, 1, 3, 4, 5 and 7; BC6H is not decoded yet) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
-        3 | 5 => 16,
+        3 | 5 | 7 => 16,
         _ => return Err(Error("unsupported BC format")),
     };
     if dst.is_empty() || !dst.len().is_multiple_of(block) {
@@ -277,7 +277,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
         4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
         5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
-        _ => unreachable!("rejected above"),
+        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
@@ -291,7 +291,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
         4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
         5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        _ => unreachable!("rejected above"),
+        _ => bc7(records, out, t),
     }
 }
 
@@ -665,6 +665,258 @@ fn bc5_pack(v: &Plain, out: &mut [u8]) {
     bc4_alpha(v.ep[2], v.ep[3], &v.ix[16..], &mut out[8..]);
 }
 
+/// A byte's even and odd bits as two zigzag-coded 4-bit residuals.
+fn nibbles(b: u8, odd_first: bool) -> [i16; 2] {
+    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
+    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    if odd_first { [odd, even] } else { [even, odd] }
+}
+
+/// Index residual plus reference, both left-aligned to 16 bits at their own
+/// widths, back to `bits` bits (signed).
+fn add_index(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
+    let up = |v: i16, b: u8| {
+        if b == 0 || b > 16 {
+            0
+        } else {
+            (v as u16) << (16 - b)
+        }
+    };
+    let sum = up(cur, bits).wrapping_add(up(refv, ref_bits)) as i16;
+    if bits == 0 { 0 } else { sum >> (16 - bits) }
+}
+
+/// Little-endian bit writer for one 128-bit block.
+#[derive(Default)]
+struct Bits {
+    v: u128,
+    at: u32,
+}
+
+impl Bits {
+    fn put(&mut self, value: u64, n: u32) {
+        if n > 0 && self.at < 128 {
+            self.v |= (u128::from(value) & ((1u128 << n) - 1)) << self.at;
+        }
+        self.at += n;
+    }
+}
+
+// BC7.
+
+/// Public BC7 anchor indices: second subset of two; second and third of three.
+const ANCHOR2: [u8; 64] = [
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 2, 8, 2, 2, 8, 8, 15, 2, 8,
+    2, 2, 8, 8, 2, 2, 15, 15, 6, 8, 2, 8, 15, 15, 2, 8, 2, 2, 2, 15, 15, 6, 6, 2, 6, 8, 15, 15, 2,
+    2, 15, 15, 15, 15, 15, 2, 2, 15,
+];
+const ANCHOR3A: [u8; 64] = [
+    3, 3, 15, 15, 8, 3, 15, 15, 8, 8, 6, 6, 6, 5, 3, 3, 3, 3, 8, 15, 3, 3, 6, 10, 5, 8, 8, 6, 8, 5,
+    15, 15, 8, 15, 3, 5, 6, 10, 8, 15, 15, 3, 15, 5, 15, 15, 15, 15, 3, 15, 5, 5, 5, 8, 5, 10, 5,
+    10, 8, 13, 15, 12, 3, 3,
+];
+const ANCHOR3B: [u8; 64] = [
+    15, 8, 8, 3, 15, 15, 3, 8, 15, 15, 15, 15, 15, 15, 15, 8, 15, 8, 15, 3, 15, 8, 15, 8, 3, 15, 6,
+    10, 15, 15, 10, 8, 15, 3, 15, 10, 10, 8, 9, 10, 6, 15, 8, 15, 3, 6, 6, 8, 15, 3, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 3, 15, 15, 8,
+];
+
+/// Endpoint bits of R G B A per mode (public), before p-bits and rotation.
+const BC7_BITS: [[u8; 4]; 8] = [
+    [4, 4, 4, 0],
+    [6, 6, 6, 0],
+    [5, 5, 5, 0],
+    [7, 7, 7, 0],
+    [5, 5, 5, 6],
+    [7, 7, 7, 8],
+    [7, 7, 7, 7],
+    [5, 5, 5, 5],
+];
+/// Index bits of the primary and secondary sets per mode.
+const BC7_INDEX: [[u8; 2]; 8] = [
+    [3, 0],
+    [3, 0],
+    [2, 0],
+    [2, 0],
+    [3, 2],
+    [2, 2],
+    [4, 0],
+    [2, 0],
+];
+
+fn pbits(mode: u16) -> bool {
+    matches!(mode, 0 | 1 | 3 | 6 | 7)
+}
+
+/// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
+/// with the rotated channel.
+fn bc7_precision(ctrl: u16) -> [u8; 4] {
+    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let mut p = BC7_BITS[usize::from(mode)];
+    if rot != 0 {
+        p.swap(3, rot - 1);
+    } else if pbits(mode) {
+        p[0] += 1;
+    }
+    p
+}
+
+fn bc7<'a>(
+    records: impl Iterator<Item = &'a [u8]>,
+    out: impl Iterator<Item = &'a mut [u8]>,
+    t: &Tables,
+) -> Result<(), Error> {
+    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    let zero = (Bc7Ep::default(), Bc7Ix::default());
+    for (i, (s, block)) in records.zip(out).enumerate() {
+        let (ep_ref, ix_ref) = references(s, true);
+        let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
+        if ctrl == 0 {
+            return Err(Error("unused BC7 control code"));
+        }
+        let mode = usize::from(ctrl & 7);
+        let subsets = usize::from((ctrl & 0xff) >> 6);
+        let prec = bc7_precision(ctrl);
+        let three = subsets == 3;
+        let or0 = |v: u8| if three { 0 } else { v };
+        let if3 = |v: u8| if three { v } else { 0 };
+        let stored = [
+            [s[4], s[5], s[6], s[7], s[8], s[9], or0(s[10]), or0(s[11])],
+            [
+                s[12],
+                s[13],
+                s[14],
+                s[15],
+                s[16],
+                s[17],
+                or0(s[18]),
+                or0(s[19]),
+            ],
+            [
+                s[20],
+                s[21],
+                if3(s[10]),
+                if3(s[11]),
+                if3(s[18]),
+                if3(s[19]),
+                0,
+                0,
+            ],
+        ];
+        let r = &pick(i, ep_ref, &history, &t.bc7, &zero).0;
+        let mut ep = Bc7Ep {
+            ctrl,
+            ..Default::default()
+        };
+        // Rows the reference lacks build on its first row.
+        let common = subsets.min(usize::from((r.ctrl & 0xff) >> 6));
+        let columns = if prec[3] > 0 { 8 } else { 6 };
+        for c in 0..columns {
+            let p = prec[c / 2];
+            if p == 0 {
+                continue;
+            }
+            let mask = 0xffffu16 << (16 - p);
+            for (row, st) in stored.iter().enumerate().take(subsets) {
+                let v = st[c];
+                let residual =
+                    (u16::from(v >> 1) ^ (v & 1).wrapping_neg() as i8 as u16) << (16 - p);
+                let base = r.rows[if row < common { row } else { 0 }][c] & mask;
+                ep.rows[row][c] = base.wrapping_add(residual);
+            }
+        }
+        let bits = BC7_INDEX[mode];
+        let rx = &pick(i, ix_ref, &history, &t.bc7, &zero).1;
+        let mut ix = Bc7Ix {
+            bits,
+            ..Default::default()
+        };
+        for (set, offsets) in [[22, 24, 26, 28], [12, 14, 16, 20]].into_iter().enumerate() {
+            if bits[set] == 0 {
+                continue;
+            }
+            for (k, o) in offsets.into_iter().enumerate() {
+                for (b, &byte) in s[o..o + 2].iter().enumerate() {
+                    let pair = nibbles(byte, k < 3);
+                    for (h, &v) in pair.iter().enumerate() {
+                        let p = 4 * k + 2 * b + h;
+                        ix.ix[set][p] = add_index(v, bits[set], rx.ix[set][p], rx.bits[set]);
+                    }
+                }
+            }
+        }
+        history[i % HISTORY] = (ep, ix);
+        bc7_pack(&ep, &ix, prec, block);
+    }
+    Ok(())
+}
+
+fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
+    let ctrl = ep.ctrl;
+    let mode = ctrl & 7;
+    let subsets = usize::from((ctrl & 0xff) >> 6);
+    let part = usize::from(ctrl >> 8 & 63);
+    let rot = usize::from(ctrl >> 3 & 3);
+    let mut w = Bits::default();
+    w.put(1 << mode, u32::from(mode) + 1);
+    match mode {
+        0 => w.put(part as u64, 4),
+        1 | 2 | 3 | 7 => w.put(part as u64, 6),
+        4 => {
+            w.put(rot as u64, 2);
+            w.put(u64::from(ctrl >> 5 & 1), 1);
+        }
+        5 => w.put(rot as u64, 2),
+        _ => {}
+    }
+    let ends = 2 * subsets;
+    let field = |row: usize, col: usize, p: u8| u64::from(ep.rows[row][col] >> (16 - p));
+    let mut order = [0, 1, 2, 3];
+    if rot != 0 {
+        order.swap(3, rot - 1);
+    }
+    for ch in order {
+        let p = prec[ch];
+        if p == 0 {
+            continue;
+        }
+        let drop = u32::from(ch == 0 && pbits(mode));
+        for e in 0..ends {
+            w.put(field(e / 2, 2 * ch + e % 2, p) >> drop, u32::from(p) - drop);
+        }
+    }
+    match mode {
+        1 => (0..subsets).for_each(|row| w.put(field(row, 0, prec[0]) & 1, 1)),
+        m if pbits(m) => (0..ends).for_each(|e| w.put(field(e / 2, e % 2, prec[0]) & 1, 1)),
+        _ => {}
+    }
+    let anchors: &[u8] = match subsets {
+        2 => &[0, ANCHOR2[part]],
+        3 => &[0, ANCHOR3A[part], ANCHOR3B[part]],
+        _ => &[0],
+    };
+    let mut indices = |set: usize| {
+        let bits = ix.bits[set];
+        for (p, &v) in ix.ix[set].iter().enumerate() {
+            let n = u32::from(bits) - u32::from(anchors.contains(&(p as u8)));
+            w.put(u64::from(v as u16), n);
+        }
+    };
+    match mode {
+        4 => {
+            indices(1);
+            indices(0);
+        }
+        5 => {
+            indices(0);
+            indices(1);
+        }
+        _ => indices(0),
+    }
+    out.copy_from_slice(&w.v.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -807,6 +1059,42 @@ mod tests {
         let mut next = src.iter().copied();
         lanes(&t, &BC4_LANES, 1, records.len(), |_| next.next(), &mut got).unwrap();
         assert_eq!(got, records.concat());
+    }
+
+    #[test]
+    fn bc7_mode6_block() {
+        let t = Tables::parse(&tables()).unwrap();
+        // Control code 0 -> mode 6; endpoints R 8 bits (p-bit low), G B A 7 bits.
+        let mut s = vec![0u8; 32];
+        s[4] = zigzag(0x55); // R0 = 0x55: field 0x2a, p-bit 1
+        s[5] = zigzag(-1); // R1 = 0xff (8 bits)
+        s[6] = zigzag(3);
+        s[10] = zigzag(0x7f >> 1);
+        let src = stream(
+            &t,
+            &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4],
+            2,
+            &[s],
+        );
+        let mut dst = [0u8; 16];
+        decode(7, &src, &mut dst, &t).unwrap();
+        let mut w = Bits::default();
+        w.put(1 << 6, 7);
+        for (v, n) in [
+            (0x2a, 7),
+            (0x7f, 7),
+            (3, 7),
+            (0, 7),
+            (0, 7),
+            (0, 7),
+            (0x3f, 7),
+            (0, 7),
+        ] {
+            w.put(v, n);
+        }
+        w.put(1, 1);
+        w.put(1, 1);
+        assert_eq!(dst, w.v.to_le_bytes());
     }
 
     #[test]
