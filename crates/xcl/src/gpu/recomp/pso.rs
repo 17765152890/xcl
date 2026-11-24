@@ -106,9 +106,20 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    console_to_dxil_in_with_cache_status(blob, stage, sampler_base, split_wave64, windows)
+        .map(|(shader, _)| shader)
+}
+
+/// Returns the shader and whether this call reused cached DXIL without compiling it.
+pub(crate) fn console_to_dxil_in_with_cache_status(
+    blob: &[u8],
+    stage: Stage,
+    sampler_base: u32,
+    split_wave64: bool,
+    windows: u32,
+) -> Result<(Compiled, bool), String> {
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one();
+        return compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     }
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)));
@@ -120,8 +131,16 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
+    // A memory or translation cache hit never calls the DXC path.
+    let mut cached = true;
+    let compile_one = || {
+        let (shader, hit) = compile_console_shader(blob, stage, sampler_base, windows, split_wave64)?;
+        cached = hit;
+        Ok(shader)
+    };
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    let shader = cached_shader(cache, key, blob, from_disk)?;
+    Ok((shader.as_ref().clone(), cached))
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -258,7 +277,7 @@ mod translated {
 
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
@@ -289,8 +308,8 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok(Compiled { dxil, samplers: t.static_samplers })
+    let (dxil, cached) = dxc::compile_cached(&t.hlsl, "main", profile)?;
+    Ok((Compiled { dxil, samplers: t.static_samplers }, cached))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.

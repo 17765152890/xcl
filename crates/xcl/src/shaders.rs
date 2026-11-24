@@ -859,12 +859,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
+                    match recomp::pso::console_to_dxil_in_with_cache_status(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok((c, hit)) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
                             }
-                            compiled.fetch_add(1, Ordering::Relaxed)
+                            if hit { &cached } else { &compiled }.fetch_add(1, Ordering::Relaxed)
                         }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
