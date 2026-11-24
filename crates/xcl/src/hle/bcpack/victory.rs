@@ -290,6 +290,10 @@ impl<'a> RecordStream<'a> {
         }
     }
 
+    /// Runs the schedule until `blocks` records are in `batch`.
+    // shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s on one core,
+    // measured before the batches); if texture streaming needs more, run the schedule only to
+    // split the input per lane and decode the lanes apart.
     fn fill_batch<const PER: usize>(&mut self, blocks: usize) -> Result<(), Error> {
         let full = (1u32 << self.lane_count) - 1;
         let lanes = &mut self.lanes[..self.lane_count];
@@ -1101,6 +1105,54 @@ mod streaming_tests {
         let expected = [0x80, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(decode(7, src, 4096 * 16).unwrap(), expected.repeat(4096));
         assert_eq!(decode(7, src, 65 * 16).unwrap(), expected.repeat(65));
+    }
+
+    /// FNV-1a, 64 bits.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Output that varies from block to block, across the batches of 64 records. The hashes are
+    /// of what the two-pass decoder of `main` (47efa2e) gave for the same synthetic fixtures
+    /// (`tests/data/bcpack/generate.py`), so a record dropped, repeated or left unwritten at a
+    /// boundary shows. BC1 has no block errors, so random symbols decode.
+    #[test]
+    fn batch_boundaries_match_the_previous_decoder() {
+        let bc1_700 = include_bytes!("../../../../../tests/data/bcpack/bc1-700-2.bin");
+        for (blocks, hash) in [
+            (63, 0x7e84_51a2_111e_a50e),
+            (64, 0x1a27_ded4_beb3_46cd),
+            (65, 0x558e_76a5_56fe_a2ea),
+            (127, 0x1414_519a_6c0b_f625),
+            (128, 0xb296_1a17_d993_e007),
+            (129, 0x782f_2402_991a_e524),
+        ] {
+            let out = decode(1, bc1_700, blocks * 8).unwrap();
+            assert_eq!(fnv(&out), hash, "bc1-700-2, {blocks} blocks");
+        }
+        // 700 blocks: one hash for each batch of 64 blocks (512 bytes), the last one of 60.
+        let want = [
+            0x1a27_ded4_beb3_46cd,
+            0xae91_a1a1_5304_38af,
+            0x6156_c01a_8c61_00a5,
+            0x70db_84c1_ca4e_0084,
+            0x4183_85c2_a165_1eff,
+            0x1b48_5c02_2cc6_9307,
+            0xa191_9c35_81e6_46f4,
+            0xcdf4_f556_c294_3a40,
+            0x9285_541f_4dea_fcf4,
+            0x4680_ef24_f794_c2bb,
+            0x2b3c_9844_1c46_1bb3,
+        ];
+        let out = decode(1, bc1_700, 700 * 8).unwrap();
+        let got: Vec<u64> = out.chunks(64 * 8).map(fnv).collect();
+        assert_eq!(got, want, "bc1-700-2, 700 blocks");
+        // 8192 blocks, mostly equal with a few different ones.
+        let bc1_8192 = include_bytes!("../../../../../tests/data/bcpack/bc1-8192-3.bin");
+        let out = decode(1, bc1_8192, 8192 * 8).unwrap();
+        assert_eq!(fnv(&out), 0xa0d8_a27e_a25c_b660, "bc1-8192-3");
     }
 
     #[test]
