@@ -3349,6 +3349,7 @@ fn compile(src: &str, target: &str) -> Vec<u8> {
 
 /// Stand-in shaders used when the PC driver rejects a console shader.
 fn dummy() -> &'static Dummy {
+    static D: OnceLock<Dummy> = OnceLock::new();
     D.get_or_init(|| {
         // On a native host DXIL from DXC first: a host that turns DXIL into its own shaders
         // (Apple's D3DMetal) has nothing for a DXBC stand-in; the old compiler is the fallback.

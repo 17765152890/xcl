@@ -1666,7 +1666,6 @@ impl TitleMemory {
             n -= chunk;
         }
         all
->>>>>>> 58f6a81 (D3D12.X: command queue #31 (newer layout) – the GPU's page mappings of a page pool are kept; a GPU view's page is read where they show it, else by the pairing)
     }
 }
 
