@@ -98,7 +98,7 @@ pub const GAMEINPUT: &str = "gameinput.dll";
 
 fn build(config: &Config) -> Registry {
     let mut modules = vec![
-        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
+        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll", "psapi.dll"]),
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
@@ -147,6 +147,7 @@ fn build(config: &Config) -> Registry {
         "kernel32legacy.dll",
         "advapi32legacy.dll",
         "minappmodelx.dll",
+        "psapi.dll",
         "api-ms-win-core-*",
         "ext-ms-win-core-*",
     ] {
