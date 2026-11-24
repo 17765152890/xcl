@@ -2,10 +2,12 @@
 merged"), checked from its description and its files – run by .github/workflows/pr-check.yml
 (`pull_request_target`: this file as it is on main, never the PR's copy) and locally:
 
-    python scripts/pr_check.py --body body.md --head <sha> --files files.tsv [--local]
+    python scripts/pr_check.py --body body.md --head <sha> --files files.tsv [--labels a,b] [--local]
 
 files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha. --local
-asks git instead of the GitHub API (whether a commit is on main, a blob's size).
+asks git instead of the GitHub API (whether a commit is on main, a blob's size). --labels: the
+PR's labels; `test-only` (set by a maintainer for a change to `#[cfg(test)]` code in a runtime
+file) takes the place of the regression runs.
 """
 import argparse, os, re, subprocess, sys
 
@@ -22,6 +24,8 @@ TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
+# a maintainer's word that a PR in runtime files changes only test code: no regression runs needed
+TEST_ONLY = "test-only"
 
 
 def smoke_blocks(body):
@@ -46,10 +50,10 @@ def runtime(path):
     return path.startswith("crates/xcl/src/") and "/tests" not in path and not path.endswith("tests.rs")
 
 
-def check(body, head, files, is_main_ancestor):
+def check(body, head, files, is_main_ancestor, labels=()):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
-    commit is on main."""
+    commit is on main; `labels`: the PR's labels."""
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
@@ -73,7 +77,7 @@ def check(body, head, files, is_main_ancestor):
         elif binary and not in_test_data:
             problems.append(f"`{path}` is a binary file outside tests/data/ or over 1 MB")
 
-    if any(runtime(p) for p, *_ in files):
+    if any(runtime(p) for p, *_ in files) and TEST_ONLY not in labels:
         blocks = smoke_blocks(body)
         mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]
@@ -112,6 +116,7 @@ def main():
     a.add_argument("--head", required=True)
     a.add_argument("--files", required=True)
     a.add_argument("--repo", default=os.environ.get("REPO", ""))
+    a.add_argument("--labels", default="", help="the PR's labels, comma-separated")
     a.add_argument("--local", action="store_true")
     o = a.parse_args()
     body = open(o.body, encoding="utf-8").read()
@@ -135,7 +140,8 @@ def main():
         r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
         return r.returncode == 0 and r.stdout.strip() in ("ahead", "identical")
 
-    problems = check(body, o.head, files, is_main_ancestor)
+    labels = {l.strip() for l in o.labels.split(",") if l.strip()}
+    problems = check(body, o.head, files, is_main_ancestor, labels)
     if problems:
         print("This PR cannot be merged yet (see CONTRIBUTING.md, 'What a PR needs to be merged'):")
         for p in problems:

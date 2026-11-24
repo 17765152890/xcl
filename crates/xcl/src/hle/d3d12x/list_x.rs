@@ -1567,6 +1567,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
+        super::vram::after_execute(q);
+    }
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);

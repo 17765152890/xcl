@@ -1043,11 +1043,38 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+            read_or_zero(p, &mut out[p - at..end - at]);
         }
         p = end;
     }
     out
+}
+
+/// `out.len()` bytes at `at` into `out`, through the kernel: the title's streaming threads
+/// decommit pages while this thread reads them (between `VirtualQuery` and the copy too), and
+/// a plain copy then faulted in the middle of a texture and ended the title. A page that is
+/// gone stays zero, as a page that was never there.
+unsafe fn read_or_zero(at: usize, out: &mut [u8]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PAGE: usize = 0x1000;
+    let me = GetCurrentProcess();
+    let mut done = 0usize;
+    if ReadProcessMemory(me, at as *const c_void, out.as_mut_ptr() as *mut c_void, out.len(), &mut done) != 0 && done == out.len() {
+        return;
+    }
+    // some page went: the others one by one
+    out.fill(0);
+    let mut p = at;
+    while p < at + out.len() {
+        let end = ((p & !(PAGE - 1)) + PAGE).min(at + out.len());
+        let part = &mut out[p - at..end - at];
+        let mut done = 0usize;
+        if ReadProcessMemory(me, p as *const c_void, part.as_mut_ptr() as *mut c_void, part.len(), &mut done) == 0 || done != part.len() {
+            part.fill(0);
+        }
+        p = end;
+    }
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
@@ -1410,6 +1437,46 @@ mod tests {
         assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
+    }
+
+    /// A texture's memory read while another thread decommits and recommits a page of it (a
+    /// title's streaming): the read returns what was there or zeros for the page, never faults.
+    #[test]
+    fn a_texture_read_survives_a_page_decommitted_meanwhile() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGES: usize = 64;
+        const LEN: usize = PAGES * 0x1000;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            std::slice::from_raw_parts_mut(base as *mut u8, LEN).fill(0xA5);
+            let gone = base + 40 * 0x1000;
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let freeing = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        VirtualFree(gone as *mut c_void, 0x1000, MEM_DECOMMIT);
+                        VirtualAlloc(gone as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+                    }
+                })
+            };
+            for round in 0..4000 {
+                let got = read_committed(base, LEN);
+                for (i, page) in got.chunks(0x1000).enumerate() {
+                    if i == 40 {
+                        // recommitted pages are zero; a torn read is not possible within a page
+                        assert!(page.iter().all(|&b| b == 0) || page.iter().all(|&b| b == 0xA5), "round {round}: the page that comes and goes");
+                    } else {
+                        assert!(page.iter().all(|&b| b == 0xA5), "round {round}: page {i} kept its bytes");
+                    }
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            freeing.join().unwrap();
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.

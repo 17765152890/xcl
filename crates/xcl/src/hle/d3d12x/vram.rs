@@ -187,6 +187,20 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
 }
 
+/// A queue GPU work was submitted to: `fence` reaches `value` when all of it so far has run.
+struct Submitted {
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+/// A superseded texture still mapped for the draws submitted before it was superseded.
+struct Unmapping {
+    /// keeps the texture until its tiles are unmapped
+    res: ID3D12Resource,
+    /// queue → the value its `Submitted` fence has to reach first
+    after: Vec<(usize, u64)>,
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
@@ -206,6 +220,10 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// queue → the fence that follows its submissions
+    submitted: std::collections::HashMap<usize, Submitted>,
+    /// superseded textures waiting for the GPU to finish with them (`unmap_superseded`)
+    unmapping: Vec<Unmapping>,
 }
 
 // D3D12 objects are free-threaded
@@ -237,7 +255,50 @@ impl Pages {
             extra_pages: std::collections::HashMap::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            submitted: std::collections::HashMap::new(),
+            unmapping: Vec::new(),
         })
+    }
+
+    /// What each queue has to reach before the work submitted so far no longer reads a texture
+    /// (queues that are through with theirs are left out).
+    unsafe fn in_flight(&self) -> Vec<(usize, u64)> {
+        self.submitted.iter().filter(|(_, s)| s.fence.GetCompletedValue() < s.value).map(|(&q, s)| (q, s.value)).collect()
+    }
+
+    /// Unmap the superseded textures the GPU is through with; they are returned for the caller
+    /// to release once `PAGES` is unlocked (a last reference comes back into `forget`).
+    unsafe fn unmap_finished(&mut self) -> Vec<ID3D12Resource> {
+        if self.unmapping.is_empty() {
+            return Vec::new();
+        }
+        let submitted = &self.submitted;
+        // a queue that is gone has nothing in flight; a removed device completes its fences
+        let (ready, waiting): (Vec<Unmapping>, Vec<Unmapping>) = std::mem::take(&mut self.unmapping)
+            .into_iter()
+            .partition(|u| u.after.iter().all(|(q, v)| submitted.get(q).is_none_or(|s| s.fence.GetCompletedValue() >= *v)));
+        self.unmapping = waiting;
+        let now = std::time::Instant::now();
+        let mut done = Vec::with_capacity(ready.len());
+        for u in ready {
+            self.unmap_now(&u.res, now);
+            done.push(u.res);
+        }
+        done
+    }
+
+    /// Unmap `res` and give its unshared tiles back to the pool.
+    unsafe fn unmap_now(&mut self, res: &ID3D12Resource, now: std::time::Instant) {
+        let Some(t) = self.targets.get_mut(&(res.as_raw() as usize)) else { return };
+        if !t.mapped {
+            return;
+        }
+        let total = t.total;
+        let used = std::mem::take(&mut t.used);
+        let used_extra = std::mem::take(&mut t.used_extra);
+        t.mapped = false;
+        self.unmap(res, total);
+        self.release_tiles(used, used_extra, now, true);
     }
 
     fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
@@ -501,24 +562,30 @@ unsafe fn place_on_pages(
 }
 
 /// Unmap a placed texture superseded by a placement with a different address range, returning its
-/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
+/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool. Draws submitted
+/// before may still sample it (the mapping queue is not ordered after the title's), so the unmap
+/// waits until every queue is through with what it had been given (`after_execute`); with nothing
+/// in flight it happens at once.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let now = std::time::Instant::now();
+    let mut done = Vec::new();
     for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.get_mut(&key) else { continue };
-        if !t.mapped {
-            return;
+        let Some(t) = pages.targets.get(&key) else { continue };
+        if !t.mapped || pages.unmapping.iter().any(|u| u.res.as_raw() as usize == key) {
+            break;
         }
-        let total = t.total;
-        let used = std::mem::take(&mut t.used);
-        let used_extra = std::mem::take(&mut t.used_extra);
-        t.mapped = false;
-        pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
-        return;
+        done = pages.unmap_finished();
+        let after = pages.in_flight();
+        if after.is_empty() {
+            pages.unmap_now(res, std::time::Instant::now());
+        } else {
+            pages.unmapping.push(Unmapping { res: res.clone(), after });
+        }
+        break;
     }
+    drop(g);
+    drop(done);
 }
 
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
@@ -535,6 +602,11 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         return false;
     };
     if mapped {
+        // an unmap still waiting for the GPU is called off: the tiles were never given back
+        let at = pages.unmapping.iter().position(|u| u.res.as_raw() as usize == key);
+        let kept = at.map(|i| pages.unmapping.swap_remove(i));
+        drop(g);
+        drop(kept);
         return true;
     }
     let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
@@ -570,10 +642,46 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(dev) = dev else { return };
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
+    let done = pages.unmap_finished();
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
         pages.waited.insert(key, pages.value);
+    }
+    drop(g);
+    drop(done);
+}
+
+/// After GPU work was submitted to `queue`: a fence of its own follows it, so that a texture
+/// superseded later is unmapped only when this work no longer samples it (`unmap_superseded`).
+pub(super) unsafe fn after_execute(queue: &ID3D12CommandQueue) {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
+    let key = queue.as_raw() as usize;
+    if !pages.submitted.contains_key(&key) {
+        let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+        pages.submitted.insert(key, Submitted { fence, value: 0 });
+    }
+    if let Some(s) = pages.submitted.get_mut(&key) {
+        if queue.Signal(&s.fence, s.value + 1).is_ok() {
+            s.value += 1;
+        }
+    }
+    let done = pages.unmap_finished();
+    drop(g);
+    drop(done);
+}
+
+/// A queue released for good: nothing of its is in flight, and its address may be another's next.
+pub(super) fn forget_queue(queue: usize) {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        pages.submitted.remove(&queue);
     }
 }
 
@@ -873,6 +981,94 @@ mod tests {
             let small_size = dev.GetResourceAllocationInfo(0, &[small]).SizeInBytes as usize;
             assert_eq!(arena_bytes().0 - arenas0, small_size.next_multiple_of(PAGE));
             drop(last);
+        }
+    }
+
+    /// On the GPU: a superseded texture stays mapped while a queue still has work submitted
+    /// before it was superseded, is unmapped once that work has run, and stays mapped when the
+    /// placement over it goes first. Needs a hardware adapter with tiled resources tier 2.
+    #[test]
+    fn a_superseded_texture_is_unmapped_after_the_work_submitted_before() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return skip_test("no GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let dev_key = dev.as_raw() as usize;
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 256, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| -> Option<ID3D12Resource> {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(4 * PAGE as u64), riid, &mut p)?;
+                (hr >= 0 && !p.is_null()).then(|| ID3D12Resource::from_raw(p))
+            };
+            let mapped = |r: &ID3D12Resource| PAGES.lock().unwrap().get(&dev_key).and_then(|p| p.as_ref()).and_then(|p| p.targets.get(&(r.as_raw() as usize))).map(|t| t.mapped);
+            let waiting = || PAGES.lock().unwrap().get(&dev_key).and_then(|p| p.as_ref()).map_or(0, |p| p.unmapping.len());
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let ran: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            // the queue's work so far has run (no event: returns when the fence has the value)
+            let drain = |n: u64| {
+                queue.Signal(&ran, n).unwrap();
+                ran.SetEventOnCompletion(n, HANDLE::default()).unwrap();
+            };
+
+            let pages0 = page_bytes_for(dev_key).0;
+            let Some(a) = place_at(0x58_0000_0000) else { return skip_test("no GPU") };
+            let with_a = page_bytes_for(dev_key).0;
+            assert!(with_a > pages0, "the texture is on pages");
+
+            // 1. work the queue has not got to (it waits for `gate`), then the texture superseded
+            queue.Wait(&gate, 1).unwrap();
+            after_execute(&queue);
+            unmap_superseded(&a);
+            before_execute(&queue);
+            assert_eq!((mapped(&a), waiting(), page_bytes_for(dev_key).0), (Some(true), 1, with_a), "mapped for the work submitted before");
+            // asked again: still one unmap to come
+            unmap_superseded(&a);
+            assert_eq!(waiting(), 1);
+            gate.Signal(1).unwrap();
+            drain(1);
+            before_execute(&queue);
+            assert_eq!((mapped(&a), waiting(), page_bytes_for(dev_key).0), (Some(false), 0, pages0), "unmapped once that work has run");
+            assert!(remap_if_unmapped(&a));
+            assert_eq!((mapped(&a), page_bytes_for(dev_key).0), (Some(true), with_a));
+
+            // 2. the placement over it released before the unmap happened: it never happens
+            queue.Wait(&gate, 2).unwrap();
+            after_execute(&queue);
+            unmap_superseded(&a);
+            assert_eq!((mapped(&a), waiting()), (Some(true), 1));
+            assert!(remap_if_unmapped(&a));
+            gate.Signal(2).unwrap();
+            drain(2);
+            before_execute(&queue);
+            assert_eq!((mapped(&a), waiting(), page_bytes_for(dev_key).0), (Some(true), 0, with_a), "the unmap was called off");
+
+            // 3. a queue that is gone holds nothing back
+            queue.Wait(&gate, 3).unwrap();
+            after_execute(&queue);
+            unmap_superseded(&a);
+            assert_eq!(waiting(), 1);
+            forget_queue(queue.as_raw() as usize);
+            let other: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            before_execute(&other);
+            assert_eq!((mapped(&a), waiting()), (Some(false), 0));
+            gate.Signal(3).unwrap();
+            drain(3);
+            drop(a);
         }
     }
 }
