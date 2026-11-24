@@ -86,7 +86,9 @@ creates its own extended vtable (`hle/d3d12x/real.rs`, `adopt`), and vkd3d-proto
 
 The build in `scripts/linux/` is v3.1 with a 6-line patch for the two `from_iface` functions
 ([`vkd3d-proton-xcl.patch`](../scripts/linux/vkd3d-proton-xcl.patch)) and `-Db_ndebug=true`, which compiles
-the assertions out:
+the assertions out. Its `dxil-spirv` submodule is moved to a newer commit (`DXIL_SPIRV_REF`, default
+`53aac418`): v3.1's loops without end or overflows the stack on 20 of the retail title's compute programs
+during world loading ([#611](https://github.com/ivall/xcl/issues/611)), the newer one converts all of them:
 
 ```sh
 scripts/linux/build-vkd3d-proton.sh ~/xcl-vkd3d      # -> ~/xcl-vkd3d/vkd3d-proton-xcl/{d3d12,d3d12core}.dll
