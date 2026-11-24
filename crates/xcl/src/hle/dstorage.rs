@@ -223,6 +223,76 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
     }
 }
 
+/// `XCL_DSTORAGE_BCPACK_DUMP=n`: keep the source bytes of the first `n` refused BCPack
+/// requests under `data_root()\bcpack\` — `NNN-modeM.bin` with a `.meta` line (source,
+/// destination and intermediate sizes, swizzle, zlib, options) — the input a BCPack
+/// decoder implementation needs. Both source kinds are readable at enqueue: a memory
+/// range as in `execute`, a file through the title's own `IDStorageFile`. Off by default.
+unsafe fn bcpack_dump_source(r: &Request) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    // read per call: refusals are rare, and a cached limit would pin the value from before
+    // a test (or a late env change) could set it
+    let limit = std::env::var("XCL_DSTORAGE_BCPACK_DUMP").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+    if limit == 0 {
+        return;
+    }
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k > limit {
+        return;
+    }
+    let src: Option<Vec<u8>> = if r.memory_source() {
+        let mut b = vec![0u8; r.source_size as usize];
+        let ok = !r.source_physical_pages() && crate::gpu::shader::readable(r.source as usize, r.source_size as usize);
+        if ok {
+            std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+            Some(b)
+        } else {
+            None
+        }
+    } else {
+        let f = r.source as *mut c_void;
+        let mut vt = 0usize;
+        if read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) && vt == file_vtbl().as_ptr() as usize {
+            let file = inner::<FileInner>(f);
+            if let Some(h) = file.handle() {
+                let mut b = vec![0u8; r.source_size as usize];
+                if read_exact_at(&h, r.offset, &mut b).is_ok() {
+                    Some(b)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let Some(src) = src else {
+        crate::xlog_warn!("DirectStorage: BCPack dump: request {k}: source unreadable, skipped");
+        return;
+    };
+    let dir = crate::launcher::data_root().join("bcpack");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stem = format!("{k:03}-mode{}", r.bcpack());
+    let _ = std::fs::write(dir.join(format!("{stem}.bin")), &src);
+    let meta = format!(
+        "mode {} {} swizzle {} source_size {} destination_size {} intermediate_size {} zlib {} options {:#x}\n",
+        r.bcpack(),
+        bcpack_name(r.bcpack()),
+        r.swizzle(),
+        r.source_size,
+        r.destination_size,
+        r.intermediate_size,
+        r.zlib(),
+        r.options
+    );
+    let _ = std::fs::write(dir.join(format!("{stem}.meta")), meta);
+    crate::xlog_info!("DirectStorage: BCPack dump: request {k} kept ({} bytes, mode {}) under {}", src.len(), r.bcpack(), dir.display());
+}
+
 /// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
 /// format (magenta; red for BC4/BC5) instead of staying as it was, so the title's textures
 /// that wait on BCPack show where they are. The request still fails.
@@ -1201,6 +1271,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
             log_bcpack_refusal(&r, BCPACK.note(&r));
+            bcpack_dump_source(&r);
             if q.bcpack_fill.load(Ordering::Relaxed) {
                 fill = if !r.dest_physical_pages() {
                     Some(FillTarget::Virtual)
@@ -2211,6 +2282,39 @@ mod tests {
         assert!(bc6h_mode11_texels(&b(6)).iter().all(|t| *t == [0x3C00, 0, 0x3C00]), "BC6H: 1.0, 0, 1.0");
         assert!(bc7_mode6_texels(&b(7)).iter().all(|t| *t == [255, 1, 255, 255]), "BC7");
         assert_eq!((bcpack_fill_block(0), bcpack_fill_block(8)), (None, None), "not a BCn mode");
+    }
+
+    #[test]
+    fn bcpack_dump_keeps_the_source_bytes_and_meta_of_refused_requests() {
+        unsafe {
+            let root = std::env::temp_dir().join(format!("xcl-test-bcpack-dump-{}", std::process::id()));
+            std::env::set_var("XCL_DATA_ROOT", &root);
+            std::env::set_var("XCL_DSTORAGE_BCPACK_DUMP", "1");
+            let dir = crate::launcher::data_root().join("bcpack");
+            let _ = std::fs::remove_dir_all(&dir);
+            let before = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+
+            // a memory source the readability check accepts (committed memory)
+            let src: &'static mut [u8; 64] = Box::leak(vec![0xA5u8; 64].into_boxed_slice().try_into().unwrap());
+            let r = Request::parse(&request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, 0x1000, 0x8000, src.as_ptr() as u64, 0, 64));
+            bcpack_dump_source(&r);
+
+            let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+            assert_eq!(files.len() - before, 2, "bin + meta");
+            let bin = files.iter().find(|p| p.extension().is_some_and(|e| e == "bin")).unwrap();
+            let meta = std::fs::read_to_string(files.iter().find(|p| p.extension().is_some_and(|e| e == "meta")).unwrap()).unwrap();
+            assert_eq!(std::fs::read(bin).unwrap().len(), 64);
+            assert!(meta.contains("mode 1 BC1") && meta.contains("source_size 64") && meta.contains("swizzle 0"), "meta: {meta}");
+
+            // the limit: a second request writes nothing more
+            let r2 = Request::parse(&request(SOURCE_MEMORY_BIT | 3 << BCPACK_SHIFT, 0x1000, 0x8000, src.as_ptr() as u64, 0, 64));
+            bcpack_dump_source(&r2);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count() - before, 2, "limit 2");
+
+            std::env::remove_var("XCL_DSTORAGE_BCPACK_DUMP");
+            std::env::remove_var("XCL_DATA_ROOT");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
