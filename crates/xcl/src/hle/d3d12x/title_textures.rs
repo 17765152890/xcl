@@ -457,12 +457,22 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
-    let mut t = TEXTURES.lock().unwrap();
-    if let Some(e) = t.get_mut(res) {
-        if !e.gpu_written {
-            e.gpu_written = true;
-            GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    let changed = {
+        let mut t = TEXTURES.lock().unwrap();
+        if let Some(e) = t.get_mut(res) {
+            if !e.gpu_written {
+                e.gpu_written = true;
+                GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    if changed {
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -628,12 +638,29 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
             }
         }
     }
-    // Recompute the watched ranges (textures kept in step + mapped sparse tiles clipped to
-    // write-watched regions) only when the set of textures, tiles, or reservations changed.
+    // Recompute the watched ranges (textures kept in step + committed mapped sparse tiles clipped
+    // to write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
-    wanted.extend(super::sparse::mapped_ranges());
+    let sparse_active = super::sparse::is_active();
+    let mut wanted = super::sparse::mapped_ranges();
+    {
+        let t = TEXTURES.lock().unwrap();
+        for e in t.by_res.values() {
+            let bytes = e.tex.size() as usize;
+            if e.gpu_written || bytes == 0 {
+                continue;
+            }
+            let lo = e.src & !0xFFF;
+            let hi = e.src.saturating_add(bytes).saturating_add(0xFFF) & !0xFFF;
+            // with sparse windows tracked, every committed page in one is already in
+            // `sparse::mapped_ranges()`: a streaming texture's reserved mip tail is not scanned
+            if sparse_active && lo < hi && u.is_sparse(lo) && u.is_sparse(hi - 1) {
+                continue;
+            }
+            wanted.push((lo, hi));
+        }
+    }
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
@@ -990,32 +1017,61 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
     Ok(made)
 }
 
-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
-/// thousands of them – a lot)
+/// Ranges closer than this inside the same write-watched region are scanned as one (on Wine, a
+/// `GetWriteWatch` call costs ~2 µs while scanning 1 MiB costs ~0.9 µs, so merging small gaps is
+/// faster than splitting into thousands of calls).
 const WATCH_GAP: usize = 1 << 20;
 
-/// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
-/// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
-/// covers one allocation).
+/// The parts of `wanted` (start, end) inside `regions` (base, size), clipped to each region first
+/// and then merged within each region (gaps `<= WATCH_GAP`), sorted as (base, size) – each within
+/// one region (a write-watch call covers one allocation).
 fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    wanted.retain(|&(a, b)| a < b);
+    if wanted.is_empty() || regions.is_empty() {
+        return Vec::new();
+    }
     wanted.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
+    let mut collapsed: Vec<(usize, usize)> = Vec::with_capacity(wanted.len());
     for (a, b) in wanted {
-        match merged.last_mut() {
-            Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
-            _ => merged.push((a, b)),
+        match collapsed.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => collapsed.push((a, b)),
         }
     }
-    let mut out = Vec::new();
-    for (a, b) in merged {
-        for &(base, size) in regions {
-            let (lo, hi) = (a.max(base), b.min(base + size));
+    let mut regs: Vec<(usize, usize)> = regions.iter().copied().filter(|&(_, s)| s > 0).map(|(b, s)| (b, b.saturating_add(s))).collect();
+    regs.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut wi = 0usize;
+    let mut prev_rend = 0usize;
+    let mut regs_overlap = false;
+    for (rbase, rend) in regs {
+        if rbase < prev_rend {
+            regs_overlap = true;
+        }
+        prev_rend = prev_rend.max(rend);
+        while wi < collapsed.len() && collapsed[wi].1 <= rbase {
+            wi += 1;
+        }
+        let region_start = out.len();
+        let mut j = wi;
+        while j < collapsed.len() && collapsed[j].0 < rend {
+            let lo = collapsed[j].0.max(rbase);
+            let hi = collapsed[j].1.min(rend);
             if lo < hi {
-                out.push((lo, hi - lo));
+                match out[region_start..].last_mut() {
+                    Some(last) if lo <= (last.0 + last.1).saturating_add(WATCH_GAP) => {
+                        let new_end = (last.0 + last.1).max(hi);
+                        last.1 = new_end - last.0;
+                    }
+                    _ => out.push((lo, hi - lo)),
+                }
             }
+            j += 1;
         }
     }
-    out.sort_unstable();
+    if regs_overlap {
+        out.sort_unstable();
+    }
     out
 }
 
@@ -1364,15 +1420,22 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
-    /// Only the wanted parts of the watched regions are scanned, merged, one region each.
+    /// Only the wanted parts of the watched regions are scanned, clipped per region before gap
+    /// merging so out-of-region ranges never pull a scan to a region's edge.
     #[test]
     fn watch_ranges_clip_and_merge() {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x1000)]);
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+        // empty/degenerate inputs and a wanted range straddling two adjacent regions
+        let adj = [(0x2000_0000, 0x40000), (0x2004_0000, 0x40000)];
+        let wanted = vec![(0x2003_0000, 0x2005_0000), (0x2006_0000, 0x2006_0000)];
+        assert_eq!(watch_ranges(&adj, wanted), vec![(0x2003_0000, 0x10000), (0x2004_0000, 0x10000)]);
+        assert!(watch_ranges(&[], vec![(0x10000, 0x20000)]).is_empty());
+        assert!(watch_ranges(&regions, Vec::new()).is_empty());
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
@@ -1711,6 +1774,221 @@ mod tests {
                 drop(res);
             }
             uma.free(base);
+        }
+    }
+
+    /// Micro-benchmark of `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` over a 4 GiB `MEM_WRITE_WATCH`
+    /// reservation: whole reservation vs gap-merged runs vs exact committed runs.
+    /// Runs only when `XCL_BENCH_WW=1` is set; otherwise returns immediately.
+    #[test]
+    fn bench_write_watch_committed_runs() {
+        if std::env::var("XCL_BENCH_WW").ok().as_deref() != Some("1") {
+            return;
+        }
+        use std::fmt::Write as _;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const RES_SIZE: usize = 4usize << 30;
+        const TILE: usize = 0x1_0000;
+        const PAGE: usize = 0x1000;
+        const TOTAL_TILES: usize = RES_SIZE / TILE;
+
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), RES_SIZE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert!(base != 0, "4 GiB MEM_WRITE_WATCH reserve failed");
+
+            let merge_with_gap = |runs: &[(usize, usize)], gap: usize| -> Vec<(usize, usize)> {
+                let mut out: Vec<(usize, usize)> = Vec::new();
+                for &(a, b) in runs {
+                    match out.last_mut() {
+                        Some(last) if a <= last.1.saturating_add(gap) => last.1 = last.1.max(b),
+                        _ => out.push((a, b)),
+                    }
+                }
+                out.into_iter().map(|(a, b)| (a, b - a)).collect()
+            };
+
+            let mut buf: Vec<*mut c_void> = vec![std::ptr::null_mut(); 16384];
+            let mut dirty_out: Vec<usize> = Vec::with_capacity(512);
+            let mut report = String::new();
+
+            let mut run_case = |report: &mut String, label: &str, ranges: &[(usize, usize)], dirty_pages: &[usize], iters: usize| {
+                // Warmup + clear any residual dirty bits
+                let mut page = 0x1000u32;
+                let mut n = buf.len();
+                let _ = GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, RES_SIZE, buf.as_mut_ptr(), &mut n, &mut page);
+
+                let total_bytes: usize = ranges.iter().map(|&(_, s)| s).sum();
+                let mut total_scan = std::time::Duration::ZERO;
+                let mut found_each = 0usize;
+                for _ in 0..iters {
+                    for &p in dirty_pages {
+                        std::ptr::write_volatile(p as *mut u8, 1);
+                    }
+                    let t0 = std::time::Instant::now();
+                    dirty_out.clear();
+                    for &(rb, rs) in ranges {
+                        loop {
+                            let mut cnt = buf.len();
+                            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, rb as *const c_void, rs, buf.as_mut_ptr(), &mut cnt, &mut page) != 0 {
+                                break;
+                            }
+                            dirty_out.extend(buf[..cnt].iter().map(|&p| p as usize));
+                            if cnt < buf.len() {
+                                break;
+                            }
+                        }
+                    }
+                    total_scan += t0.elapsed();
+                    found_each = dirty_out.len();
+                    assert_eq!(found_each, dirty_pages.len(), "{label}: missed dirty pages");
+                }
+                let us = total_scan.as_secs_f64() * 1e6 / iters as f64;
+                let _ = writeln!(
+                    report,
+                    "  {label:<28} ranges={:<5} span={:>7.1} MiB  dirty={:<4}  avg={:>8.1} us/call",
+                    ranges.len(),
+                    total_bytes as f64 / (1024.0 * 1024.0),
+                    found_each,
+                    us
+                );
+            };
+
+            // Layout A: ~35% committed in scattered clusters (300 runs, ~1.4 GiB across 4 GiB),
+            // leaving gaps of ~256 KiB .. 8 MiB between clusters (resembles a retail sparse window).
+            let mut committed_runs: Vec<(usize, usize)> = Vec::new();
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next_u64 = || -> u64 {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
+            let mut tile = 0usize;
+            while tile < TOTAL_TILES {
+                let run_tiles = 4 + (next_u64() as usize % 120);
+                let run_end = (tile + run_tiles).min(TOTAL_TILES);
+                let addr = base + tile * TILE;
+                let len = (run_end - tile) * TILE;
+                assert!(!VirtualAlloc(addr as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null());
+                committed_runs.push((addr, addr + len));
+                let gap_tiles = if next_u64() % 4 == 0 {
+                    64 + (next_u64() as usize % 512) // 4..36 MiB empty void
+                } else {
+                    2 + (next_u64() as usize % 24) // 128 KiB..1.6 MiB gap
+                };
+                tile = run_end + gap_tiles;
+            }
+            let committed_bytes: usize = committed_runs.iter().map(|&(a, b)| b - a).sum();
+            let mut dirty_200: Vec<usize> = Vec::with_capacity(200);
+            for i in 0..200 {
+                let (a, b) = committed_runs[i * committed_runs.len() / 200];
+                let pg = a + ((i * 7) % ((b - a) / PAGE)) * PAGE;
+                dirty_200.push(pg);
+            }
+            dirty_200.sort_unstable();
+            dirty_200.dedup();
+
+            let _ = writeln!(report, "Layout A (clustered): {} runs, {:.1} MiB committed / 4096 MiB reserved", committed_runs.len(), committed_bytes as f64 / (1024.0 * 1024.0));
+            let whole = vec![(base, RES_SIZE)];
+            let gap_2m = merge_with_gap(&committed_runs, 2 << 20);
+            let gap_1m = watch_ranges(&[(base, RES_SIZE)], committed_runs.clone());
+            let gap_256k = merge_with_gap(&committed_runs, 256 << 10);
+            let exact = merge_with_gap(&committed_runs, 0);
+            run_case(&mut report, "whole 4 GiB (0 dirty)", &whole, &[], 20);
+            run_case(&mut report, "gap=2 MiB   (0 dirty)", &gap_2m, &[], 20);
+            run_case(&mut report, "watch_ranges(0 dirty)", &gap_1m, &[], 20);
+            run_case(&mut report, "gap=256 KiB (0 dirty)", &gap_256k, &[], 20);
+            run_case(&mut report, "exact runs  (0 dirty)", &exact, &[], 20);
+            run_case(&mut report, "whole 4 GiB (200 dirty)", &whole, &dirty_200, 20);
+            run_case(&mut report, "gap=2 MiB   (200 dirty)", &gap_2m, &dirty_200, 20);
+            run_case(&mut report, "watch_ranges(200 dirty)", &gap_1m, &dirty_200, 20);
+            run_case(&mut report, "gap=256 KiB (200 dirty)", &gap_256k, &dirty_200, 20);
+            run_case(&mut report, "exact runs  (200 dirty)", &exact, &dirty_200, 20);
+
+            // Reset reservation for Layout B: scattered single 64 KiB tiles (stride 16 tiles = 1 MiB,
+            // so 4096 committed tiles = 256 MiB committed across 4 GiB; gap = 960 KiB < 1 MiB!).
+            assert_ne!(VirtualFree(base as *mut c_void, RES_SIZE, MEM_DECOMMIT), 0);
+            committed_runs.clear();
+            for i in (0..TOTAL_TILES).step_by(16) {
+                let addr = base + i * TILE;
+                assert!(!VirtualAlloc(addr as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                committed_runs.push((addr, addr + TILE));
+            }
+            dirty_200.clear();
+            for i in 0..200 {
+                let (a, _) = committed_runs[i * committed_runs.len() / 200];
+                dirty_200.push(a);
+            }
+            let committed_bytes_b: usize = committed_runs.iter().map(|&(a, b)| b - a).sum();
+            let _ = writeln!(report, "Layout B (scattered 64K every 1 MiB): {} runs, {:.1} MiB committed / 4096 MiB reserved", committed_runs.len(), committed_bytes_b as f64 / (1024.0 * 1024.0));
+            let gap_1m_b = watch_ranges(&[(base, RES_SIZE)], committed_runs.clone());
+            let gap_256k_b = merge_with_gap(&committed_runs, 256 << 10);
+            let exact_b = merge_with_gap(&committed_runs, 0);
+            run_case(&mut report, "whole 4 GiB (0 dirty)", &whole, &[], 20);
+            run_case(&mut report, "watch_ranges(0 dirty)", &gap_1m_b, &[], 20);
+            run_case(&mut report, "gap=256 KiB (0 dirty)", &gap_256k_b, &[], 20);
+            run_case(&mut report, "exact runs  (0 dirty)", &exact_b, &[], 20);
+            run_case(&mut report, "whole 4 GiB (200 dirty)", &whole, &dirty_200, 20);
+            run_case(&mut report, "watch_ranges(200 dirty)", &gap_1m_b, &dirty_200, 20);
+            run_case(&mut report, "gap=256 KiB (200 dirty)", &gap_256k_b, &dirty_200, 20);
+            run_case(&mut report, "exact runs  (200 dirty)", &exact_b, &dirty_200, 20);
+
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+
+            // Range-cache rebuild micro-benchmark (69,000 mapped tiles across 12 GiB):
+            // old collect+sort over 69k keys vs iterating incremental BTreeMap runs + watch_ranges.
+            let mut tiles_map: std::collections::HashMap<usize, [u64; 18]> = std::collections::HashMap::with_capacity(69_000);
+            let mut btree_runs: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut addr = 0x4_0000_0000usize;
+            let mut count = 0usize;
+            while count < 69_000 {
+                let run_len = (4 + (next_u64() as usize % 200)).min(69_000 - count);
+                let run_start = addr;
+                for i in 0..run_len {
+                    tiles_map.insert(addr + i * TILE, [0u64; 18]);
+                }
+                let run_end = run_start + run_len * TILE;
+                btree_runs.insert(run_start, run_end);
+                count += run_len;
+                let gap = (2 + (next_u64() as usize % 64)) * TILE;
+                addr = run_end + gap;
+            }
+            let regs_12g = [(0x4_0000_0000usize, 12usize << 30)];
+            let iters_rebuild = 50usize;
+            let t0 = std::time::Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..iters_rebuild {
+                let mut keys: Vec<usize> = tiles_map.keys().copied().collect();
+                keys.sort_unstable();
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for t in keys {
+                    match runs.last_mut() {
+                        Some(last) if last.1 == t => last.1 = t + TILE,
+                        _ => runs.push((t, t + TILE)),
+                    }
+                }
+                sink += watch_ranges(&regs_12g, runs).len();
+            }
+            let old_rebuild_us = t0.elapsed().as_secs_f64() * 1e6 / iters_rebuild as f64;
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters_rebuild {
+                let runs: Vec<(usize, usize)> = btree_runs.iter().map(|(&a, &b)| (a, b)).collect();
+                sink += watch_ranges(&regs_12g, runs).len();
+            }
+            let new_rebuild_us = t1.elapsed().as_secs_f64() * 1e6 / iters_rebuild as f64;
+            let _ = writeln!(
+                report,
+                "Cache rebuild (69k tiles, {} runs, sink={sink}): old collect+sort={old_rebuild_us:.1} us, incremental btree={new_rebuild_us:.1} us ({:.1}x faster)",
+                btree_runs.len(),
+                old_rebuild_us / new_rebuild_us.max(0.1)
+            );
+
+            eprint!("{report}");
+            if let Ok(path) = std::env::var("XCL_BENCH_WW_LOG") {
+                let _ = std::fs::write(path, &report);
+            }
         }
     }
 }

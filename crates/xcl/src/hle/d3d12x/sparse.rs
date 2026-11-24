@@ -240,8 +240,9 @@ struct State {
     rb_last_fence: u64,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
-    /// `mapped` as sorted (start, end) runs (None: to be made again)
-    runs: Option<Vec<(usize, usize)>>,
+    /// `mapped` tiles with at least one committed page (`holes != 0xFFFF`), kept incrementally
+    /// as disjoint, merged `[start, end)` runs in O(log R) per map/unmap.
+    mapped_runs: BTreeMap<usize, usize>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
 }
@@ -450,12 +451,83 @@ fn early_remove(early: &mut BTreeMap<usize, usize>, a: usize, b: usize) {
         }
     }
 }
-/// generation counter incremented whenever the set of mapped tiles changes (for watch_ranges cache)
+/// generation counter incremented whenever `mapped_runs` changes (for watch_ranges cache)
 static MAPPED_GEN: AtomicU64 = AtomicU64::new(0);
+/// set once `init` has installed `STATE` and replayed `EARLY` commits
+static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Generation counter of `mapped_ranges()` (changes only when tiles are mapped or unmapped).
+/// Generation counter of `mapped_ranges()` (changes only when committed mapped tile runs change).
 pub fn mapped_gen() -> u64 {
     MAPPED_GEN.load(Ordering::Acquire)
+}
+
+/// Whether sparse VRAM windows are initialized and tracking all sparse-window commits.
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
+
+/// Clear hole bits for pages overlapping `[a, a + n)` in `mapped` and add any tile whose holes
+/// transition from `0xFFFF` (all uncommitted) to `< 0xFFFF` into `mapped_runs`.
+/// Returns whether `mapped_runs` changed.
+fn commit_tile_holes(
+    mapped: &mut FxHashMap<usize, TileEntry>,
+    mapped_runs: &mut BTreeMap<usize, usize>,
+    a: usize,
+    n: usize,
+) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let mut run: Option<(usize, usize)> = None;
+    let mut changed = false;
+    let mut pg = a & !(PAGE - 1);
+    let end = a.saturating_add(n);
+    while pg < end {
+        let t = pg & !(TILE - 1);
+        let tile_end = t.saturating_add(TILE).min(end);
+        if let Some(entry) = mapped.get_mut(&t) {
+            let was_all_holes = entry.holes == 0xFFFF;
+            let mut p = pg;
+            while p < tile_end {
+                entry.holes &= !(1u16 << ((p - t) / PAGE));
+                p += PAGE;
+            }
+            if was_all_holes && entry.holes != 0xFFFF {
+                changed = true;
+                match run {
+                    Some((rs, re)) if re == t => run = Some((rs, t + TILE)),
+                    Some((rs, re)) => {
+                        early_add(mapped_runs, rs, re);
+                        run = Some((t, t + TILE));
+                    }
+                    None => run = Some((t, t + TILE)),
+                }
+            }
+        }
+        if tile_end <= pg {
+            break;
+        }
+        pg = tile_end;
+    }
+    if let Some((rs, re)) = run {
+        early_add(mapped_runs, rs, re);
+    }
+    changed
+}
+
+/// Remove sorted tile addresses `tiles` (each `TILE` bytes) from `mapped_runs` in coalesced runs.
+fn remove_tile_runs(mapped_runs: &mut BTreeMap<usize, usize>, tiles: &[usize]) {
+    let mut i = 0;
+    while i < tiles.len() {
+        let rs = tiles[i];
+        let mut re = rs + TILE;
+        i += 1;
+        while i < tiles.len() && tiles[i] == re {
+            re += TILE;
+            i += 1;
+        }
+        early_remove(mapped_runs, rs, re);
+    }
 }
 
 fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
@@ -539,7 +611,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_list,
             rb_last_fence: 0,
             waited: FxHashMap::default(),
-            runs: None,
+            mapped_runs: BTreeMap::new(),
             scratch_runs: Vec::new(),
         })
     })();
@@ -550,6 +622,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
+            ACTIVE.store(true, Ordering::Release);
             out
         }
         Err(e) => {
@@ -718,12 +791,25 @@ impl State {
         let first = a & !(TILE - 1);
         let end = a.saturating_add(n);
         let mut new: Vec<(usize, (u32, u32))> = Vec::new();
+        let mut run: Option<(usize, usize)> = None;
+        let mut runs_changed = false;
         let mut t = first;
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 let Some((tile, reused)) = self.take_tile() else { break };
-                self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
-                self.runs = None;
+                let holes = initial_holes(t);
+                self.mapped.insert(t, TileEntry::with_holes(tile, holes));
+                if holes != 0xFFFF {
+                    runs_changed = true;
+                    match run {
+                        Some((rs, re)) if re == t => run = Some((rs, t + TILE)),
+                        Some((rs, re)) => {
+                            early_add(&mut self.mapped_runs, rs, re);
+                            run = Some((t, t + TILE));
+                        }
+                        None => run = Some((t, t + TILE)),
+                    }
+                }
                 if reused {
                     self.to_zero.push((t, TILE));
                 }
@@ -734,10 +820,15 @@ impl State {
                 None => break,
             }
         }
+        if let Some((rs, re)) = run {
+            early_add(&mut self.mapped_runs, rs, re);
+        }
         if new.is_empty() {
             return;
         }
-        MAPPED_GEN.fetch_add(1, Ordering::Release);
+        if runs_changed {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
         // per window
         let mut by_window: FxHashMap<usize, Vec<(usize, (u32, u32))>> = FxHashMap::default();
         for x in new {
@@ -1250,22 +1341,8 @@ pub unsafe fn committed(a: usize, n: usize) {
         return;
     };
     s.ensure_mapped(a, n, |_| 0xFFFF);
-    let mut pg = a & !(PAGE - 1);
-    let end = a.saturating_add(n);
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = t.saturating_add(TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut p = pg;
-            while p < tile_end {
-                entry.holes &= !(1u16 << ((p - t) / PAGE));
-                p += PAGE;
-            }
-        }
-        if tile_end <= pg {
-            break;
-        }
-        pg = tile_end;
+    if commit_tile_holes(&mut s.mapped, &mut s.mapped_runs, a, n) {
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1286,7 +1363,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if tiles.is_empty() {
         return;
     }
-    s.runs = None;
+    remove_tile_runs(&mut s.mapped_runs, &tiles);
     let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for &t in &tiles {
         if let Some(wi) = s.window_index(t) {
@@ -1311,24 +1388,12 @@ impl State {
     }
 }
 
-/// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
-/// has to reach the GPU.
+/// The sparse windows' committed mapped tiles as sorted, merged (start, end) runs: where a CPU
+/// write has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return Vec::new() };
-    if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
-        tiles.sort_unstable();
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for t in tiles {
-            match runs.last_mut() {
-                Some(last) if last.1 == t => last.1 = t + TILE,
-                _ => runs.push((t, t + TILE)),
-            }
-        }
-        s.runs = Some(runs);
-    }
-    s.runs.clone().unwrap_or_default()
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    s.mapped_runs.iter().map(|(&a, &b)| (a, b)).collect()
 }
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
@@ -1673,7 +1738,7 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
-                runs: None,
+                mapped_runs: BTreeMap::new(),
                 scratch_runs: Vec::new(),
             };
 
@@ -1681,6 +1746,11 @@ mod tests {
             s.ensure_mapped(base, 2 * TILE, |t| query_tile_holes(t));
             assert_eq!(s.mapped[&base].holes, 0xFF0F, "uncommitted prefix and suffix pages must stay holes");
             assert_eq!(s.mapped[&(base + TILE)].holes, 0xFFFF, "fully reserved tile must have all 16 holes set");
+            assert_eq!(
+                s.mapped_runs.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(),
+                vec![(base, base + TILE)],
+                "only tiles with at least one committed page belong in mapped_runs"
+            );
 
             // Reading back the full 2-tile span must not fault on uncommitted pages.
             s.readback_ranges(&[(base, 2 * TILE)]);
@@ -1857,6 +1927,90 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    /// Incremental `mapped_runs` matches rebuilding from `mapped` (excluding all-hole reserved
+    /// tiles) across random sequences of reserved/committed tile inserts, page commits, and
+    /// full/sub-tile decommits.
+    #[test]
+    fn incremental_mapped_runs_matches_committed_tiles() {
+        let base = 0x4_0000_0000usize;
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        let mut free: Vec<(u32, u32)> = Vec::new();
+        let mut to_zero: Vec<(usize, usize)> = Vec::new();
+        let mut mapped_runs: BTreeMap<usize, usize> = BTreeMap::new();
+
+        let expected_runs = |m: &FxHashMap<usize, TileEntry>| -> Vec<(usize, usize)> {
+            let mut tiles: Vec<usize> = m.iter().filter(|(_, e)| e.holes != 0xFFFF).map(|(&t, _)| t).collect();
+            tiles.sort_unstable();
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for t in tiles {
+                match runs.last_mut() {
+                    Some(last) if last.1 == t => last.1 = t + TILE,
+                    _ => runs.push((t, t + TILE)),
+                }
+            }
+            runs
+        };
+
+        // 1. All-hole tile (placed buffer over reserved space) stays out of mapped_runs until a
+        //    page is committed, then joins, and leaves once all pages are decommitted.
+        let t0 = base;
+        let t1 = base + TILE;
+        mapped.insert(t0, TileEntry::with_holes((0, 0), 0xFFFF));
+        mapped.insert(t1, TileEntry::with_holes((0, 1), 0xFFFF));
+        assert!(mapped_runs.is_empty());
+        assert!(commit_tile_holes(&mut mapped, &mut mapped_runs, t0 + 2 * PAGE, PAGE));
+        assert!(!commit_tile_holes(&mut mapped, &mut mapped_runs, t0 + 5 * PAGE, PAGE), "already in mapped_runs");
+        assert_eq!(mapped_runs.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(t0, t0 + TILE)]);
+        assert!(commit_tile_holes(&mut mapped, &mut mapped_runs, t1, TILE));
+        assert_eq!(mapped_runs.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(t0, t0 + 2 * TILE)]);
+        let unmapped = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t0, TILE);
+        remove_tile_runs(&mut mapped_runs, &unmapped);
+        assert_eq!(mapped_runs.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(t1, t1 + TILE)]);
+        let unmapped = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t1, TILE);
+        remove_tile_runs(&mut mapped_runs, &unmapped);
+        assert!(mapped_runs.is_empty());
+
+        // 2. Random operations over 128 tiles.
+        let mut x = 0xCAFE_BABE_1234_5679u64;
+        for step in 0..2000u32 {
+            let tile_idx = (next(&mut x) % 128) as usize;
+            let count = 1 + (next(&mut x) % 6) as usize;
+            let a = base + tile_idx * TILE + ((next(&mut x) % PAGES_PER_TILE as u64) as usize) * PAGE;
+            let n = (1 + (next(&mut x) % (count * PAGES_PER_TILE) as u64) as usize) * PAGE;
+            match next(&mut x) % 3 {
+                0 => {
+                    // Simulate `place_buffer`: insert missing tiles with all holes (reserved).
+                    let first = a & !(TILE - 1);
+                    let end = a + n;
+                    let mut t = first;
+                    while t < end {
+                        mapped.entry(t).or_insert_with(|| TileEntry::with_holes((0, step), 0xFFFF));
+                        t += TILE;
+                    }
+                }
+                1 => {
+                    // Simulate `committed`: ensure tiles exist (with all holes), then commit pages.
+                    let first = a & !(TILE - 1);
+                    let end = a + n;
+                    let mut t = first;
+                    while t < end {
+                        mapped.entry(t).or_insert_with(|| TileEntry::with_holes((0, step), 0xFFFF));
+                        t += TILE;
+                    }
+                    commit_tile_holes(&mut mapped, &mut mapped_runs, a, n);
+                }
+                _ => {
+                    // Simulate `decommitted`.
+                    let unmapped = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, a, n);
+                    remove_tile_runs(&mut mapped_runs, &unmapped);
+                }
+            }
+            let got: Vec<(usize, usize)> = mapped_runs.iter().map(|(&s, &e)| (s, e)).collect();
+            assert_eq!(got, expected_runs(&mapped), "mismatch at step {step}");
+        }
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
