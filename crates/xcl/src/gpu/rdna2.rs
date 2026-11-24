@@ -5,7 +5,7 @@
 //! encoding identification, literal constants, SDWA/DPP extension dwords and MIMG NSA.
 //! It is the first stage of the shader recompiler (console microcode → PC shaders).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
@@ -516,8 +516,13 @@ fn scalar_int(d: &Decoded, code: u64) -> Option<u32> {
 /// (`s_sub_u32` / `s_subb_u32` for a negative offset): a jump to the address after the
 /// `s_getpc_b64` plus the 64-bit constant hi:lo. Each such `s_setpc_b64` gets that target
 /// (`far_target`), so it is an unconditional branch like `s_branch` to everything that
-/// follows the control flow. Any other `s_setpc_b64` stays an indirect jump.
+/// follows the control flow. Any other `s_setpc_b64` – or one whose `add` / `addc` /
+/// `setpc` is entered by a branch that bypasses `s_getpc_b64` – stays an indirect jump.
 pub fn resolve_far_jumps(insts: &mut [Decoded]) {
+    for d in insts.iter_mut() {
+        d.far_target = None;
+    }
+    let mut candidates = Vec::new();
     for k in 3..insts.len() {
         let [get, lo, hi, set] = &insts[k - 3..=k] else { continue };
         if get.inst.name != "S_GETPC_B64" || set.inst.name != "S_SETPC_B64" {
@@ -547,7 +552,18 @@ pub fn resolve_far_jumps(insts: &mut [Decoded]) {
         let (Some(l), Some(h)) = (half(lo, r), half(hi, r + 1)) else { continue };
         let offset = (h as u64) << 32 | l as u64;
         let base = get.pc + get.len as u64;
-        insts[k].far_target = Some(if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) });
+        let target = if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) };
+        candidates.push((k, target));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let mut targets: HashSet<u64> = insts.iter().filter_map(branch_target).collect();
+    targets.extend(candidates.iter().map(|&(_, target)| target));
+    for (k, target) in candidates {
+        if insts[k - 2..=k].iter().all(|d| !targets.contains(&d.pc)) {
+            insts[k].far_target = Some(target);
+        }
     }
 }
 
