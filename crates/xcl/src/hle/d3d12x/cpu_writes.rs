@@ -12,10 +12,13 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
+use std::time::Duration;
 
 use windows::core::{Interface, Owned};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::CreateEventW;
+
+use crate::gpu::fence::{self, FenceError};
 
 /// A bottom-of-pipe write into memory outside unified memory, applied by the CPU once the
 /// queue's fence reaches the submission that recorded it.
@@ -45,24 +48,41 @@ struct QueueFence {
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
-/// how long the worker waits for one submission before writing anyway (a removed device, a
-/// queue that never gets there)
+/// Keep the bounded fallback for legacy writes; progress writes require confirmed completion.
 const WAIT_MS: u32 = 10_000;
 
-fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> mpsc::Sender<Job> {
+fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence, timeout_ms: u32) -> mpsc::Sender<Job> {
     let (tx, rx) = mpsc::channel::<Job>();
     let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
         let event = CreateEventW(None, false, false, None).ok().map(|event| Owned::new(event));
         let handle = event.as_deref().copied();
         for job in rx {
-            let completed = crate::gpu::fence::wait(&fence, job.value, &dev, handle, WAIT_MS);
+            let mut completed = fence::wait(&fence, job.value, &dev, handle, timeout_ms);
             for w in &job.writes {
                 match w {
                     Write::Immediate(va, words) => write_now(*va, words),
-                    Write::ImmediateU64(va, value) => match &completed {
-                        Ok(()) => write_u64_now(*va, *value),
-                        Err(e) => crate::xlog_warn!("D3D12.X: deferred 64-bit write at {va:#x} did not complete: {e:?}"),
-                    },
+                    Write::ImmediateU64(va, value) => {
+                        if let Err(e) = &completed {
+                            if !matches!(e, FenceError::Removed(_)) {
+                                crate::xlog_warn!("D3D12.X: deferred 64-bit write at {va:#x}: {e}; still waiting for the producer");
+                                // The first event registration may still be active, or the event
+                                // API may have failed. Sample the fence without registering again.
+                                completed = loop {
+                                    match fence::completed_value(&fence, &dev) {
+                                        Ok(value) if value < job.value => std::thread::sleep(Duration::from_millis(20)),
+                                        result => break result.map(|_| ()),
+                                    }
+                                };
+                            }
+                        }
+                        match &completed {
+                            Ok(()) => write_u64_now(*va, *value),
+                            Err(e) => {
+                                crate::xlog_error!("D3D12.X: deferred 64-bit write at {va:#x} did not complete: {e}");
+                                super::real::stop_if_device_removed();
+                            }
+                        }
+                    }
                     Write::ReadbackU64 { va, src, .. } => {
                         let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
                         write_u64_now(*va, value);
@@ -151,7 +171,7 @@ unsafe fn enqueue(
                 }
                 let Some(dev) = dev else { return };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                let tx = spawn_queue_worker(dev, fence.clone());
+                let tx = spawn_queue_worker(dev, fence.clone(), WAIT_MS);
                 v.insert(QueueFence { fence, value: 0, tx })
             }
         };
@@ -241,6 +261,53 @@ mod tests {
             }
             forget_queue(q.as_raw() as usize);
             assert_eq!(*dst, expected);
+        }
+    }
+
+    #[test]
+    fn immediate_u64_survives_a_producer_fence_timeout() {
+        // Heap pages are writable, and the cells outlive even a failure to drain.
+        static CELLS: std::sync::LazyLock<Box<(AtomicU32, AtomicU64, AtomicU32)>> =
+            std::sync::LazyLock::new(|| Box::new((AtomicU32::new(0), AtomicU64::new(0), AtomicU32::new(0))));
+        let wait_for_marker = |cell: &AtomicU32| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while cell.load(Ordering::Acquire) != 1 {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            true
+        };
+
+        unsafe {
+            let Some(dev) = test_device() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (before, progress, after) = CELLS.as_ref();
+            let expected = 0x1234_5678_9abc_def0;
+            let tx = spawn_queue_worker(dev, fence.clone(), 0);
+            assert!(tx.send(Job {
+                value: 1,
+                writes: vec![
+                    Write::Immediate(before.as_ptr() as usize, vec![1]),
+                    Write::ImmediateU64(progress.as_ptr() as usize, expected),
+                    Write::Immediate(after.as_ptr() as usize, vec![1]),
+                ],
+            }).is_ok());
+            drop(tx);
+
+            // The first legacy write proves the worker has passed its timeout without our signal.
+            let timed_out = wait_for_marker(before);
+            let pending = progress.load(Ordering::Acquire) == 0 && after.load(Ordering::Acquire) == 0;
+            fence.Signal(1).expect("complete the producer fence");
+
+            assert!(timed_out, "worker did not reach the timeout fallback");
+            assert!(pending, "worker published progress or reordered writes before producer completion");
+            assert!(wait_for_marker(after), "worker did not finish the job after producer completion");
+            assert_eq!(progress.load(Ordering::Acquire), expected);
         }
     }
 
