@@ -1237,9 +1237,10 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
-/// page at each address (page 0: the address is unmapped)
+/// page at each address (page 0, or no `pages` at all: the addresses are unmapped, as with
+/// `MapUserPhysicalPagesScatter` – a title's Series S path unmaps this way)
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -1249,7 +1250,8 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    let page = |i: usize| if pages.is_null() { std::ptr::null_mut() } else { pages.add(i) as *mut usize };
+    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, page(i)).is_null());
     give_back_homes(away);
     ok as BOOL
 }
@@ -2031,6 +2033,12 @@ mod tests {
             ids[1] += 1;
             assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 0, "not a page number");
             // Page numbers must refer to one registered allocation; arithmetic is checked before
+            *(at[0] as *mut u32) = 0x1234;
+            // no page array: the addresses are unmapped (a title asserts on FALSE here) and the
+            // pages keep their contents
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, std::ptr::null_mut()), 1);
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert_eq!(*(at[0] as *const u32), 0x1234);
             // constructing an address inside the reserved UMA region.
             let mut outside = [page_number(u.size() / PHYS_PAGE)];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, outside.as_mut_ptr()).is_null());
