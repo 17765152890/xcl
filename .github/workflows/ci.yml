@@ -52,3 +52,50 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+
+  release:
+    # the build regression runs use (scripts/smoke.ps1: target\release\xcl.exe), so a release-only
+    # build error shows here; on main, xcl.exe and its PDB are kept as the run's artifact for
+    # testers (not for pull requests: that would be a build of code nobody reviewed yet)
+    name: Release build (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust (stable, MSVC)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cargo build --release -p xcl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # [profile.release] debug = "line-tables-only" is what makes it
+          if (-not (Test-Path target/release/xcl.pdb)) { throw 'no target/release/xcl.pdb' }
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: xcl-${{ github.sha }}
+          path: |
+            target/release/xcl.exe
+            target/release/xcl.pdb
+          if-no-files-found: error
+          retention-days: 14
