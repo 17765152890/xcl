@@ -7169,6 +7169,60 @@ fn gpu_cmp_class_f16_preserves_snan() {
 }
 
 #[test]
+fn v_cmp_class_f32_emits_bitwise_modifiers_without_asfloat() {
+    let code = prog(&[
+        ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 255), ("ABS", 1), ("NEG", 1)], Some(1 << 7)),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete());
+    assert!(t.hlsl.contains("& 0x7FFFFFFFu"), "must apply abs bitwise: {}", t.hlsl);
+    assert!(t.hlsl.contains("^ 0x80000000u"), "must apply neg bitwise: {}", t.hlsl);
+    assert!(!t.hlsl.contains("asfloat("), "must not convert to float for fclass: {}", t.hlsl);
+    assert!(t.hlsl.contains("fclass("), "must call fclass: {}", t.hlsl);
+}
+
+#[test]
+fn gpu_cmp_class_f32_preserves_snan_and_denormals() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // 0x7F800001 (sNaN) tested against mask 1 << 0 (sNaN) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 129)], None),
+            // 0x7F800001 (sNaN) tested against mask 1 << 1 (qNaN) -> false
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", 130)], None),
+            // 0x7FC00001 (qNaN) tested against mask 1 << 0 (sNaN) -> false
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 129)], None),
+            // 0x7FC00001 (qNaN) tested against mask 1 << 1 (qNaN) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 1), ("SRC1", 130)], None),
+            // 0xBF800000 (-1.0) with ABS tested against mask 1 << 8 (+normal) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 255), ("ABS", 1)], Some(1 << 8)),
+            // 0xBF800000 (-1.0) with NEG tested against mask 1 << 8 (+normal) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 2), ("SRC1", 255), ("NEG", 1)], Some(1 << 8)),
+            // 0x80000001 (-subnormal) with ABS tested against mask 1 << 7 (+subnormal) -> true (not flushed to zero)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 3), ("SRC1", 255), ("ABS", 1)], Some(1 << 7)),
+            // 0x7F800001 (sNaN) with NEG tested against mask 1 << 0 (sNaN) -> true (not quieted to qNaN)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", 129), ("NEG", 1)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x7F800001; // f32 sNaN
+            r[1] = 0x7FC00001; // f32 qNaN
+            r[2] = 0xBF800000; // f32 -1.0
+            r[3] = 0x80000001; // f32 negative subnormal
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} f32 sNaN matches sNaN bit");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (0, 0), "wave{lanes} f32 sNaN does not match qNaN bit");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), (0, 0), "wave{lanes} f32 qNaN does not match sNaN bit");
+        assert_eq!((r.sgpr[6], r.sgpr[7]), all, "wave{lanes} f32 qNaN matches qNaN bit");
+        assert_eq!((r.sgpr[8], r.sgpr[9]), all, "wave{lanes} f32 abs(-1.0) matches +normal");
+        assert_eq!((r.sgpr[10], r.sgpr[11]), all, "wave{lanes} f32 neg(-1.0) matches +normal");
+        assert_eq!((r.sgpr[12], r.sgpr[13]), all, "wave{lanes} f32 abs(-denormal) matches +denormal");
+        assert_eq!((r.sgpr[14], r.sgpr[15]), all, "wave{lanes} f32 neg(sNaN) matches sNaN");
+    }
+}
+
+#[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
