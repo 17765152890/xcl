@@ -22,7 +22,7 @@ for i, (a, t) in enumerate(ins):
     if i + 2 >= len(ins):
         continue
     m2 = re.match(rf'cmp\s+0x(30|28)\(%{L}\),%{P}$', ins[i + 1][1])
-    m3 = re.match(r'jae\s+0x([0-9a-f]+)', ins[i + 2][1])
+    m3 = re.match(r'jae\s+(?:0x)?([0-9a-f]+)\b', ins[i + 2][1])
     if not (m2 and m3):
         continue
     bound, fallback = m2.group(1), int(m3.group(1), 16)
