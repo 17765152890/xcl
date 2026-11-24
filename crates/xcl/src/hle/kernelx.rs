@@ -79,6 +79,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         OutputDebugStringA,
         OutputDebugStringW,
         GetSystemOSVersion,
+        GetFileSizeEx,
         // modules
         LoadLibraryW,
         LoadLibraryA,
@@ -380,11 +381,19 @@ fn trace_mem(what: &str, addr: usize, size: usize, flags: u64, protect: u32, got
 }
 
 /// `f` with the thread's last error as it was before.
-fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
     let e = unsafe { fnd::GetLastError() };
     let r = f();
     unsafe { fnd::SetLastError(e) };
     r
+}
+
+pub(crate) unsafe extern "system" fn GetFileSizeEx(handle: HANDLE, size: *mut i64) -> BOOL {
+    let result = windows_sys::Win32::Storage::FileSystem::GetFileSizeEx(handle, size);
+    if result != 0 && !size.is_null() {
+        crate::vfs_hooks::trace_archive_size("GetFileSizeEx", handle, Some(size.read_unaligned()), None);
+    }
+    result
 }
 
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT

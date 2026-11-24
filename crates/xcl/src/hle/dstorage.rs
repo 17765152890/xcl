@@ -499,12 +499,14 @@ unsafe extern "system" fn file_close(p: *mut c_void) {
 
 /// a handle of the title's own (it closes it)
 unsafe extern "system" fn file_get_handle(p: *mut c_void) -> HANDLE {
-    let Some(f) = inner::<FileInner>(p).handle() else { return std::ptr::null_mut() };
+    let file = inner::<FileInner>(p);
+    let Some(f) = file.handle() else { return std::ptr::null_mut() };
     let mut h: HANDLE = std::ptr::null_mut();
     let me = GetCurrentProcess();
     if DuplicateHandle(me, f.as_raw_handle() as HANDLE, me, &mut h, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
         return std::ptr::null_mut();
     }
+    crate::vfs_hooks::trace_archive_size("DirectStorage GetHandle", h, None, Some(file.id));
     h
 }
 

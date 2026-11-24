@@ -10,11 +10,16 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStringExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_NOT_SAME_DEVICE, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, WIN32_FIND_DATAA, WIN32_FIND_DATAW};
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileSizeEx, GetFinalPathNameByHandleW, FILE_NAME_OPENED, MOVEFILE_DELAY_UNTIL_REBOOT,
+    WIN32_FIND_DATAA, WIN32_FIND_DATAW,
+};
 
 use crate::hooks::hook;
 use crate::util::{from_ansi_ptr, from_file_ansi_ptr, from_wide_ptr, wide};
@@ -43,6 +48,43 @@ impl Drop for Guard {
         IN_HOOK.with(|c| c.set(false));
         unsafe { windows_sys::Win32::Foundation::SetLastError(e) };
     }
+}
+
+pub(crate) fn trace_archive_size(api: &str, handle: HANDLE, size: Option<i64>, file_id: Option<u32>) {
+    crate::hle::kernelx::keep_last_error(|| {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var_os("XCL_TRACE_ARCHIVE_SIZES").as_deref() == Some(std::ffi::OsStr::new("1"))
+        });
+        if !enabled {
+            return;
+        }
+        let mut name = [0u16; 1024];
+        let len = unsafe { GetFinalPathNameByHandleW(handle, name.as_mut_ptr(), name.len() as u32, FILE_NAME_OPENED) } as usize;
+        if len == 0 || len >= name.len() {
+            return;
+        }
+        let name = std::ffi::OsString::from_wide(&name[..len]);
+        let path = Path::new(&name);
+        if !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("rpf")) {
+            return;
+        }
+        let Some(basename) = path.file_name() else { return };
+        let size = if let Some(size) = size {
+            size
+        } else {
+            let mut size = 0;
+            if unsafe { GetFileSizeEx(handle, &mut size) } == 0 {
+                return;
+            }
+            size
+        };
+        if let Some(id) = file_id {
+            crate::xlog_info!("archive size: {api} file #{id} {basename:?}, {size} bytes");
+        } else {
+            crate::xlog_info!("archive size: {api} {basename:?}, {size} bytes");
+        }
+    });
 }
 
 macro_rules! orig {
@@ -1243,6 +1285,37 @@ mod tests {
         CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
     };
+
+    #[test]
+    fn archive_size_queries_preserve_native_results() {
+        use std::os::windows::io::AsRawHandle;
+
+        let fixture = HookFixture::new("archive_size");
+        let path = fixture.dir.join("size-fixture.RPF");
+        std::fs::write(&path, b"size fixture").unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        let duplicate = file.try_clone().unwrap();
+        let handle = duplicate.as_raw_handle() as HANDLE;
+
+        unsafe {
+            for candidate in [handle, INVALID_HANDLE_VALUE] {
+                let mut expected_size = -1;
+                SetLastError(0x1234);
+                let expected_result = GetFileSizeEx(candidate, &mut expected_size);
+                let expected_error = GetLastError();
+
+                let mut size = -1;
+                SetLastError(0x1234);
+                let result = crate::hle::kernelx::GetFileSizeEx(candidate, &mut size);
+                let error = GetLastError();
+                assert_eq!((result, size, error), (expected_result, expected_size, expected_error));
+            }
+
+            SetLastError(0x1234);
+            trace_archive_size("DirectStorage GetHandle", handle, None, Some(7));
+            assert_eq!(GetLastError(), 0x1234);
+        }
+    }
 
     struct HookFixture {
         dir: PathBuf,

@@ -139,6 +139,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- Set `XCL_TRACE_ARCHIVE_SIZES=1` to log basenames and sizes for successful `.rpf` size queries
+  through mapped `GetFileSizeEx` imports and handles returned by DirectStorage `GetHandle`.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
