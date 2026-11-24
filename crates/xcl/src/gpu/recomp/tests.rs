@@ -1975,6 +1975,10 @@ fn gpu_ps_compare_mip_gradients() {
         ("IMAGE_SAMPLE_C_D", 0.125f32, 0.125f32, 0.125f32, 0.0f32, 0, 0.0f32),
         ("IMAGE_SAMPLE_C_D", 0.125, 0.0, 0.25, 0.0, 1, 0.0),
         ("IMAGE_SAMPLE_C_D_CL", 0.25, 0.125, 0.125, 0.0, 0, 0.0),
+        // Pin the mip while checking that an infinite gradient cannot move the sampling pixel.
+        ("IMAGE_SAMPLE_C_D_CL", 0.125, f32::INFINITY, 0.125, 1.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_D_CL", 0.125, 0.125, f32::NEG_INFINITY, 1.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_D_CL", 0.125, f32::NAN, 0.125, 1.0, 1, 0.0),
         ("IMAGE_SAMPLE_C_CD_O", 0.125, 0.25, 0.0, 0.0, 1, 0.0),
         ("IMAGE_SAMPLE_C_CD_CL_O", 0.125, 0.125, 0.125, 1.0, 1, 0.0),
         ("IMAGE_SAMPLE_C_D", 0.125, 0.10, 0.0, 0.0, 0, 0.0625),
@@ -2071,15 +2075,22 @@ fn check_ps_depth_mip(ps: &[u8], coord_scale: f32, mip_at: impl Fn(usize) -> u32
     let mut sgprs = [0; 32];
     sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
     sgprs[24..28].copy_from_slice(&sampler);
-    let pixels = draw_console_views(None, Some(ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&sampler, true)]);
-    for (i, pixel) in pixels.iter().enumerate() {
-        let (x, y) = (i % 16, i / 16);
-        let mip = mip_at(x);
-        let size = 8u32 >> mip;
-        let texel = |p: usize| (((p as f32 + 0.5) * coord_scale * size as f32) as u32).min(size - 1);
-        let expected = (texel(x) + texel(y) + mip) % 2;
-        if pixel[0] != expected as f32 {
-            return Err(format!("pixel ({x},{y}): {} instead of {expected} from mip {mip}", pixel[0]));
+    let samplers = [crate::gpu::desc::sampler_d3d12(&sampler, true)];
+    // The second triangle cuts through 2x2 quads. Its diagonal is 4*x + 3*y = 48;
+    // no pixel center lies exactly on it. Uncovered pixels must retain the clear value.
+    for (width, height) in [(32.0, 32.0), (12.0, 16.0)] {
+        let tri = [[0.0, 0.0], [0.0, height], [width, 0.0]];
+        let pixels = draw_console_views(None, Some(ps), &tri, &sgprs, std::slice::from_ref(&tex), &samplers);
+        for (i, pixel) in pixels.iter().enumerate() {
+            let (x, y) = (i % 16, i / 16);
+            let mip = mip_at(x);
+            let size = 8u32 >> mip;
+            let texel = |p: usize| (((p as f32 + 0.5) * coord_scale * size as f32) as u32).min(size - 1);
+            let covered = (x as f32 + 0.5) * height + (y as f32 + 0.5) * width < width * height;
+            let expected = if covered { ((texel(x) + texel(y) + mip) % 2) as f32 } else { -1.0 };
+            if pixel[0] != expected {
+                return Err(format!("{width}x{height} triangle, pixel ({x},{y}): {} instead of {expected} at mip {mip}", pixel[0]));
+            }
         }
     }
     Ok(())
