@@ -2269,7 +2269,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     }
     if pred_in_state {
         if let Some(ref pb) = pred_buf {
-            transition(list, pb.as_raw() as usize, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+            let st = predication_resource_state(ty);
+            transition(list, pb.as_raw() as usize, st, D3D12_RESOURCE_STATE_COMMON);
         }
     }
 
@@ -2395,7 +2396,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     if ty != D3D12_COMMAND_LIST_TYPE_COPY {
         if let (Some(op), Some(ref pb)) = (predication, pred_buf) {
             let pb_raw = pb.as_raw() as usize;
-            transition(next_pc, pb_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
+            let st = predication_resource_state(ty);
+            transition(next_pc, pb_raw, D3D12_RESOURCE_STATE_COMMON, st);
             pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(next_pc, PC_SET_PREDICATION)(next_pc, pb_raw, 0, op);
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                 s.pred_in_state = true;
@@ -2569,12 +2571,22 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     Some(raw)
 }
 
+#[inline]
+fn predication_resource_state(ty: D3D12_COMMAND_LIST_TYPE) -> D3D12_RESOURCE_STATES {
+    if ty == D3D12_COMMAND_LIST_TYPE_COMPUTE {
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+    } else {
+        D3D12_RESOURCE_STATE_PREDICATION
+    }
+}
+
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
-/// `D3D12_RESOURCE_STATE_PREDICATION`.
+/// the predication resource state for its command list type.
 pub(super) unsafe fn before_close(list: *mut c_void) {
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
+    let ty = list_type(list);
     let pb = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
@@ -2588,7 +2600,8 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
         }
     };
     if let Some(pb) = pb {
-        transition(list, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+        let st = predication_resource_state(ty);
+        transition(list, pb, st, D3D12_RESOURCE_STATE_COMMON);
     }
 }
 
@@ -2606,6 +2619,8 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
 /// bind `SetPredication(pb, 0, op)` on `this`.
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
+    let ty = list_type(this);
+    let st = predication_resource_state(ty);
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     let f = pc::<F>(this, PC_SET_PREDICATION);
     let (was_active, was_in_state) = LISTS
@@ -2620,11 +2635,11 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
         f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     }
     transition(this, uma_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    let pb_before = if was_in_state { D3D12_RESOURCE_STATE_PREDICATION } else { D3D12_RESOURCE_STATE_COMMON };
+    let pb_before = if was_in_state { st } else { D3D12_RESOURCE_STATE_COMMON };
     transition(this, pb, pb_before, D3D12_RESOURCE_STATE_COPY_DEST);
     copy_buffer_region(this, pb, 0, uma_buf, off, 8);
     transition(this, uma_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+    transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, st);
     f(this, pb, 0, op);
     PREDICATION_USED.store(true, Ordering::Release);
     if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
@@ -2661,7 +2676,8 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
             })
         };
         if let Some(pb) = pb {
-            transition(this, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+            let st = predication_resource_state(ty);
+            transition(this, pb, st, D3D12_RESOURCE_STATE_COMMON);
         }
         return;
     }
@@ -2742,7 +2758,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     if pred_in_state {
         if let Some(pb) = pred_buf {
-            transition(this, pb, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+            let st = predication_resource_state(ty);
+            transition(this, pb, st, D3D12_RESOURCE_STATE_COMMON);
         }
     }
 
@@ -2886,11 +2903,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(target, PC_OM_SET_DEPTH_BOUNDS)(target, min, max);
         }
     }
-    if let (Some(op), Some(pb)) = (predication, pred_buf) {
-        transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
-        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
-            s.pred_in_state = true;
+    if ty != D3D12_COMMAND_LIST_TYPE_COPY {
+        if let (Some(op), Some(pb)) = (predication, pred_buf) {
+            let st = predication_resource_state(ty);
+            transition(target, pb, D3D12_RESOURCE_STATE_COMMON, st);
+            pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+                s.pred_in_state = true;
+            }
         }
     }
 }
