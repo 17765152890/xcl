@@ -870,6 +870,10 @@ mod tests {
             }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            if adapter.GetDesc1().is_ok_and(|d| d.DedicatedVideoMemory < 8usize << 30) {
+                crate::gpu::recomp::runner::skip_test("< 8 GB VRAM");
+                return;
+            }
             let Some(dev) = dev.filter(|d| tier2(d)) else { return };
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let memory: IDXGIAdapter3 = adapter.cast().unwrap();
