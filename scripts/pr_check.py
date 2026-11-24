@@ -10,6 +10,8 @@ asks git instead of the GitHub API (whether a commit is on main, a blob's size).
 import argparse, os, re, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
+# the headings of the description's outline: a section ends where the next one starts
+HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
 # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
 BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)"
 # game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance")
@@ -37,6 +39,17 @@ def smoke_blocks(body):
     return out
 
 
+def filled(body, section):
+    """Whether `body` has a `**section**` heading with something written under it, before the
+    next heading: comments and list markers with nothing after them are not something."""
+    end = r"(?=\n[ \t]*\*\*(?:" + "|".join(HEADINGS) + r")\*\*|\Z)"
+    for m in re.finditer(r"\*\*" + section + r"\*\*[ \t]*(?=\n)(.*?)" + end, body, re.S):
+        text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
+        if re.sub(r"^[ \t]*[-*+][ \t]*$", "", text, flags=re.M).strip():
+            return True
+    return False
+
+
 def number(s):
     m = re.match(r"\s*(\d+)", s or "")
     return int(m.group(1)) if m else None
@@ -53,7 +66,7 @@ def check(body, head, files, is_main_ancestor):
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
-        if not re.search(r"\*\*" + section + r"\*\*\s*\n\s*\S", body):
+        if not filled(body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
     ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
