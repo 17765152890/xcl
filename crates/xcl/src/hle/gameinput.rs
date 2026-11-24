@@ -587,10 +587,15 @@ unsafe extern "system" fn get_battery_state(_this: *mut Object, state: *mut [u32
 unsafe extern "system" fn motor_powered_on(_this: *mut Object, _motor: u32) -> bool {
     false
 }
-/// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors
+/// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors, or a
+/// DualSense's
 unsafe extern "system" fn set_rumble_state(_this: *mut Object, p: *const [f32; 4]) {
-    let Some((_, set)) = xinput() else { return };
     let (lo, hi) = if p.is_null() { (0.0, 0.0) } else { ((*p)[0], (*p)[1]) };
+    // the gamepad is a DualSense when no XInput controller answers (`playstation`)
+    if !PAD_CONNECTED.load(Ordering::Relaxed) && super::playstation::rumble(lo, hi) {
+        return;
+    }
+    let Some((_, set)) = xinput() else { return };
     let speed = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
     set(PAD.load(Ordering::Relaxed), &[speed(lo), speed(hi)]);
 }

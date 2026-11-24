@@ -2,16 +2,22 @@
 //! XInput only through extra software (Steam Input, DS4Windows), so without it a player with
 //! one had no gamepad. They are read here as HID devices: a thread reads the first one found
 //! (input report 0x01; a DualShock 4 over Bluetooth sends the same first bytes as over USB) and
-//! `gameinput::poll` uses it when no XInput controller answers. Rumble and the light bar are
-//! not driven.
+//! `gameinput::poll` uses it when no XInput controller answers. A DualSense over USB also
+//! takes the title's rumble (compatible vibration), sent by a thread of its own whenever it
+//! changes; sending it also sets the light bar and player LEDs to their defaults. Reads are
+//! overlapped, so `shutdown` (at process exit) can stop them and the motors.
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows_sys::core::GUID;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
+use super::dualsense_report as report;
 use super::gameinput::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,7 +53,7 @@ pub fn pad() -> Option<GamepadState> {
 
 /// Looks for a controller every second; reads one until it is gone.
 fn reader() {
-    loop {
+    while !SHUTDOWN.load(Ordering::Acquire) {
         if let Some((path, layout, name)) = find() {
             read_until_gone(&path, layout, name);
             *STATE.lock().unwrap() = None;
@@ -96,26 +102,63 @@ pub(crate) fn known(path: &str) -> Option<(Layout, &'static str)> {
         .map(|&(_, layout, name)| (layout, name))
 }
 
+/// a manual-reset event set by `shutdown`: wakes the reader
+fn stop_event() -> HANDLE {
+    static E: OnceLock<usize> = OnceLock::new();
+    *E.get_or_init(|| unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) as usize }) as HANDLE
+}
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// the reading handle, for `shutdown`'s CancelIoEx
+static READ_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+fn open(path: &[u16], access: u32, flags: u32) -> Option<HANDLE> {
+    let h = unsafe { CreateFileW(path.as_ptr(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, flags, std::ptr::null_mut()) };
+    (h != INVALID_HANDLE_VALUE).then_some(h)
+}
+
+/// One overlapped read: the report's length, or None when the read failed, `shutdown` stopped
+/// it or nothing came for 2 s (a controller that went out of Bluetooth range can leave a read
+/// pending without an error).
+fn read_report(h: HANDLE, buf: &mut [u8], ev: HANDLE) -> Option<usize> {
+    unsafe {
+        let mut ov: OVERLAPPED = std::mem::zeroed();
+        ov.hEvent = ev;
+        let mut n = 0u32;
+        if ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, &mut ov) == 0 && GetLastError() != ERROR_IO_PENDING {
+            return None;
+        }
+        let w = WaitForMultipleObjects(2, [ev, stop_event()].as_ptr(), 0, 2000);
+        if w != WAIT_OBJECT_0 {
+            CancelIoEx(h, &ov);
+            GetOverlappedResult(h, &ov, &mut n, 1);
+            return None;
+        }
+        (GetOverlappedResult(h, &ov, &mut n, 0) != 0).then_some(n as usize)
+    }
+}
+
 fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-    let h = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
-    if h == INVALID_HANDLE_VALUE {
+    let Some(h) = open(path, GENERIC_READ, FILE_FLAG_OVERLAPPED) else {
         static ONCE: AtomicBool = AtomicBool::new(false);
         if !ONCE.swap(true, Ordering::Relaxed) {
             crate::xlog_warn!("GameInput: the {name} could not be opened ({}) – it is not the title's gamepad", std::io::Error::last_os_error());
         }
         return;
-    }
-    crate::xlog_info!("GameInput: a {name} is read as the title's gamepad when no XInput controller answers");
+    };
+    READ_HANDLE.store(h as usize, Ordering::Release);
+    // a DualSense over USB takes the rumble on a handle of its own (writes are not overlapped)
+    let out = if layout == Layout::DualSense { open(path, GENERIC_WRITE, 0) } else { None };
+    crate::xlog_info!(
+        "GameInput: a {name} is read as the title's gamepad when no XInput controller answers{}",
+        if out.is_some() { ", with rumble" } else { "" }
+    );
+    with_output(|o| *o = Output { conn: out.map(|h| h as usize), rumble: o.rumble, sent: None });
+    let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
     let mut buf = [0u8; 128];
     let mut odd = false;
-    loop {
-        let mut n = 0u32;
-        if unsafe { ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null_mut()) } == 0 {
-            break;
-        }
-        match parse(layout, &buf[..n as usize]) {
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        let Some(n) = read_report(h, &mut buf, ev) else { break };
+        match parse(layout, &buf[..n]) {
             Some(s) => *STATE.lock().unwrap() = Some(s),
             None if !odd => {
                 odd = true;
@@ -124,8 +167,110 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
             None => {}
         }
     }
-    unsafe { CloseHandle(h as *mut c_void) };
-    crate::xlog_info!("GameInput: the {name} was disconnected");
+    READ_HANDLE.store(0, Ordering::Release);
+    if let Some(c) = with_output(|o| o.conn.take()) {
+        unsafe { CloseHandle(c as HANDLE) };
+    }
+    unsafe {
+        CloseHandle(ev);
+        CloseHandle(h);
+    }
+    if !SHUTDOWN.load(Ordering::Acquire) {
+        crate::xlog_info!("GameInput: the {name} was disconnected");
+    }
+}
+
+/// What a DualSense is to play, and what was last sent to it.
+#[derive(Default)]
+struct Output {
+    /// the write handle of a connected DualSense
+    conn: Option<usize>,
+    /// the title's levels: low and high motor
+    rumble: [f32; 2],
+    sent: Option<[u8; 48]>,
+}
+
+impl Output {
+    /// The output report to send now: None while it is the one last sent.
+    fn next_report(&mut self) -> Option<[u8; 48]> {
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+        let r = report::Output { rumble: Some((b(self.rumble[0]), b(self.rumble[1]))), ..Default::default() }.usb();
+        (self.sent != Some(r)).then(|| {
+            self.sent = Some(r);
+            r
+        })
+    }
+}
+
+static OUTPUT: Mutex<Option<Output>> = Mutex::new(None);
+static WAKE: Condvar = Condvar::new();
+
+fn with_output<R>(f: impl FnOnce(&mut Output) -> R) -> R {
+    let r = f(OUTPUT.lock().unwrap().get_or_insert_with(Output::default));
+    WAKE.notify_all();
+    r
+}
+
+fn write(h: usize, r: &[u8]) -> bool {
+    let mut n = 0u32;
+    unsafe { WriteFile(h as HANDLE, r.as_ptr(), r.len() as u32, &mut n, std::ptr::null_mut()) != 0 }
+}
+
+/// Sends the output report whenever it changes, so the title's thread never waits on HID.
+fn writer() {
+    let mut g = OUTPUT.lock().unwrap();
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        let o = g.get_or_insert_with(Output::default);
+        if let Some(c) = o.conn {
+            if let Some(r) = o.next_report() {
+                drop(g);
+                if !write(c, &r) {
+                    crate::xlog_debug!("GameInput: the DualSense did not take an output report");
+                }
+                g = OUTPUT.lock().unwrap();
+                continue;
+            }
+        }
+        g = WAKE.wait_timeout(g, Duration::from_millis(500)).unwrap().0;
+    }
+}
+
+/// The title's rumble (0..1, low and high motor); false when no DualSense takes it.
+pub fn rumble(low: f32, high: f32) -> bool {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if !STARTED.swap(true, Ordering::Relaxed) {
+        if let Err(e) = std::thread::Builder::new().name("xcl playstation output".into()).spawn(writer) {
+            crate::xlog_warn!("GameInput: no thread for the DualSense's rumble: {e}");
+        }
+    }
+    with_output(|o| {
+        o.rumble = [low, high];
+        o.conn.is_some()
+    })
+}
+
+/// At process exit: a pending read is cancelled and the motors stopped (a DualSense keeps
+/// rumbling at the last level it was sent until it is switched off).
+pub fn shutdown() {
+    if SHUTDOWN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    unsafe { SetEvent(stop_event()) };
+    let h = READ_HANDLE.load(Ordering::Acquire);
+    if h != 0 {
+        unsafe { CancelIoEx(h as HANDLE, std::ptr::null()) };
+    }
+    // try_lock: the process may end with another thread holding it
+    if let Ok(mut g) = OUTPUT.try_lock() {
+        if let Some(o) = g.as_mut() {
+            if let (Some(c), Some(_)) = (o.conn, o.sent) {
+                o.rumble = [0.0; 2];
+                if let Some(r) = o.next_report() {
+                    write(c, &r);
+                }
+            }
+        }
+    }
 }
 
 /// Input report 0x01 as a GameInput gamepad state (HID sticks: 0 left / up, 128 centre).
@@ -170,6 +315,20 @@ pub(crate) fn parse(layout: Layout, r: &[u8]) -> Option<GamepadState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rumble levels become the USB report's motor bytes (right small, left big), and a
+    /// report is sent only when it changes.
+    #[test]
+    fn dualsense_rumble_is_sent_when_it_changes() {
+        let mut o = Output { rumble: [1.0, 0.5], ..Output::default() };
+        let r = o.next_report().unwrap();
+        assert_eq!((r[0], r[1] & 0x03, r[3], r[4]), (0x02, 0x03, 127, 255));
+        assert_eq!(o.next_report(), None);
+        o.rumble = [0.0, 0.0];
+        let r = o.next_report().unwrap();
+        assert_eq!((r[3], r[4]), (0, 0));
+        assert_eq!(o.next_report(), None);
+    }
 
     /// A DualShock 4 report and a DualSense USB report with the same input give the same
     /// gamepad state; idle sticks are centred and no button is pressed.
