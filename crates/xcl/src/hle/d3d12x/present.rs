@@ -530,6 +530,8 @@ struct Presenter {
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
     dumps: Vec<FrameDump>,
+    /// `XCL_OVERLAY`: the stats panel's texture (upload heap) and its size
+    overlay: Option<(ID3D12Resource, u32, u32)>,
     disabled: bool,
     value: u64,
     event: HANDLE,
@@ -573,7 +575,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_source: None, dumps: Vec::new(), overlay: None, disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
@@ -622,6 +624,53 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             false
         }
     }
+}
+
+/// The panel buffer's row pitch: `w * 4` rounded up to `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`
+/// (256) – a placed footprint requires it (`overlay::panel` pads its rows the same way).
+fn panel_row_pitch(w: u32) -> u32 {
+    (w * 4).div_ceil(256) * 256
+}
+
+/// `XCL_OVERLAY`: the stats panel in an upload-heap buffer (kept in GENERIC_READ: a copy
+/// source), recreated when its text size changes. `None` = no overlay this frame.
+unsafe fn overlay_copy(p: &mut Presenter, bb: &ID3D12Resource, fmt: DXGI_FORMAT) -> Option<(ID3D12Resource, u32, u32)> {
+    let (w, h, px) = crate::hle::overlay::panel(fmt.0)?;
+    let bbdesc = bb.GetDesc();
+    if w + 16 > bbdesc.Width as u32 || h + 16 > bbdesc.Height {
+        return None; // a frame smaller than the panel: nothing drawn
+    }
+    let reuse = p.overlay.as_ref().is_some_and(|(_, ow, oh)| *ow == w && *oh == h);
+    if !reuse {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: px.len() as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buf: Option<ID3D12Resource> = None;
+        p.dev
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buf,
+            )
+            .ok()?;
+        p.overlay = Some((buf?, w, h));
+    }
+    let (tex, _, _) = p.overlay.as_ref()?;
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    tex.Map(0, None, Some(&mut ptr)).ok()?;
+    std::ptr::copy_nonoverlapping(px.as_ptr(), ptr as *mut u8, px.len());
+    tex.Unmap(0, None);
+    p.overlay.clone()
 }
 
 unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
@@ -691,9 +740,32 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
+    // `XCL_OVERLAY`: the stats panel, copied into the frame after the game image
+    let overlay = if crate::hle::overlay::enabled() { overlay_copy(p, &bb, fmt) } else { None };
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, &src);
+    if let Some((tex, w, h)) = &overlay {
+        // transmute_copy: the copy locations only borrow – a clone here would AddRef the back
+        // buffer every frame (ResizeBuffers then fails) and leak every recreated overlay buffer
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&bb),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let srcloc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(tex),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: fmt, Width: *w, Height: *h, Depth: 1, RowPitch: panel_row_pitch(*w) },
+                },
+            },
+        };
+        let region = D3D12_BOX { left: 0, top: 0, front: 0, right: *w, bottom: *h, back: 1 };
+        p.list.CopyTextureRegion(&dst, 8, 8, 0, &srcloc, Some(&region));
+    }
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
@@ -1001,6 +1073,19 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overlay copy's row pitch is 256-aligned for every panel width the font produces
+    /// (`w = 16 + 12 * cols`), and equals the padding `overlay::panel` writes.
+    #[test]
+    fn panel_row_pitch_is_256_aligned() {
+        for cols in 1..40u32 {
+            let w = 16 + 12 * cols;
+            let pitch = panel_row_pitch(w);
+            assert_eq!(pitch % 256, 0, "w={w}");
+            assert!(pitch >= w * 4 && pitch - w * 4 < 256, "w={w}");
+        }
+        assert_eq!(panel_row_pitch(64), 256, "an exact multiple stays");
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {
