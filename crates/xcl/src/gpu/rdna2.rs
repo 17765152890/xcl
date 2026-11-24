@@ -551,6 +551,79 @@ pub fn resolve_far_jumps(insts: &mut [Decoded]) {
     }
 }
 
+/// The address dwords an image instruction reads, as LLVM counts them (`getAddrSizeMIMGOp`):
+/// one each for an offset, a bias and a compare value, the dimension's coordinates and a
+/// LOD / LOD clamp / mip level (two to a dword with A16), and the gradients (two to a dword
+/// in the `_g16` forms). The ray queries take a fixed 11 / 12 (8 / 9 with A16).
+fn mimg_address_dwords(name: &str, dim: usize, a16: bool) -> u64 {
+    // SQ_RSRC_IMG_*: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
+    const COORDS: [u64; 8] = [1, 2, 3, 3, 2, 3, 3, 4];
+    const GRADIENTS: [u64; 8] = [2, 4, 6, 4, 2, 4, 0, 0];
+    if name.contains("BVH") {
+        return if name.contains("BVH64") { 12 } else { 11 } - if a16 { 3 } else { 0 };
+    }
+    if name == "IMAGE_GET_RESINFO" {
+        return 1;
+    }
+    let has = |t: &str| name.split('_').any(|x| x == t);
+    let components = COORDS[dim] + (has("MIP") || has("CL") || has("L")) as u64;
+    let mut n = ["O", "B", "C"].iter().filter(|t| has(t)).count() as u64 + if a16 { components.div_ceil(2) } else { components };
+    if has("D") || has("CD") {
+        n += if has("G16") { (GRADIENTS[dim] / 2).next_multiple_of(2) } else { GRADIENTS[dim] };
+    }
+    n
+}
+
+/// An image instruction as LLVM writes it: the data registers DMASK selects (four for a
+/// gather; halved by D16, one more with TFE), the address registers the opcode and the
+/// dimension take (`mimg_address_dwords`; a list when NSA dwords name them one by one), the
+/// resource and the sampler, then `dmask`, `dim` and the flags (a ray query: `a16` alone).
+fn mimg_text(d: &Decoded) -> String {
+    const DIM: [&str; 8] = ["1D", "2D", "3D", "CUBE", "1D_ARRAY", "2D_ARRAY", "2D_MSAA", "2D_MSAA_ARRAY"];
+    let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (name, bvh) = (d.inst.name, d.inst.name.contains("BVH"));
+    let (dmask, dim) = (f("DMASK"), f("DIM") as usize);
+    let data = if bvh {
+        4
+    } else {
+        // a compare-and-swap has the value to compare with after the one to store: two at least
+        let least = if name.contains("CMPSWAP") { 2 } else { 1 };
+        let n = if name.starts_with("IMAGE_GATHER") { 4 } else { (dmask.count_ones() as u64).max(least) };
+        (if f("D16") == 1 { n.div_ceil(2) } else { n }) + f("TFE")
+    };
+    let addr = mimg_address_dwords(name, dim, f("A16") == 1);
+    let ops: Vec<String> = d
+        .ienc
+        .operands
+        .iter()
+        .filter_map(|o| match o.field {
+            Some("VDATA") => Some(reg_range("v", f("VDATA"), 32 * data as u16)),
+            Some("VADDR") if f("NSA") == 0 => Some(reg_range("v", f("VADDR"), 32 * addr as u16)),
+            // the first address register, then one a byte of the NSA dwords
+            Some("VADDR") => {
+                let more = d.words[2..].iter().flat_map(|w| w.to_le_bytes()).take(addr as usize - 1);
+                let list: Vec<String> = std::iter::once(f("VADDR") as u8).chain(more).map(|v| format!("v{v}")).collect();
+                Some(format!("[{}]", list.join(", ")))
+            }
+            _ => operand_text(d, o),
+        })
+        .collect();
+    let mut s = format!("{} {}", mnemonic(d), ops.join(", "));
+    if !bvh {
+        if dmask != 0 {
+            let _ = write!(s, " dmask:{dmask:#x}");
+        }
+        let _ = write!(s, " dim:SQ_RSRC_IMG_{}", DIM[dim]);
+    }
+    for (field, label) in [("UNORM", "unorm"), ("GLC", "glc"), ("SLC", "slc"), ("DLC", "dlc"), ("R128", "r128"), ("A16", "a16"), ("TFE", "tfe"), ("LWE", "lwe"), ("D16", "d16")] {
+        // a ray query has its DMASK, UNORM and R128 set, and no name for them
+        if f(field) == 1 && !(bvh && matches!(field, "UNORM" | "R128")) {
+            let _ = write!(s, " {label}");
+        }
+    }
+    s
+}
+
 pub fn mnemonic(d: &Decoded) -> String {
     let mut m = d.inst.name.to_ascii_lowercase();
     match d.variant {
@@ -563,6 +636,9 @@ pub fn mnemonic(d: &Decoded) -> String {
 }
 
 pub fn format(d: &Decoded) -> String {
+    if d.enc.name == "ENC_MIMG" {
+        return mimg_text(d);
+    }
     let mut s = mnemonic(d);
     let ops: Vec<String> = d.ienc.operands.iter().filter_map(|o| operand_text(d, o)).collect();
     if !ops.is_empty() {
@@ -680,6 +756,54 @@ mod tests {
         let d = decode(&[0xff, 0x03, 0x80, 0xbe, 0x78, 0x56, 0x34, 0x12], 0).unwrap();
         assert_eq!(d.len, 8);
         assert_eq!(format(&d), "s_mov_b32 s0, 0x12345678");
+    }
+
+    #[test]
+    fn image_operands_and_modifiers() {
+        // llvm-mc 21.1.8 (-mcpu=gfx1030) gives these lines for the words
+        for (words, text) in [
+            (&[0xf200_3f88u32, 0x0018_1008][..], "image_load v[16:19], v[8:9], s[96:103] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc slc dlc"),
+            (&[0xf003_bf08, 0xc018_1008], "image_load v[16:18], v8, s[96:103] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc r128 a16 tfe lwe d16"),
+            (&[0xf080_0008, 0x0325_1008], "image_sample v16, v[8:9], s[20:27], s[100:103] dim:SQ_RSRC_IMG_2D"),
+            (&[0xf038_0f08, 0x0018_1008], "image_get_resinfo v[16:19], v8, s[96:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            (&[0xf180_0f08, 0x0325_1008], "image_get_lod v[16:19], v[8:9], s[20:27], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            (&[0xf088_0f10, 0x0325_1008], "image_sample_d v[16:19], v[8:16], s[20:27], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            // the address registers of an NSA form, one a byte
+            (&[0xf088_0f02, 0x0018_1008, 0x0000_0a09], "image_sample_d v[16:19], [v8, v9, v10], s[96:103], s[0:3] dmask:0xf dim:SQ_RSRC_IMG_1D"),
+        ] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(dis(&bytes), text);
+        }
+    }
+
+    /// Every image instruction of LLVM's gfx10 tests reads as LLVM writes it: data and address
+    /// registers, resource, sampler, `dmask`, `dim` and the flags.
+    #[test]
+    fn llvm_gfx10_image_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut nsa, mut wrong) = (0usize, 0usize, Vec::new());
+        let mut names = std::collections::HashSet::new();
+        for file in ["gfx10_mimg.txt", "gfx1030_new.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                if !asm.starts_with("image_") {
+                    continue;
+                }
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let d = decode(&bytes, 0).unwrap();
+                assert_eq!((d.enc.name, d.len), ("ENC_MIMG", bytes.len()), "{line}");
+                let got = format(&d);
+                total += 1;
+                nsa += (bytes.len() > 8) as usize;
+                names.insert(d.inst.name);
+                if got != asm {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total > 250 && nsa > 60 && names.len() > 100, "the image tests are not all there: {total} lines, {nsa} with NSA dwords, {} instructions", names.len());
+        assert!(wrong.is_empty(), "{} of {total} image lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
