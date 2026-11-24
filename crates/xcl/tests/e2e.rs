@@ -255,7 +255,7 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
     let bin_dir = xcl.parent().unwrap();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("..").join("..").join("target").join("e2e-debug-layer");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e-debug-layer");
     let _ = std::fs::remove_dir_all(&root);
     let (game, data) = (root.join("game"), root.join("data"));
     copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
