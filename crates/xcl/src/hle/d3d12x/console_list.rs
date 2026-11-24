@@ -963,6 +963,27 @@ mod tests {
         assert_eq!(user_data_for(&l, Some(8), &args, 0x7_0000_0100), user_data(&l, &args, 0x7_0000_0100));
     }
 
+    #[test]
+    fn stack_sgprs_match_the_padded_heap_payload() {
+        let layout = layout_from_blob(&rts0(&[(4, 0), (4, 0), (1, 16)])).unwrap();
+        let addr = 0x7_0000_0100;
+        let args: Vec<u8> = (1..=80).collect();
+        for len in [0, 3, 8, 15, 80] {
+            let args = &args[..len];
+            let mut out = [u32::MAX; crate::gpu::recomp::KERNEL_SGPRS];
+            for user in [None, Some(4), Some(6), Some(8)] {
+                let mut expected = user_data_for(&layout, user, args, addr);
+                expected.resize(out.len(), 0);
+                write_user_data_for(&mut out, &layout, user, args, addr);
+                assert_eq!(out.as_slice(), expected.as_slice());
+            }
+            let mut expected = user_data_gfx(&layout, args, addr);
+            expected.resize(out.len(), 0);
+            write_user_data_gfx(&mut out, &layout, args, addr);
+            assert_eq!(out.as_slice(), expected.as_slice());
+        }
+    }
+
     /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)
     fn rts0(params: &[(u32, u32)]) -> Vec<u8> {
         let n = params.len() as u32;

@@ -112,7 +112,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
-/// Invalidate cached PC root-signature and pipeline bindings after an external PC-list reset.
+/// Invalidate cached PC root-signature and pipeline bindings after a PC-list reset or bundle execution.
 pub(super) fn invalidate_pc_bindings(list: *mut c_void) {
     if let Ok(mut g) = STATES.lock() {
         if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) {
@@ -240,6 +240,32 @@ pub(super) fn note_root_changing_signature(sig: usize) {
     ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
 }
 
+/// Call the original PC setter. bind_abi manages its own cache when it also writes u2..u5.
+unsafe fn set_pc_signature(this: *mut c_void, rs: *mut c_void, gfx: bool) {
+    let slot = if gfx { 30 } else { 29 };
+    let set: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(this, slot));
+    set(this, rs);
+}
+
+pub(super) unsafe extern "system" fn external_root_signature<const GFX: bool>(this: *mut c_void, rs: *mut c_void) {
+    set_pc_signature(this, rs, GFX);
+    if let Some(state) = STATES.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+        if GFX { state.bound_rs_gfx = 0; } else { state.bound_rs_compute = 0; }
+    }
+}
+
+unsafe fn bind_title_graphics_signature(list: &ID3D12GraphicsCommandList) {
+    let rs = with(list.as_raw(), |s| {
+        if s.rs_gfx != 0 {
+            s.bound_rs_gfx = 0;
+        }
+        s.rs_gfx
+    });
+    if rs != 0 {
+        set_pc_signature(list.as_raw(), rs as *mut c_void, true);
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -264,9 +290,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
         // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
-            list.SetGraphicsRootSignature(r);
+        if let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) {
+            bind_title_graphics_signature(list);
         }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
@@ -438,15 +463,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        let rs = with(this, |s| {
-            if s.rs_gfx != 0 {
-                s.bound_rs_gfx = 0;
-            }
-            s.rs_gfx
-        }) as *mut c_void;
-        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
-            list.SetGraphicsRootSignature(r);
-        }
+        bind_title_graphics_signature(&list);
         return Some(list);
     }
     if super::present::trace_frame() {
@@ -887,7 +904,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         .or_else(|| super::real::abi_rs_cached().map(|p| p as usize))
         .ok_or("no XCL ABI root signature")?;
     let rs_ptr = rs_raw as *mut c_void;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs_ptr).ok_or("root signature")?;
+    if rs_ptr.is_null() { return Err("root signature".into()); }
     let real_ptr = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real_ptr).ok_or("pipeline")?;
 
@@ -926,10 +943,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
 
     let io_va = super::real::uma_va_of_in(u, &windows, win_count, io_at).unwrap_or(first);
     let res_va = super::real::uma_va_of_in(u, &windows, win_count, res_at).unwrap_or(first);
+    if need_rs {
+        set_pc_signature(this, rs_ptr, gfx);
+    }
     if gfx {
-        if need_rs {
-            list.SetGraphicsRootSignature(rs);
-        }
         list.SetGraphicsRootUnorderedAccessView(0, io_va);
         list.SetGraphicsRootUnorderedAccessView(1, res_va);
         if need_rs {
@@ -938,9 +955,6 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             }
         }
     } else {
-        if need_rs {
-            list.SetComputeRootSignature(rs);
-        }
         list.SetComputeRootUnorderedAccessView(0, io_va);
         list.SetComputeRootUnorderedAccessView(1, res_va);
         if need_rs {
@@ -1381,6 +1395,123 @@ mod tests {
         });
 
         forget(list);
+    }
+
+    #[test]
+    fn translated_draw_rebinds_after_indirect_draw_and_bundle() {
+        // Capture native calls, including which root parameters are rewritten before each draw.
+        #[derive(Clone, Debug, PartialEq)]
+        enum Call { Signature(usize), Uav(u32), Pipeline(usize), Draw, Indirect, Bundle(usize) }
+        #[repr(C)]
+        struct List { vt: *const usize, calls: Mutex<Vec<Call>> }
+        unsafe fn record(this: *mut c_void, call: Call) {
+            (*this.cast::<List>()).calls.lock().unwrap().push(call);
+        }
+        unsafe extern "system" fn refcount(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn signature(this: *mut c_void, rs: *mut c_void) { record(this, Call::Signature(rs as usize)); }
+        unsafe extern "system" fn uav(this: *mut c_void, slot: u32, _: u64) { record(this, Call::Uav(slot)); }
+        unsafe extern "system" fn pipeline(this: *mut c_void, pso: *mut c_void) { record(this, Call::Pipeline(pso as usize)); }
+        unsafe extern "system" fn draw(this: *mut c_void, _: u32, _: u32, _: u32, _: u32) { record(this, Call::Draw); }
+        unsafe extern "system" fn indirect(this: *mut c_void, _: usize, _: u32, _: usize, _: u64, _: usize, _: u64) { record(this, Call::Indirect); }
+        unsafe extern "system" fn bundle(this: *mut c_void, ptr: *mut c_void) { record(this, Call::Bundle(ptr as usize)); }
+
+        let mut orig = [0usize; 64];
+        orig[1] = refcount as usize;
+        orig[2] = refcount as usize;
+        orig[12] = draw as usize;
+        orig[25] = pipeline as usize;
+        orig[27] = bundle as usize;
+        orig[29] = signature as usize;
+        orig[30] = signature as usize;
+        orig[41] = uav as usize;
+        orig[42] = uav as usize;
+        orig[59] = indirect as usize;
+        let mut ext = [0usize; 65];
+        ext[0] = orig.as_ptr() as usize;
+        ext[1..].copy_from_slice(&orig);
+        ext[1 + 29] = external_root_signature::<false> as usize;
+        ext[1 + 30] = external_root_signature::<true> as usize;
+        let list = List { vt: ext[1..].as_ptr(), calls: Mutex::new(Vec::new()) };
+        let ptr = &list as *const List as *mut c_void;
+        let take = || std::mem::take(&mut *list.calls.lock().unwrap());
+        let allocator = 0x7361_0100;
+        let gfx = 0x7361_0001;
+        let title = 0x7361_0002;
+        if real::init().is_err() || real::uma_window_vas_fast().1 == 0 {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let Some(abi) = real::abi_rs_raw(real::device_raw()) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            use Call::*;
+            let full = || vec![Signature(abi as usize), Uav(0), Uav(1), Uav(2), Uav(3), Uav(4), Uav(5)];
+            real::register_translated_graphics_for_test(gfx);
+            reset(ptr, allocator, gfx);
+            let draw_one = || draw_instanced(ptr, 3, 1, 0, 0);
+            let mut initial = full();
+            initial.extend([Pipeline(gfx), Draw]);
+            draw_one();
+            assert_eq!(take(), initial);
+            set_graphics_root_signature(ptr, title as *mut c_void);
+            for indirect in [true, false] {
+                with(ptr, |s| s.pso = 0);
+                if indirect {
+                    execute_indirect(ptr, 1, 1, 0, 0, 0, 0);
+                } else {
+                    draw_one();
+                }
+                assert_eq!(take(), [Signature(title), if indirect { Indirect } else { Draw }]);
+                with(ptr, |s| s.pso = gfx);
+                draw_one();
+                let mut expected = full();
+                expected.push(Draw);
+                assert_eq!(take(), expected);
+            }
+            // A compute bind changes the shared PSO but preserves graphics root arguments.
+            let compute = 0x7361_0003;
+            let cl = ID3D12GraphicsCommandList::from_raw_borrowed(&ptr).unwrap();
+            bind_abi(ptr, cl, compute, false).unwrap();
+            let mut expected = full();
+            expected.push(Pipeline(compute));
+            assert_eq!(take(), expected);
+            draw_one();
+            assert_eq!(take(), [Uav(0), Uav(1), Pipeline(gfx), Draw]);
+
+            cl.SetComputeRootSignature(None);
+            bind_abi(ptr, cl, compute, false).unwrap();
+            let mut expected = vec![Signature(0)];
+            expected.extend(full());
+            expected.push(Pipeline(compute));
+            assert_eq!(take(), expected);
+            cl.SetGraphicsRootSignature(None);
+            draw_one();
+            let mut expected = vec![Signature(0)];
+            expected.extend(initial.iter().cloned());
+            assert_eq!(take(), expected);
+
+            // Clearing fallback depth bias binds the base PSO directly on the native list.
+            let base = 0x7361_0004;
+            list_x::on_create(ptr, allocator, base, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            list_x::set_depth_bias_x(ptr, -1.0, 0.0, 0.0);
+            list_x::set_depth_bias_x(ptr, 0.0, 0.0, 0.0);
+            draw_one();
+            assert_eq!(take(), [Pipeline(base), Uav(0), Uav(1), Pipeline(gfx), Draw]);
+            list_x::on_release(ptr as usize);
+
+            let other = List { vt: ext[1..].as_ptr(), calls: Mutex::new(Vec::new()) };
+            let other_ptr = &other as *const List as *mut c_void;
+            real::cl_execute_bundle(ptr, other_ptr);
+            draw_one();
+            let mut expected = vec![Bundle(other_ptr as usize)];
+            expected.extend(initial);
+            assert_eq!(take(), expected);
+            real::forget_pso_for_test(gfx);
+        }
+        forget(ptr);
+        console_list::allocator_reset(allocator as *mut c_void);
     }
 
     #[test]

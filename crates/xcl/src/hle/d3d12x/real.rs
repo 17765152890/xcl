@@ -170,7 +170,9 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// `mem`, `mem1`.. of recompiled shaders. (buffer, GPU VA) per window, kept for the process
 /// lifetime.
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-/// Lock-free mirror of the first 4 UMA window GPU VAs (`u2`..`u5`), published on `open_uma`.
+/// Lock-free mirror of the first 4 UMA window GPU VAs (`u2`..`u5`), published by `open_uma` during backend initialization.
+/// The process keeps that device and these windows for its lifetime. The count publishes
+/// the addresses once, before rendering starts; live replacement would invalidate cached UAVs.
 static UMA_WINDOW_VAS_FAST: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static UMA_WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
@@ -408,7 +410,6 @@ unsafe fn open_uma(device: &ID3D12Device) {
     for (i, slot) in fast_vas.iter_mut().enumerate() {
         *slot = bufs.get(i).map_or(0, |b| b.1);
     }
-    UMA_WINDOW_COUNT.store(0, Ordering::Release);
     *UMA_BUFFER.lock().unwrap() = bufs;
     for (slot, va) in UMA_WINDOW_VAS_FAST.iter().zip(fast_vas) {
         slot.store(va, Ordering::Release);
@@ -508,6 +509,9 @@ fn graphics_wave32(device: *mut c_void) -> bool {
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
 pub fn init() -> Result<String, String> {
+    // backend() serializes production callers. Tests can also enter init() directly.
+    static INIT: Mutex<()> = Mutex::new(());
+    let _init = INIT.lock().unwrap();
     if !device_raw().is_null() {
         return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
     }
@@ -2455,6 +2459,9 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("SetPipelineState", cl_set_pipeline_state as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
+            ("SetGraphicsRootSignature", super::bind::external_root_signature::<true> as usize),
+            ("SetComputeRootSignature", super::bind::external_root_signature::<false> as usize),
+            ("ExecuteBundle", cl_execute_bundle as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
         ]),
         Kind::DmaList => v.extend_from_slice(&[
@@ -4674,6 +4681,13 @@ unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
     f(this, icount, inst, si, bv, sinst);
+}
+
+pub(super) unsafe extern "system" fn cl_execute_bundle(this: *mut c_void, bundle: *mut c_void) {
+    let native = super::title_list::backing(bundle).unwrap_or(bundle);
+    let execute: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(orig_fn(this, 27));
+    execute(this, native);
+    super::bind::invalidate_pc_bindings(this);
 }
 
 #[allow(clippy::too_many_arguments)]
