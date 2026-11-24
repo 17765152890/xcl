@@ -11,11 +11,106 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
+/// Refcounted priority inheritance for a `THREAD_PRIORITY_LOWEST` preload worker.
+/// While `count > 0` (at least one demand bind or `BIG_COMPILES` demand waiter depends on this
+/// worker), its OS thread priority is raised to `THREAD_PRIORITY_NORMAL`; dropping the last
+/// `BoostGuard` restores `THREAD_PRIORITY_LOWEST`.
+pub(crate) struct BoostToken {
+    tid: u32,
+    count: Mutex<usize>,
+}
+
+pub(crate) struct BoostGuard(Arc<BoostToken>);
+
+/// Whether preload workers can safely run at `THREAD_PRIORITY_LOWEST` and be raised back to
+/// `THREAD_PRIORITY_NORMAL` on demand. Under Wine, lowering a thread's priority maps to raising
+/// its Linux nice value (always allowed), while raising it again requires `RLIMIT_NICE` /
+/// `CAP_SYS_NICE` and fails for a normal desktop user, leaving the worker stuck at `LOWEST`.
+/// Under Wine we keep preload workers at `NORMAL` and rely on `BIG_COMPILES` admission order.
+pub(crate) fn can_lower_preload_priority() -> bool {
+    !crate::util::under_wine()
+}
+
+fn set_thread_priority_by_id(tid: u32, prio: i32) {
+    if !can_lower_preload_priority() {
+        return;
+    }
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_SET_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, tid);
+        if !h.is_null() {
+            SetThreadPriority(h, prio);
+            CloseHandle(h);
+        }
+    }
+}
+
+impl BoostToken {
+    pub(crate) fn for_current_thread() -> Arc<Self> {
+        let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        Arc::new(Self { tid, count: Mutex::new(0) })
+    }
+
+    pub(crate) fn tid(&self) -> u32 {
+        self.tid
+    }
+
+    pub(crate) fn is_boosted(&self) -> bool {
+        *self.count.lock().unwrap() > 0
+    }
+
+    /// Raise this preload worker to `THREAD_PRIORITY_NORMAL` until the returned guard drops.
+    pub(crate) fn boost(self: &Arc<Self>) -> BoostGuard {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        let mut c = self.count.lock().unwrap();
+        if *c == 0 {
+            set_thread_priority_by_id(self.tid, THREAD_PRIORITY_NORMAL);
+        }
+        *c += 1;
+        BoostGuard(self.clone())
+    }
+}
+
+impl Drop for BoostGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST;
+        let mut c = self.0.count.lock().unwrap();
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            set_thread_priority_by_id(self.0.tid, THREAD_PRIORITY_LOWEST);
+        }
+    }
+}
+
+thread_local! {
+    /// Set on `xcl-pso-pre-*` threads so `BIG_COMPILES` can detect preload holders and boost them
+    /// when a demand-bound compile arrives.
+    static CURRENT_PRELOAD: std::cell::RefCell<Option<Arc<BoostToken>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// If the current thread is a `THREAD_PRIORITY_LOWEST` preload worker, returns its boost token.
+pub(crate) fn current_preload_token() -> Option<Arc<BoostToken>> {
+    CURRENT_PRELOAD.with(|c| c.borrow().clone())
+}
+
+#[derive(Default)]
+struct PreloadOwner {
+    /// Preload worker currently building this pipeline (None when not in preload).
+    worker: Option<Arc<BoostToken>>,
+    /// True once a demand bind (`resolve` / `resolve_wait`) needs this pipeline.
+    demanded: bool,
+    /// Active boost held while `worker` is building this demanded pipeline.
+    boost: Option<BoostGuard>,
+}
+
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
+    /// priority-inheritance state if a `THREAD_PRIORITY_LOWEST` preload worker owns the build
+    preload: Mutex<PreloadOwner>,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -36,6 +131,38 @@ impl Pending {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
         }
+    }
+
+    /// A demand bind needs this pipeline: if a `THREAD_PRIORITY_LOWEST` preload worker is already
+    /// building it, raise that worker to `THREAD_PRIORITY_NORMAL` until it finishes this build.
+    fn promote_preload(&self) {
+        let boosted_now = {
+            let mut g = self.preload.lock().unwrap();
+            g.demanded = true;
+            if g.boost.is_none() {
+                if let Some(tok) = g.worker.as_ref() {
+                    g.boost = Some(tok.boost());
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if boosted_now {
+            super::real::notify_big_compiles();
+        }
+    }
+}
+
+struct PreloadJobGuard<'a>(&'a Pending);
+
+impl Drop for PreloadJobGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.preload.lock().unwrap();
+        g.worker = None;
+        g.boost = None;
     }
 }
 
@@ -129,6 +256,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
+        preload: Mutex::new(PreloadOwner::default()),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
@@ -251,10 +379,14 @@ fn preload() -> Option<&'static Preload> {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                if can_lower_preload_priority() {
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                    }
                 }
+                let tok = BoostToken::for_current_thread();
+                CURRENT_PRELOAD.with(|c| *c.borrow_mut() = Some(tok.clone()));
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
                     let p = {
@@ -273,6 +405,14 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
+                        {
+                            let mut pg = p.preload.lock().unwrap();
+                            pg.worker = Some(tok.clone());
+                            if pg.demanded && pg.boost.is_none() {
+                                pg.boost = Some(tok.boost());
+                            }
+                        }
+                        let _guard = PreloadJobGuard(&p);
                         let real = job();
                         complete(&p, real);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -344,6 +484,108 @@ mod used_tests {
         released(known);
         released(unknown);
     }
+
+    fn thread_priority_of(tid: u32) -> i32 {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetThreadPriority, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+        unsafe {
+            let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+            assert!(!h.is_null(), "OpenThread({tid}) failed");
+            let p = GetThreadPriority(h);
+            CloseHandle(h);
+            p
+        }
+    }
+
+    #[test]
+    fn boost_token_refcounts_nested_guards() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+        let check_os = can_lower_preload_priority();
+        let (tok_tx, tok_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let h = std::thread::spawn(move || {
+            if check_os {
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+            }
+            let tok = BoostToken::for_current_thread();
+            tok_tx.send(tok).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tok = tok_rx.recv().unwrap();
+        assert!(!tok.is_boosted());
+        if check_os {
+            assert_eq!(thread_priority_of(tok.tid()), THREAD_PRIORITY_LOWEST);
+        }
+        let g1 = tok.boost();
+        assert!(tok.is_boosted());
+        if check_os {
+            assert_eq!(thread_priority_of(tok.tid()), THREAD_PRIORITY_NORMAL);
+        }
+        let g2 = tok.boost();
+        assert!(tok.is_boosted());
+        if check_os {
+            assert_eq!(thread_priority_of(tok.tid()), THREAD_PRIORITY_NORMAL);
+        }
+        drop(g1);
+        assert!(tok.is_boosted(), "still boosted while second guard lives");
+        if check_os {
+            assert_eq!(thread_priority_of(tok.tid()), THREAD_PRIORITY_NORMAL, "still boosted while second guard lives");
+        }
+        drop(g2);
+        assert!(!tok.is_boosted(), "unboosted once last guard drops");
+        if check_os {
+            assert_eq!(thread_priority_of(tok.tid()), THREAD_PRIORITY_LOWEST, "restored once last guard drops");
+        }
+        let _ = done_tx.send(());
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn resolve_wait_boosts_preload_worker_priority_and_restores_it() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+        let check_os = can_lower_preload_priority();
+        let (standin, key) = (0x7E57_7011usize, 0x5EED_0011u64);
+        used::earlier_run_used(key);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        submit_lazy(
+            standin,
+            true,
+            Box::new(move || {
+                let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+                let tok = current_preload_token().expect("preload job must run on a preload worker");
+                let before = unsafe { GetThreadPriority(GetCurrentThread()) };
+                started_tx.send((tid, before, tok.clone())).unwrap();
+                let _ = go_rx.recv();
+                assert!(tok.is_boosted(), "preload worker must be marked boosted while resolve_wait waits");
+                let during = unsafe { GetThreadPriority(GetCurrentThread()) };
+                assert_eq!(during, THREAD_PRIORITY_NORMAL, "preload worker must run at NORMAL while resolve_wait waits");
+                0x5678
+            }),
+            key,
+        );
+        let (worker_tid, before_prio, worker_tok) = started_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let expected_base = if check_os { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_NORMAL };
+        assert_eq!(before_prio, expected_base, "unexpected initial preload worker priority");
+
+        // Call resolve_wait from another thread while the preload worker is mid-build
+        let waiter = std::thread::spawn(move || resolve_wait(standin));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker_tok.is_boosted() || (check_os && thread_priority_of(worker_tid) != THREAD_PRIORITY_NORMAL) {
+            assert!(std::time::Instant::now() < deadline, "preload worker was not boosted to NORMAL");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        go_tx.send(()).unwrap();
+        assert_eq!(waiter.join().unwrap(), 0x5678);
+
+        // Once the preload job finishes, PreloadJobGuard drops and restores the base priority
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker_tok.is_boosted() || (check_os && thread_priority_of(worker_tid) != THREAD_PRIORITY_LOWEST) {
+            assert!(std::time::Instant::now() < deadline, "preload worker boost was not released after job completion");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        released(standin);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -356,7 +598,9 @@ pub fn resolve(pso: usize) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy one is wanted now: to the workers
+            // a lazy one is wanted now: to the workers (and boost if a low-priority preload
+            // worker already picked it up)
+            p.promote_preload();
             if !p.sent.swap(true, Ordering::AcqRel) {
                 let _ = queue().lock().unwrap().send(p);
             }
@@ -382,6 +626,10 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         complete(&p, job());
+    } else {
+        // another worker owns the build; if it is a low-priority preload thread, raise its
+        // priority so the caller does not stall behind THREAD_PRIORITY_LOWEST
+        p.promote_preload();
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -413,6 +661,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if *p.done.lock().unwrap() {
         return built(p);
     }
+    p.promote_preload();
     if !p.sent.swap(true, Ordering::AcqRel) {
         let _ = queue().lock().unwrap().send(p.clone());
     }
