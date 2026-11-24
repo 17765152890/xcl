@@ -3,10 +3,10 @@
 //! that D3D12 can open as heaps (`ID3D12Device3::OpenExistingHeapFromAddress`), so the GPU
 //! works on them directly.
 //!
-//! A heap is smaller than 4 GiB, so the memory is up to 4 *windows*: window k is one region
-//! at `base + k · 4 GiB` with `base` 16 GiB-aligned. The window of a console GPU address is
-//! then `(address >> 32) & 3` and its low 32 bits are the offset in that window's heap – the
-//! recompiler's `mem` (window 0), `mem1` … buffers. Allocations never straddle windows.
+//! A heap is smaller than 4 GiB, so memory is split into windows at `base + k · 4 GiB`.
+//! The aperture has 4 windows by default and can grow to 8 or 16 with heap-backed shaders.
+//! The base is aligned to the aperture size, so the shader takes the window index from the
+//! high dword of the address and the byte offset from its low dword.
 //!
 //! Measured on Windows 11 + RX 9070 (2026-11-20): the heap must cover a fully committed
 //! `VirtualAlloc` allocation (a reservation with partial commit is rejected); up to
@@ -26,7 +26,30 @@ pub const GRAIN: usize = 0x1_0000;
 pub const MAX_SIZE: usize = (4096 << 20) - GRAIN;
 /// distance between windows
 pub const WINDOW: usize = 1 << 32;
+/// The legacy layout and the number of memory UAVs in the ABI root signature.
 pub const MAX_WINDOWS: usize = 4;
+/// Maximum number of windows addressable through the shared descriptor heap.
+pub const MAX_HEAP_WINDOWS: usize = 16;
+
+/// Exclusive upper bound for candidate window indices.
+fn slot_limit(windows: usize) -> usize {
+    // Larger layouts stay below the title's 40-bit GPU address limit.
+    if windows > MAX_WINDOWS { 1 << (40 - 32) } else { 512 }
+}
+
+pub(crate) fn configured_runtime_windows() -> usize {
+    let Ok(value) = std::env::var("XCL_UMA_WINDOWS") else { return MAX_WINDOWS };
+    let windows = value.parse::<usize>().unwrap_or(0);
+    if !matches!(windows, MAX_WINDOWS | 8 | MAX_HEAP_WINDOWS) {
+        crate::xlog_warn!("UMA: XCL_UMA_WINDOWS must be 4, 8, or 16. Using {MAX_WINDOWS}");
+        return MAX_WINDOWS;
+    }
+    if windows > MAX_WINDOWS && !crate::gpu::recomp::pso::heap_windows() {
+        crate::xlog_warn!("UMA: {windows} windows require heap-backed shaders. Using {MAX_WINDOWS}");
+        return MAX_WINDOWS;
+    }
+    windows
+}
 
 /// bytes of sparse window 0 only 32-bit descriptor heaps get (`Uma::desc_range`)
 const DESC_HEADROOM: usize = 512 << 20;
@@ -174,7 +197,7 @@ impl Uma {
         let committed = ((size.min(coherent.max(RUNTIME_COMMITTED_CAP)) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
         let coherent_index = windows - 1;
         let sparse_len = coherent_index * WINDOW;
-        for slot in (windows..512).step_by(windows) {
+        for slot in (windows..slot_limit(windows)).step_by(windows) {
             let base = slot << 32;
             let sp = unsafe { VirtualAlloc(base as *const std::ffi::c_void, sparse_len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) };
             if sp as usize != base {
@@ -380,8 +403,9 @@ impl Uma {
     /// `windows` committed windows of `size` bytes each.
     pub fn with_windows(windows: usize, size: usize) -> Option<Uma> {
         let size = ((size + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
-        let windows = windows.clamp(1, MAX_WINDOWS);
-        for slot in (4usize..512).step_by(MAX_WINDOWS) {
+        let windows = windows.clamp(1, MAX_HEAP_WINDOWS);
+        let aperture = windows.next_power_of_two().max(MAX_WINDOWS);
+        for slot in (aperture..slot_limit(aperture)).step_by(aperture) {
             let base = slot << 32;
             let mut got = Vec::new();
             for k in 0..windows {
@@ -395,7 +419,7 @@ impl Uma {
             }
             if got.len() == windows {
                 let mut inner = Inner::default();
-                let mut kinds = vec![WindowKind::None; MAX_WINDOWS];
+                let mut kinds = vec![WindowKind::None; aperture];
                 let mut win_allocs = Vec::with_capacity(windows + 1);
                 for k in 0..windows {
                     inner.free.insert(k * WINDOW, size);
@@ -741,7 +765,16 @@ pub fn get() -> Option<&'static Uma> {
         .get_or_init(|| {
             let mb = std::env::var("XCL_UMA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
             let coherent = coherent_hint();
-            let u = Uma::for_runtime_with((mb << 20).max(coherent), coherent);
+            let size = (mb << 20).max(coherent);
+            let windows = configured_runtime_windows();
+            let u = if windows > MAX_WINDOWS {
+                Uma::reserve_runtime(size, coherent, windows).or_else(|| {
+                    crate::xlog_warn!("UMA: could not reserve {windows} windows. Using the default layout");
+                    Uma::for_runtime_with(size, coherent)
+                })
+            } else {
+                Uma::for_runtime_with(size, coherent)
+            };
             match &u {
                 Some(u) => {
                     let sparse_n = u.kinds.iter().filter(|w| matches!(w, WindowKind::Sparse)).count();
@@ -763,6 +796,29 @@ pub fn get() -> Option<&'static Uma> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_runtime_windows_hold_large_sparse_reservations() {
+        let size = 24usize << 30;
+        let legacy = Uma::for_runtime(GRAIN).unwrap();
+        assert!(legacy.sparse_reserve(size).is_none());
+        drop(legacy);
+
+        for windows in [8, MAX_HEAP_WINDOWS] {
+            let u = Uma::reserve_runtime(GRAIN, GRAIN, windows).unwrap();
+            let last = windows - 1;
+            assert_eq!(u.shader_windows(), windows);
+            assert_eq!(u.base() % (windows * WINDOW), 0);
+            assert!(u.base() + windows * WINDOW <= 1 << 40);
+            assert_eq!(u.committed_window(), Some(last));
+            assert_eq!(u.watch_regions(), vec![(u.base(), last * WINDOW), (u.window(last).0, GRAIN)]);
+
+            let p = u.sparse_reserve(size).unwrap();
+            assert_eq!(u.window_of(p), Some(1));
+            assert_eq!(u.window_of(p + size - 1), Some(6));
+            assert_eq!(u.sparse_alloc_in(0, GRAIN, GRAIN), Some((u.base() + GRAIN, GRAIN)));
+        }
+    }
 
     /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
     /// back to it when freed.

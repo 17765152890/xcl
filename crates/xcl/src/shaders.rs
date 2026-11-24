@@ -716,8 +716,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
         // the runtime's key: heap windows unless `XCL_HEAP_WINDOWS=0` (`pso::mem_windows`)
-        let windows = opt("--windows").unwrap_or(4) as u32;
-        let windows = if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows };
+        let windows = opt("--windows").unwrap_or_else(crate::gpu::uma::configured_runtime_windows);
+        let heap = windows > 1 && recomp::pso::heap_windows();
+        if windows == 0 || !recomp::valid_window_count(windows, heap) {
+            eprintln!("--windows expects 1 through 4, or 8 or 16 with heap-backed shaders enabled");
+            return 2;
+        }
+        let windows = if heap { windows as u32 | recomp::HEAP_WINDOWS } else { windows as u32 };
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
@@ -730,7 +735,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// wait for DXC on first use. Resumable: cached programs are skipped. GS halves need their
 /// pipeline partner and are left to the runtime.
 /// The cache key is the HLSL, so the options are the runtime's: `windows` memory windows as a
-/// title's unified memory has (`pso::mem_windows`, 4; `--windows 1` for a title without it),
+/// title's unified memory has (`XCL_UMA_WINDOWS`, default 4, or `--windows` to override),
 /// and the split wave64 form when this machine's GPU (`XCL_ADAPTER`) runs only 32-lane waves
 /// (`pso::wave32_only_for_device`). Before, the programs were translated with one window and
 /// no split form, so a title asked for other HLSL and compiled everything again. Still

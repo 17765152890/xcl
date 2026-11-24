@@ -1533,7 +1533,8 @@ impl Em {
     /// whose high dword (bits 32..63) is `hi` (`xcl_w`, read by the `mem` accessors).
     fn window(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
-            self.line(&format!("xcl_w = ({hi}) & 3u;"));
+            let mask = self.opt.mem_windows.next_power_of_two().max(crate::gpu::uma::MAX_WINDOWS as u32) - 1;
+            self.line(&format!("xcl_w = ({hi}) & {mask}u;"));
         }
     }
 
@@ -4083,10 +4084,10 @@ impl Em {
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
         let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-        let windows = self.opt.mem_windows.clamp(1, 4);
+        let windows = self.opt.mem_windows.max(1);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
-            for k in 1..windows {
+            for k in 1..windows.min(crate::gpu::uma::MAX_WINDOWS as u32) {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
             h.push_str("static uint xcl_w = 0u;\n");

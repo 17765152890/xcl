@@ -290,12 +290,18 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
-unsafe fn open_uma(device: &ID3D12Device) {
+unsafe fn open_uma(device: &ID3D12Device) -> Result<(), String> {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
-        return;
+        return Ok(());
     };
-    let open = |k: usize| -> Result<(usize, u64, usize), String> {
+    let n = u.shader_windows();
+    let expanded = n > crate::gpu::uma::MAX_WINDOWS;
+    let heap_windows = crate::gpu::recomp::pso::heap_windows();
+    if expanded && (!heap_windows || !super::console_heap::shared_heap(device)) {
+        return Err("expanded UMA needs a shared descriptor heap. Set XCL_UMA_WINDOWS=4 to use the legacy layout".into());
+    }
+    let open = |k: usize| -> Result<(ID3D12Resource, u64, ID3D12Heap), String> {
         let (base, size) = u.window(k);
         let dev3: ID3D12Device3 = device.cast().map_err(|e| format!("ID3D12Device3: {e}"))?;
         let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress (window {k}): {e}"))?;
@@ -314,24 +320,28 @@ unsafe fn open_uma(device: &ID3D12Device) {
         device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
         let buf = buf.ok_or("CreatePlacedResource")?;
         let va = buf.GetGPUVirtualAddress();
-        Ok((buf.into_raw() as usize, va, heap.into_raw() as usize))
+        Ok((buf, va, heap))
     };
-    let n = u.shader_windows();
     let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
     let mut heaps: Vec<Option<usize>> = vec![None; n];
+    let mut backing = Vec::new();
     for k in 0..n {
         if !u.is_committed_window(k) {
             continue;
         }
         match open(k) {
-            Ok((buf_raw, va, heap_raw)) => {
-                bufs[k] = (buf_raw, va);
-                heaps[k] = Some(heap_raw);
+            Ok((buf, va, heap)) => {
+                bufs[k] = (buf.as_raw() as usize, va);
+                heaps[k] = Some(heap.as_raw() as usize);
+                backing.push((buf, heap));
             }
             Err(e) => {
                 crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
+                if expanded {
+                    return Err(e);
+                }
                 *UMA_ERROR.lock().unwrap() = e;
-                return;
+                return Ok(());
             }
         }
     }
@@ -342,6 +352,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
     };
     match &check {
         Ok(s) => crate::xlog_info!("D3D12.X: UMA import check: {s}"),
+        Err(e) if expanded => return Err(format!("expanded UMA import check failed: {e}")),
         Err(e) => crate::xlog_error!("D3D12.X: UMA import check: {e}"),
     }
     *UMA_IMPORT_CHECK.lock().unwrap() = check.unwrap_or_else(|e| e);
@@ -351,6 +362,9 @@ unsafe fn open_uma(device: &ID3D12Device) {
             *slot = (*buf_raw, *va);
         }
     }
+    if expanded && bufs.iter().any(|&(buf, va)| buf == 0 || va == 0) {
+        return Err(format!("the GPU could not open all {n} UMA windows. Set XCL_UMA_WINDOWS=4 to use the legacy layout"));
+    }
     let w0_va = bufs.first().map_or(0, |b| b.1);
     crate::xlog_info!(
         "D3D12.X: UMA opened ({} sparse VRAM window(s), {} MB coherent window), window 0 buffer at VA {:#x}",
@@ -358,15 +372,23 @@ unsafe fn open_uma(device: &ID3D12Device) {
         u.size() >> 20,
         w0_va
     );
-    *UMA_HEAPS.lock().unwrap() = heaps;
     // shaders take the windows from the shared descriptor heap (`pso::heap_windows`)
-    if n > 1 && crate::gpu::recomp::pso::heap_windows() {
+    if n > 1 && heap_windows {
         let views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
         if super::console_heap::set_window_views(device, &views) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
+        } else if expanded {
+            return Err("could not bind the expanded UMA layout. Set XCL_UMA_WINDOWS=4 to use the legacy layout".into());
         }
     }
+    // The published coherent buffers and their heaps stay alive for the process lifetime.
+    for (buf, heap) in backing {
+        let _ = buf.into_raw();
+        let _ = heap.into_raw();
+    }
+    *UMA_HEAPS.lock().unwrap() = heaps;
     *UMA_BUFFER.lock().unwrap() = bufs;
+    Ok(())
 }
 
 pub fn stats() -> D3d12Stats {
@@ -538,7 +560,7 @@ pub fn init() -> Result<String, String> {
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
             }
         }
-        open_uma(&device);
+        open_uma(&device)?;
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
@@ -3215,6 +3237,13 @@ fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     HEAP_WINDOW_OOM.with(|o| o.set(false));
     let r = build();
     if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
+        return r;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.shader_windows() > crate::gpu::uma::MAX_WINDOWS) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            crate::xlog_warn!("D3D12.X: the driver refused an expanded-window pipeline. Set XCL_UMA_WINDOWS=4 to allow switch-form retries");
+        });
         return r;
     }
     let n = SWITCH_FORM_RETRIES.fetch_add(1, Ordering::Relaxed);

@@ -489,7 +489,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             return Vec::new();
         }
         let Some(r) = r else { return Vec::new() };
-        out.push((k, r.clone().into_raw() as usize, r.GetGPUVirtualAddress()));
+        out.push((k, r.as_raw() as usize, r.GetGPUVirtualAddress()));
         windows.push((base, r));
     }
     if out.is_empty() {
@@ -545,6 +545,10 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     })();
     match made {
         Ok(s) => {
+            // UMA_BUFFER owns a reference to each window independently of this state.
+            for (_, r) in &s.windows {
+                let _ = r.clone().into_raw();
+            }
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)

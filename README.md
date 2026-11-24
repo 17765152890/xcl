@@ -113,6 +113,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
   can still differ there. Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **Title memory:** `XCL_UMA_WINDOWS=8` or `16` opts into a larger GPU-visible address range
+  for large title allocations. It requires the shared descriptor heap and heap-backed shaders.
+  The default is `4`, which supports the root-UAV fallback when the driver refuses a heap-backed
+  pipeline. `xcl shaders --precompile` reads the same setting.
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe

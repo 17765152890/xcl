@@ -3183,29 +3183,54 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
-    memory_windows_above_4_gib(false);
+    memory_windows_above_4_gib(2, false);
 }
 
 /// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
 /// same results, and no `switch` over windows in the HLSL.
 #[test]
 fn gpu_memory_windows_from_the_heap() {
-    memory_windows_above_4_gib(true);
+    memory_windows_above_4_gib(2, true);
 }
 
-fn memory_windows_above_4_gib(heap: bool) {
+#[test]
+fn gpu_memory_windows_beyond_the_root_uavs() {
+    memory_windows_above_4_gib(16, true);
+}
+
+#[test]
+fn expanded_heap_window_shaders_use_the_full_window_index() {
+    let p = prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0)], None)]);
+    let dxc = super::dxc::location().is_ok();
+    if !dxc {
+        runner::skip_test("no DXC");
+    }
+    for windows in [8, 16] {
+        let t = translate(&p, &Options { mem_windows: windows | super::HEAP_WINDOWS, ..Default::default() }).unwrap();
+        assert!(t.hlsl.contains(&format!(") & {}u;", windows - 1)));
+        assert!(t.hlsl.contains(&format!("xcl_w < {windows}u")));
+        assert!(!t.hlsl.contains("register(u6)"));
+        assert!(translate(&p, &Options { mem_windows: windows, ..Default::default() }).is_err());
+        if dxc {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        }
+    }
+}
+
+fn memory_windows_above_4_gib(windows: usize, heap: bool) {
     if !gpu_ready() {
         return;
     }
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
-    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
-    assert_eq!(w1 - w0, 1 << 32);
+    let arena = crate::gpu::uma::Uma::with_windows(windows, 1 << 20).unwrap();
+    let k = windows - 1;
+    let (w0, target) = (arena.window(0).0 as u64, arena.window(k).0 as u64);
+    assert_eq!(target - w0, (k as u64) << 32);
     let word = |a: u64| unsafe { &mut *(a as *mut u32) };
-    *word(w1 + 0x1000) = 0xC0FFEE;
-    *word(w1 + 0x1004) = 0x1234;
+    *word(target + 0x1000) = 0xC0FFEE;
+    *word(target + 0x1004) = 0x1234;
     for l in 0..64u64 {
-        *word(w1 + 0x2000 + 4 * l) = 1000 + l as u32;
-        *word(w1 + 0x4000 + 4 * l) = 5000 + l as u32;
+        *word(target + 0x2000 + 4 * l) = 1000 + l as u32;
+        *word(target + 0x4000 + 4 * l) = 5000 + l as u32;
         *word(w0 + 0x4000 + 4 * l) = 9; // same low address in window 0: must not be read
     }
     let glbl = |n: &'static str, f: &[(&str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
@@ -3224,38 +3249,38 @@ fn memory_windows_above_4_gib(heap: bool) {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: windows as u32, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
     assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + (xcl_w"), heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
-    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
-    st.sgpr[8..12].copy_from_slice(&[(w1 + 0x2000) as u32, hi(w1) & 0xFFFF | 4 << 16, 64, 0]);
+    st.sgpr[2..4].copy_from_slice(&[(target + 0x1000) as u32, hi(target)]);
+    st.sgpr[8..12].copy_from_slice(&[(target + 0x2000) as u32, hi(target) & 0xFFFF | 4 << 16, 64, 0]);
     st.sgpr[12..16].copy_from_slice(&[(w0 + 0x3000) as u32, hi(w0) & 0xFFFF | 4 << 16, 64, 0]);
-    st.sgpr[16..18].copy_from_slice(&[(w1 + 0x6000) as u32, hi(w1)]);
+    st.sgpr[16..18].copy_from_slice(&[(target + 0x6000) as u32, hi(target)]);
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let l = l as u64;
         r[0] = l as u32;
         r[2] = 7 * l as u32;
         r[3] = 0; // atomic offset: all lanes on one counter
-        r[4] = (w1 + 0x4000 + 4 * l) as u32;
-        r[5] = hi(w1);
-        r[8] = (w1 + 0x5000 + 4 * l) as u32;
-        r[9] = hi(w1);
+        r[4] = (target + 0x4000 + 4 * l) as u32;
+        r[5] = hi(target);
+        r[8] = (target + 0x5000 + 4 * l) as u32;
+        r[9] = hi(target);
         r[11] = 1;
     }
     let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
-    assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window 1");
-    assert_eq!(r.sgpr[24..28], [1001, 1002, 1003, 1004], "s_buffer_load_dwordx4 from window 1");
+    assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window {k}");
+    assert_eq!(r.sgpr[24..28], [1001, 1002, 1003, 1004], "s_buffer_load_dwordx4 from window {k}");
     for l in 0..64u64 {
-        assert_eq!(r.vgpr[l as usize][1], 1000 + l as u32, "lane {l}: buffer_load from window 1");
-        assert_eq!(r.vgpr[l as usize][6], 5000 + l as u32, "lane {l}: global_load from window 1");
+        assert_eq!(r.vgpr[l as usize][1], 1000 + l as u32, "lane {l}: buffer_load from window {k}");
+        assert_eq!(r.vgpr[l as usize][6], 5000 + l as u32, "lane {l}: global_load from window {k}");
         assert_eq!(*word(w0 + 0x3000 + 4 * l), 7 * l as u32, "lane {l}: buffer_store into window 0");
-        assert_eq!(*word(w1 + 0x5000 + 4 * l), 7 * l as u32, "lane {l}: global_store into window 1");
+        assert_eq!(*word(target + 0x5000 + 4 * l), 7 * l as u32, "lane {l}: global_store into window {k}");
     }
-    assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add in window 1");
+    assert_eq!(*word(target + 0x6000), 64, "global_atomic_add in window {k}");
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
 }
 

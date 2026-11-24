@@ -159,7 +159,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             heap,
             cap,
             // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32,
+            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
         });
     }
@@ -176,17 +176,18 @@ pub fn window_views_failed() -> bool {
 
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
-/// A window without a buffer gets window 0's. False (and the shaders keep the switch): no
-/// shared heap.
+/// The legacy layout fills missing slots with window 0. The expanded layout needs every window.
 pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
-    let ok = !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
+    let count = windows.len().max(crate::gpu::uma::MAX_WINDOWS);
+    let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|w| w.0 != 0);
+    let ok = count <= crate::gpu::uma::MAX_HEAP_WINDOWS && complete && windows.first().is_some_and(|w| w.0 != 0) && shared_heap(dev) && {
         let (device, cpu, inc) = {
             let g = GLOBAL.lock().unwrap();
             let s = g.as_ref().unwrap();
             (s.dev.clone(), s.cpu, s.inc)
         };
         // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
-        for k in 0..crate::gpu::uma::MAX_WINDOWS {
+        for k in 0..count {
             let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
             let raw = raw as *mut std::ffi::c_void;
             let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
@@ -197,7 +198,7 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
     };
     if !ok {
         WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::xlog_warn!("memory windows: not in the shared descriptor heap – translated shaders switch over the windows' root UAVs");
+        crate::xlog_warn!("memory windows: could not bind the windows in the shared descriptor heap");
     }
     ok
 }
@@ -557,14 +558,16 @@ mod tests {
         use std::ffi::c_void;
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static UNLOCKED: AtomicBool = AtomicBool::new(true);
+        static CONSECUTIVE: AtomicBool = AtomicBool::new(true);
         static CALLS: AtomicU32 = AtomicU32::new(0);
         #[repr(C)]
         struct Object { vt: *const usize }
         unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
-        unsafe extern "system" fn create_uav(_this: *mut c_void, _resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, _at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        unsafe extern "system" fn create_uav(_this: *mut c_void, _resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // The adopted device hook can re-enter descriptor bookkeeping.
             UNLOCKED.fetch_and(GLOBAL.try_lock().is_ok(), Ordering::Relaxed);
-            CALLS.fetch_add(1, Ordering::Relaxed);
+            let k = CALLS.fetch_add(1, Ordering::Relaxed) + crate::gpu::recomp::MEM_HEAP_BASE;
+            CONSECUTIVE.fetch_and(at.ptr == 0x1000 + k as usize * 32, Ordering::Relaxed);
         }
         let mut vt = [0usize; 20];
         vt[1] = retain as usize;
@@ -579,10 +582,18 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::uma::MAX_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
             });
-            assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)]));
-            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            let window = (&mut resource as *mut _ as usize, 0x10000);
+            assert!(set_window_views(&dev, &[window]));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            let mut windows = [window; crate::gpu::uma::MAX_HEAP_WINDOWS];
+            assert!(set_window_views(&dev, &windows));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            windows[7] = (0, 0);
+            assert!(!set_window_views(&dev, &windows));
+            assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+            assert!(CONSECUTIVE.load(Ordering::Relaxed), "window descriptors must start at MEM_HEAP_BASE");
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
             *GLOBAL.lock().unwrap() = None;
         }
