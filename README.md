@@ -117,6 +117,9 @@ xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compi
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+- `xcl rpf` scans plain-name RPF9 records without decrypting the table of contents;
+  even a compact final record needs no trailing padding.
+
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
