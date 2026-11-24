@@ -292,8 +292,9 @@ impl Pages {
             SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
-            // every kind of texture (resource heap tier 2: the only flags for both)
-            Flags: D3D12_HEAP_FLAG_NONE,
+            // The pool maps every kind of texture. Excluding buffers lets the driver select
+            // memory types that support tiled textures even when they cannot back tiled buffers.
+            Flags: D3D12_HEAP_FLAG_DENY_BUFFERS,
         };
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
@@ -718,6 +719,32 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    #[test]
+    fn tiled_texture_pool_allows_both_texture_classes_and_denies_buffers() {
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(tier2) else {
+                skip_test("no D3D12 resource heap tier 2 device");
+                return;
+            };
+            let Some(mut pages) = Pages::new(&dev) else {
+                skip_test("no tiled resource support");
+                return;
+            };
+            let (heap, _) = pages.take_tile(&dev).expect("allocate a tiled texture pool");
+            let flags = pages.pools[heap as usize].GetDesc().Flags;
+            let resource_flags = D3D12_HEAP_FLAG_DENY_BUFFERS
+                | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES
+                | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+            assert_eq!(flags & resource_flags, D3D12_HEAP_FLAG_DENY_BUFFERS);
+        }
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
