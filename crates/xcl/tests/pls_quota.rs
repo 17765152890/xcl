@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_PATH_NOT_FOUND};
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::Globalization::GetOEMCP;
 use windows_sys::Win32::Storage::FileSystem::{
     AreFileApisANSI, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW, SetFileApisToANSI, SetFileApisToOEM,
@@ -67,11 +67,19 @@ fn disk_free_space_ex_reports_pls_quota() {
         .collect();
     xcl::vfs::init(xcl::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts));
     xcl::state::set_boot(boot);
-    xcl::vfs_hooks::install().unwrap();
 
     let host = wide(&pls.to_string_lossy());
+    let host_missing = wide(&pls.join("missing").to_string_lossy());
     let (mut available, mut total, mut free) = (0, 0, 0);
     unsafe {
+        SetLastError(0);
+        let result =
+            GetDiskFreeSpaceExW(host_missing.as_ptr(), &mut available, &mut total, &mut free);
+        let host_missing_error = GetLastError();
+        assert_eq!(result, 0);
+        assert_ne!(host_missing_error, 0);
+
+        xcl::vfs_hooks::install().unwrap();
         SetLastError(9123);
         let result = GetDiskFreeSpaceExW(host.as_ptr(), &mut available, &mut total, &mut free);
         let host_last_error = GetLastError();
@@ -141,7 +149,7 @@ fn disk_free_space_ex_reports_pls_quota() {
         SetLastError(0);
         let result = GetDiskFreeSpaceExW(missing.as_ptr(), &mut available, &mut total, &mut free);
         let error = GetLastError();
-        assert_eq!((result, error), (0, ERROR_PATH_NOT_FOUND));
+        assert_eq!((result, error), (0, host_missing_error));
         assert_eq!((available, total, free), (MIB - 579, host_total, MIB - 579));
 
         fs::File::create(pls.join("fills-quota.bin"))
