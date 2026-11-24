@@ -573,9 +573,34 @@ impl State {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
     }
 
+    /// Put `heap` back into service as pool `h`: every tile but 0 goes on the free list,
+    /// tile 0 is returned to the caller.
+    fn adopt_heap(&mut self, heap: ID3D12Heap) -> (u32, u32) {
+        let h = match self.pools.iter().position(|p| p.is_none()) {
+            Some(i) => {
+                self.pools[i] = Some(heap);
+                i as u32
+            }
+            None => {
+                self.pools.push(Some(heap));
+                self.pools.len() as u32 - 1
+            }
+        };
+        self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
+        (h, 0)
+    }
+
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
         if let Some(t) = self.free.pop() {
             return Some((t, true));
+        }
+        // A retired pool whose unmap fence has completed can serve again; without this
+        // an alloc/free cycle inside the 2 s retire window mints a fresh 64 MiB heap
+        // every time.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        if let Some(i) = self.retired.iter().position(|(_, v, _)| done >= *v) {
+            let (heap, _, _) = self.retired.remove(i);
+            return Some((self.adopt_heap(heap), false));
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
@@ -589,18 +614,7 @@ impl State {
             return None;
         }
         let heap = heap?;
-        let h = match self.pools.iter().position(|p| p.is_none()) {
-            Some(i) => {
-                self.pools[i] = Some(heap);
-                i as u32
-            }
-            None => {
-                self.pools.push(Some(heap));
-                self.pools.len() as u32 - 1
-            }
-        };
-        self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
-        Some(((h, 0), false))
+        Some((self.adopt_heap(heap), false))
     }
 
     /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
