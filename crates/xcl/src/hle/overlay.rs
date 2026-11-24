@@ -113,11 +113,17 @@ pub fn glyph(c: u8) -> [u8; 7] {
 }
 
 /// The panel as pixels for a texture of `format` (the back buffer's swap format): `w` x `h`,
-/// tightly packed rows, a dark opaque background and green text at 2x scale. `None` while
+/// rows padded to a 256-byte pitch (`D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`: the placed-footprint
+/// copy needs it), a dark opaque background and green text at 2x scale. `None` while
 /// there is nothing to show yet.
 pub fn panel(format: i32) -> Option<(u32, u32, Vec<u8>)> {
-    use windows::Win32::Graphics::Dxgi::Common::*;
     let texts = text();
+    render_panel(&texts, format)
+}
+
+/// `panel` over given lines (the testable part: layout and pixels, no sampling).
+fn render_panel(texts: &[String], format: i32) -> Option<(u32, u32, Vec<u8>)> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
     if texts.is_empty() {
         return None;
     }
@@ -160,7 +166,14 @@ pub fn panel(format: i32) -> Option<(u32, u32, Vec<u8>)> {
             [c[0], c[1], c[2], 0xFF]
         })
         .collect();
-    Some((w, h, px))
+    // rows at a 256-byte pitch: the copy's placed footprint requires the alignment; the
+    // padding stays transparent (alpha 0) and is outside the copied box anyway
+    let pitch = (w * 4).div_ceil(256) * 256;
+    let mut out = vec![0u8; (pitch * h) as usize];
+    for y in 0..h as usize {
+        out[y * pitch as usize..y * pitch as usize + (w * 4) as usize].copy_from_slice(&px[y * (w * 4) as usize..(y + 1) * (w * 4) as usize]);
+    }
+    Some((w, h, out))
 }
 
 #[cfg(test)]
@@ -222,5 +235,32 @@ mod tests {
         }
         assert_eq!(glyph(b' '), [0; 7]);
         assert!(panel(DXGI_FORMAT_R10G10B10A2_UNORM.0).is_none(), "10-bit: no overlay");
+    }
+
+    /// The panel's rows are at a 256-byte pitch (the placed-footprint copy's requirement):
+    /// the pixels sit at the start of each padded row, the padding is transparent, and the
+    /// background/text colors are the format's.
+    #[test]
+    fn panel_rows_are_at_a_256_byte_pitch() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let lines = [" 30.0 FPS  33.3 MS".to_string(), "COMMIT 1234 MB".to_string()];
+        let (w, h, px) = render_panel(&lines, DXGI_FORMAT_R8G8B8A8_UNORM.0).unwrap();
+        let pitch = (w * 4).div_ceil(256) * 256;
+        assert_eq!(px.len(), (pitch * h) as usize, "one padded row per line of pixels");
+        assert!(pitch % 256 == 0);
+        for y in 0..h as usize {
+            let row = &px[y * pitch as usize..(y + 1) * pitch as usize];
+            // first pixel of the panel: opaque background, RGBA order
+            assert_eq!(&row[..4], &[0x10, 0x18, 0x20, 0xFF], "row {y} starts at the pitch");
+            // the padding after the panel's width is transparent zeros
+            assert!(row[(w * 4) as usize..].iter().all(|&b| b == 0), "row {y} padding");
+        }
+        // some pixel is the green text (the digits are drawn)
+        assert!(px.chunks_exact(4).any(|p| p == [0x70, 0xE0, 0x40, 0xFF]), "text pixels present");
+        // a width already a multiple of 64 texels needs no padding beyond itself (cols 52: w 640)
+        let wide = render_panel(&["0".repeat(52)], DXGI_FORMAT_B8G8R8A8_UNORM.0).unwrap();
+        assert_eq!(wide.0, 640);
+        assert_eq!(wide.0 * 4 % 256, 0);
+        assert_eq!(wide.2.len(), (wide.0 * 4 * wide.1) as usize);
     }
 }
