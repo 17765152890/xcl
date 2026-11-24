@@ -23,17 +23,19 @@ struct Pending {
     compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
-    /// it was used (`used::note` is told once)
-    used: std::sync::atomic::AtomicBool,
+    /// of the whole descriptor in the pipeline journal; 0 = not recorded
+    journal: u64,
+    used: std::sync::Once,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
 }
 
 impl Pending {
     fn note_use(&self) {
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        self.used.call_once(|| {
+            super::pso_journal::used(self.journal);
             used::note(self.key);
-        }
+        });
     }
 }
 
@@ -104,7 +106,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, None, 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -120,10 +122,12 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, Some(key), 0);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+pub(super) fn submit_as(standin: usize, compute: bool, job: Job, lazy_key: Option<u64>, journal: u64) {
+    let send = lazy_key.is_none();
+    let key = lazy_key.unwrap_or(0);
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -132,7 +136,8 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         cv: Condvar::new(),
         compute,
         key,
-        used: Default::default(),
+        journal,
+        used: std::sync::Once::new(),
         orphan: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -223,6 +228,9 @@ mod used {
         get().earlier.write().unwrap().insert(key);
     }
 }
+
+#[cfg(test)]
+pub(super) use used::earlier_run_used;
 
 /// The workers that build the pipelines of an earlier run ahead of their first use
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest

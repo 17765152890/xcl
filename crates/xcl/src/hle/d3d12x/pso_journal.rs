@@ -2,12 +2,12 @@
 //! can compile them: `xcl pipelines` reads the journal – during the run (`--watch`) or before
 //! the next one – and fills the DXIL cache and the driver's with what the title will ask for.
 //! Written for every pipeline with console shaders that goes to `pso_async` (its DXIL was not
-//! in the cache, or it is made lazily); a pipeline's first build is marked as used, which the
-//! tool compiles first. `XCL_PSO_JOURNAL=0`: off.
+//! in the cache, or it is made lazily). A stand-in's first bind marks its pipeline as used so
+//! the tool can compile it first, even if the title exits during its build. `XCL_PSO_JOURNAL=0`: off.
 //!
 //! Append-only frames, little-endian: tag u8, memory windows u8, 0 u16, payload length u32,
 //! hash u64, payload. Tags: `S` a shader (its bytes; hash = fnv64 of them), `G` a graphics
-//! pipeline, `C` a compute one, `U` (no payload) pipeline `hash` was built. A pipeline's
+//! pipeline, `C` a compute one, `U` (no payload) pipeline `hash` was used. A pipeline's
 //! payload names its shaders by hash; each shader is written once, before the first pipeline
 //! that uses it. Duplicates of earlier runs are not written again.
 
@@ -265,7 +265,7 @@ pub unsafe fn compute(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> u64 {
     })
 }
 
-/// Pipeline `hash` was built (the title used it): `xcl pipelines` makes these first.
+/// The title used pipeline `hash`. `xcl pipelines` makes these first.
 pub fn used(hash: u64) {
     if hash == 0 {
         return;
