@@ -515,6 +515,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         retired: Vec::new(),
         mapped: FxHashMap::default(),
         pinned: FxHashMap::default(),
+        parked: FxHashMap::default(),
         buffers: FxHashMap::default(),
         to_zero: Vec::new(),
         staging: None,
