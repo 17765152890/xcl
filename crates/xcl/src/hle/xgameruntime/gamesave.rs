@@ -96,12 +96,13 @@ fn dec(file: &str) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&file[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        // %XX by bytes: a name put in the folder by hand may hold a multi-byte character right
+        // after the "%" (slicing the str inside it panics), and `from_str_radix` takes a sign
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            out.push(hex(b[i + 1]) << 4 | hex(b[i + 2]));
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -815,6 +816,36 @@ mod tests {
     unsafe extern "system" fn blob_names(i: *const BlobInfo, ctx: *mut c_void) -> bool {
         (*(ctx as *mut Vec<(String, u32)>)).push((from_cstr_ptr((*i).name).unwrap(), (*i).size));
         true
+    }
+
+    /// A "%" that two hex digits do not follow stays as it is: slicing the name at byte
+    /// offsets panicked when a multi-byte character followed, and `from_str_radix` took the
+    /// sign in "%+1" (#325).
+    #[test]
+    fn dec_keeps_a_percent_without_two_hex_digits() {
+        assert_eq!(dec("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(dec("%+1"), "%+1");
+        assert_eq!(dec("%2Fa%"), "/a%");
+        assert_eq!(dec(&enc("\u{e9}/ 1%")), "\u{e9}/ 1%");
+    }
+
+    /// A container folder placed in the provider's root by hand (a restored backup) whose name
+    /// holds "%", a hex digit and a multi-byte character is enumerated, not a panic across
+    /// `extern "system"` that ends the title (#325).
+    #[test]
+    fn a_container_folder_named_percent_then_multibyte_is_enumerated() {
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-325-{}", std::process::id()));
+        let dir = root.join("%a\u{e9}");
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("b").join("data"), b"x").unwrap();
+        let p = Box::into_raw(Box::new(Provider { magic: MAGIC_PROVIDER, root: root.clone() }));
+        let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+        unsafe {
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            drop(Box::from_raw(p));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(list, [("%a\u{e9}".to_string(), "%a\u{e9}".to_string(), 1, 1)]);
     }
 
     /// Names Windows does not keep as file names (device names, a trailing dot or space,
