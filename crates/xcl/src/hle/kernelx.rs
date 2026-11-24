@@ -467,10 +467,14 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    lazy::ensure(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    if proc_ == thr::GetCurrentProcess() {
+        lazy::ensure(addr as usize, size);
+    }
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
 
@@ -2186,6 +2190,27 @@ mod tests {
             assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// VirtualProtect on mapped pages not touched yet (still reserved: `lazy`) commits them
+    /// first: Windows fails it on a page that is not committed (ERROR_INVALID_ADDRESS).
+    #[test]
+    fn virtual_protect_commits_lazy_pages_first() {
+        unsafe {
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            lazy::mark(r);
+            lazy::mark(r + PHYS_PAGE);
+            let mut old = 0u32;
+            let ok = VirtualProtect(r as *const c_void, 2 * PHYS_PAGE, mem::PAGE_READONLY, &mut old);
+            let err = if ok == 0 { fnd::GetLastError() } else { 0 };
+            let first = if ok != 0 { std::ptr::read_volatile(r as *const u8) } else { 0xFF };
+            lazy::unmark(r);
+            lazy::unmark(r + PHYS_PAGE);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            assert_eq!((ok, err), (1, 0), "VirtualProtect on lazy pages");
+            assert_eq!(old, mem::PAGE_READWRITE);
+            assert_eq!(first, 0);
         }
     }
 
