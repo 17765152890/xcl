@@ -56,8 +56,20 @@ jobs:
           key: cargo-mac-gnullvm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: cargo-mac-gnullvm-${{ runner.os }}-
 
-      - name: Build the workspace and its test binaries (not executed)
+      - name: Verify Mac subsystems
         run: |
-          cargo build --workspace --locked --target x86_64-pc-windows-gnullvm
+          chmod +x scripts/verify_mac_build.sh
+          ./scripts/verify_mac_build.sh
+
+      - name: Build the workspace and its test binaries
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-gnullvm -p xcl
           cargo test --no-run --release --locked --target x86_64-pc-windows-gnullvm
-          ls -l target/x86_64-pc-windows-gnullvm/release/xcl.exe
+          ls -lh target/x86_64-pc-windows-gnullvm/release/xcl.exe
+
+      - name: Upload Wine / CrossOver binary (xcl.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcl-mac-wine-x86_64
+          path: target/x86_64-pc-windows-gnullvm/release/xcl.exe
+          if-no-files-found: error
