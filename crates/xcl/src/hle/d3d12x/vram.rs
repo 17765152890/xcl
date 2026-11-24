@@ -166,6 +166,9 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// a pool tile given back is not reused before this (the GPU may still be at work on what the
 /// title released)
 const COOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// minimum interval between full idle-page scans in `Pages::bind` (avoids O(N^2) rescans over
+/// tens of thousands of live pages during texture-creation bursts while `IDLE` is 2 s)
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A pool tile: (pool heap, tile in it).
 type Tile = (u32, u32);
@@ -190,9 +193,11 @@ struct Target {
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
-    /// signalled after each mapping; title queues wait for it before their next work
+    /// signalled lazily in `before_execute` when `dirty` is set; title queues wait for it
     fence: ID3D12Fence,
     value: u64,
+    /// `UpdateTileMappings` queued on `self.queue` since the last `Signal(&self.fence, ...)`
+    dirty: bool,
     pools: Vec<ID3D12Heap>,
     free: Vec<Tile>,
     /// tiles given back, reusable after `COOL`
@@ -202,6 +207,10 @@ struct Pages {
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
     /// address share them without aliasing unrelated addresses
     extra_pages: std::collections::HashMap<(usize, usize), Page>,
+    /// true when any entry in `pages` or `extra_pages` may have `idle_since.is_some()`
+    has_idle: bool,
+    /// last wall-clock sweep triggered from `bind`
+    last_sweep: std::time::Instant,
     /// resource → its mapping metadata and currently held pages / extra keys
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
@@ -232,11 +241,14 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            dirty: false,
             pools: Vec::new(),
             free: Vec::new(),
             cooling: std::collections::VecDeque::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
+            has_idle: false,
+            last_sweep: std::time::Instant::now(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
             uploads_waited: (0, 0),
@@ -254,19 +266,41 @@ impl Pages {
         }
     }
 
-    fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
-        let old: Vec<K> = map.iter().filter(|(_, p)| p.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)).map(|(&k, _)| k).collect();
+    fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) -> bool {
+        let mut old = Vec::new();
+        let mut any_idle = false;
+        for (&k, p) in map.iter() {
+            if let Some(t) = p.idle_since {
+                if now.saturating_duration_since(t) >= IDLE {
+                    old.push(k);
+                } else {
+                    any_idle = true;
+                }
+            }
+        }
         for k in old {
             if let Some(p) = map.remove(&k) {
                 cooling.push_back((p.tile, now));
             }
         }
+        any_idle
     }
 
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
-        Self::sweep_map(&mut self.pages, &mut self.cooling, now);
-        Self::sweep_map(&mut self.extra_pages, &mut self.cooling, now);
+        if !self.has_idle {
+            return;
+        }
+        let rem_a = Self::sweep_map(&mut self.pages, &mut self.cooling, now);
+        let rem_b = Self::sweep_map(&mut self.extra_pages, &mut self.cooling, now);
+        self.has_idle = rem_a || rem_b;
+    }
+
+    fn maybe_sweep(&mut self, now: std::time::Instant) {
+        if self.has_idle && now.saturating_duration_since(self.last_sweep) >= SWEEP_INTERVAL {
+            self.last_sweep = now;
+            self.sweep(now);
+        }
     }
 
     unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
@@ -319,8 +353,7 @@ impl Pages {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.dirty = true;
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -341,8 +374,7 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.dirty = true;
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -356,6 +388,7 @@ impl Pages {
                         }
                     } else {
                         p.idle_since = Some(now);
+                        self.has_idle = true;
                     }
                 }
             }
@@ -370,6 +403,7 @@ impl Pages {
                         }
                     } else {
                         p.idle_since = Some(now);
+                        self.has_idle = true;
                     }
                 }
             }
@@ -380,7 +414,7 @@ impl Pages {
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
-        self.sweep(now);
+        self.maybe_sweep(now);
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
@@ -602,6 +636,13 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(dev) = dev else { return };
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
+    if pages.dirty {
+        let next = pages.value + 1;
+        if pages.queue.Signal(&pages.fence, next).is_ok() {
+            pages.value = next;
+            pages.dirty = false;
+        }
+    }
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
