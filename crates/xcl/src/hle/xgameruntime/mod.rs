@@ -864,8 +864,11 @@ struct AssociationCall {
     change: DeviceAssociationChange,
 }
 
-unsafe extern "system" fn association_call(rec: *mut c_void, _canceled: bool) {
+unsafe extern "system" fn association_call(rec: *mut c_void, canceled: bool) {
     let r = Box::from_raw(rec as *mut AssociationCall);
+    if canceled {
+        return;
+    }
     let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
     f(r.ctx as *mut c_void, &r.change);
 }
@@ -894,9 +897,13 @@ pub unsafe extern "system" fn XUserRegisterForDeviceAssociationChanged(queue: *m
     }
     let t = NEXT_ASSOCIATION_TOKEN.fetch_add(1, Ordering::Relaxed);
     *token = t;
-    ASSOCIATION_CALLBACKS.lock().unwrap().push((t, queue as usize, ctx as usize, cb));
-    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if USER_SIGNED_IN.load(Ordering::Acquire) { "" } else { " – before the user is signed in" });
-    if USER_SIGNED_IN.load(Ordering::Acquire) {
+    let signed_in = {
+        let mut cbs = ASSOCIATION_CALLBACKS.lock().unwrap();
+        cbs.push((t, queue as usize, ctx as usize, cb));
+        USER_SIGNED_IN.load(Ordering::Acquire)
+    };
+    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if signed_in { "" } else { " – before the user is signed in" });
+    if signed_in {
         notify_association(queue as usize, ctx as usize, cb);
     }
     S_OK
@@ -912,11 +919,14 @@ pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: 
 /// The local user reached the title: the gamepad becomes its device (each registered
 /// association callback hears of it once).
 fn user_signed_in() {
-    if USER_SIGNED_IN.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", ASSOCIATION_CALLBACKS.lock().unwrap().len());
-    let calls: Vec<_> = ASSOCIATION_CALLBACKS.lock().unwrap().clone();
+    let calls: Vec<_> = {
+        let cbs = ASSOCIATION_CALLBACKS.lock().unwrap();
+        if USER_SIGNED_IN.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        cbs.clone()
+    };
+    crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", calls.len());
     for (_, q, ctx, cb) in calls {
         unsafe { notify_association(q, ctx, cb) };
     }
@@ -1164,6 +1174,25 @@ mod tests {
             assert!(info.available_free_bytes <= info.total_free_bytes);
             assert!(info.total_free_bytes + info.used_bytes <= info.total_bytes);
             let _ = std::fs::remove_file(&probe);
+        }
+    }
+
+    #[test]
+    fn device_association_callback_not_invoked_when_queue_terminated() {
+        let _g = xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn count_cb(ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            (*(ctx as *const AtomicU32)).fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let hits = AtomicU32::new(0);
+            notify_association(q as usize, &hits as *const AtomicU32 as usize, count_cb as usize);
+            // Terminating the queue before dispatching must cancel (and free) the queued
+            // AssociationCall without invoking the guest callback.
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "guest callback must not run when canceled by queue termination");
+            taskqueue::XTaskQueueCloseHandle(q);
         }
     }
 }
