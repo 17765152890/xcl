@@ -553,8 +553,6 @@ struct ListState {
     split_barriers: u32,
     /// UMA address ranges written by this list since last Reset/KickoffX
     written_ranges: Vec<(u64, u64)>,
-    /// This PC segment has explicit UMA writes, regardless of their destination.
-    wrote_uma: bool,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
@@ -578,7 +576,6 @@ impl ListState {
         if size == 0 {
             return;
         }
-        self.wrote_uma = true;
         let end = va.saturating_add(size);
         if self.written_ranges.len() < MAX_WRITTEN_RANGES {
             self.written_ranges.push((va, end));
@@ -1346,10 +1343,8 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         && title_list::can_split(owner) && s.can_segment()
     {
         if let Some(ty @ (D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)) = s.list_type {
-            if !s.wrote_uma && s.cpu_writes.is_empty() {
-                s.push_memory_wait(w, true);
-                return;
-            }
+            // Tracked memory writes miss ordinary D3D12 work, such as copies and draws.
+            // Split even if the prefix might be empty, so the gate only holds the suffix.
             let (alloc, pso) = (s.allocator, s.bound_pso);
             drop(g);
             let next = match split_recording(list, owner, alloc, ty, pso) {
@@ -1628,7 +1623,6 @@ unsafe fn split_recording(
             progress_waits: std::mem::take(&mut continued.progress_waits),
             ..Default::default()
         };
-        continued.wrote_uma = false;
         m.insert(raw as usize, continued);
     }
     super::bind::continue_recording(this, raw);
@@ -1732,7 +1726,6 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
         s.written_ranges.clear();
-        s.wrote_uma = false;
         (waits, s.clear_sparse_writes(), std::mem::take(&mut s.cpu_writes))
     };
 
@@ -2315,7 +2308,6 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.open_queries.clear();
         s.split_barriers = 0;
         s.written_ranges.clear();
-        s.wrote_uma = false;
         s.clear_sparse_writes();
         s.clear_waits();
         s.cpu_writes.clear();

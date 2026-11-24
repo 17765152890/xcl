@@ -1,5 +1,5 @@
 use super::super::{bind, present, real, title_list};
-use super::{on_create, on_queue_create, wait64_x, write64_bottom_x};
+use super::{execute_with_waits, on_create, on_queue_create, submit_piece, wait64_x, write64_bottom_x};
 use crate::gpu::{fence, recomp::runner::skip_test};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +36,13 @@ unsafe fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURC
     let mut resource = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource).unwrap();
     resource.unwrap()
+}
+
+unsafe fn write_upload_words(upload: &ID3D12Resource, words: [u64; 2]) {
+    let mut p = std::ptr::null_mut();
+    upload.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p)).unwrap();
+    p.cast::<[u64; 2]>().write_unaligned(words);
+    upload.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }));
 }
 
 unsafe fn readback_words(readback: &ID3D12Resource) -> [u64; 2] {
@@ -86,10 +93,7 @@ fn cross_queue_wait64_runs_at_its_recorded_position() {
         let upload = buffer(&dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         let value = buffer(&dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
         let readback = buffer(&dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        let mut p = std::ptr::null_mut();
-        upload.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p)).unwrap();
-        p.cast::<[u64; 2]>().write_unaligned([STALE, UPDATED]);
-        upload.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }));
+        write_upload_words(&upload, [STALE, UPDATED]);
 
         let init_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(DIRECT).unwrap();
         let init: ID3D12GraphicsCommandList = dev.CreateCommandList(0, DIRECT, &init_alloc, None).unwrap();
@@ -187,5 +191,74 @@ fn cross_queue_wait64_runs_at_its_recorded_position() {
         assert_eq!(observed, Some([UPDATED, UPDATED]), "GPU wait chain timed out or copied stale data");
         assert!(held, "consumer or producer finished while producer's external fence was still held");
         assert_ne!(VirtualFree(cells.cast(), 0, MEM_RELEASE), 0);
+    }
+}
+
+#[test]
+fn ordinary_copy_runs_before_wait64_for_late_external_value() {
+    const DIRECT: D3D12_COMMAND_LIST_TYPE = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const GE: u32 = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+    const READY: u64 = 0x1_0000_0041;
+    const WORDS: [u64; 2] = [0x0102_0304_0506_0708, 0xA1B2_C3D4_E5F6_0798];
+
+    unsafe {
+        let mut dev = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            skip_test("no GPU");
+            return;
+        }
+        let dev: ID3D12Device = dev.unwrap();
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: DIRECT, ..Default::default() }).unwrap();
+        let completion: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let reached = |at| fence::completed_value(&completion, &dev).is_ok_and(|v| v >= at);
+        let upload = buffer(&dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let prefix = buffer(&dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        let suffix = buffer(&dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        write_upload_words(&upload, WORDS);
+        let mut prefix_data = std::ptr::null_mut();
+        prefix.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut prefix_data)).unwrap();
+
+        let alloc = dev.CreateCommandAllocator(DIRECT).unwrap();
+        let list = title_list(&dev, &alloc, DIRECT);
+        let ready = VirtualAlloc(std::ptr::null(), 8, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<AtomicU64>();
+        assert!(!ready.is_null());
+        list.CopyBufferRegion(&prefix, 0, &upload, 0, 16);
+        wait64_x(title_list::active(list.as_raw()), ready as u64, GE, READY, 0, 0);
+        list.CopyBufferRegion(&suffix, 0, &upload, 0, 16);
+        list.Close().unwrap();
+
+        let mut pieces = Vec::new();
+        title_list::append_pieces(list.as_raw(), &mut pieces).unwrap();
+        // Use the queue scheduler's native submission path, with a real completion fence
+        // after each batch so the CPU never reads a buffer still being written by the GPU.
+        let mut batches = 0;
+        let mut signal_error = None;
+        let submit = execute_with_waits(queue.as_raw(), &pieces, |chunk| {
+            submit_piece(queue.as_raw(), chunk, queue.vtable().ExecuteCommandLists);
+            batches += 1;
+            if let Err(err) = queue.Signal(&completion, batches) {
+                signal_error = Some(err);
+            }
+        });
+        let tail = queue.Signal(&completion, batches + 1);
+        let observed_prefix = until(TIMEOUT, || reached(1))
+            .then(|| prefix_data.cast::<[u64; 2]>().read_unaligned());
+        let suffix_held = observed_prefix.is_some() && !until(Duration::from_millis(100), || reached(2));
+        prefix.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+
+        // This is the external producer. Release even on RED so queued work can drain.
+        (*ready).store(READY, Ordering::Release);
+        let finished = tail.is_ok() && until(TIMEOUT, || reached(batches + 1));
+        if finished {
+            assert_ne!(VirtualFree(ready.cast(), 0, MEM_RELEASE), 0);
+        }
+        submit.expect("submit recording");
+        assert!(signal_error.is_none(), "signal batch completion: {signal_error:?}");
+        tail.expect("signal queue tail");
+        assert!(finished, "queue did not drain after the producer advanced");
+        assert_eq!(observed_prefix, Some(WORDS), "ordinary copy did not finish before the producer advanced");
+        assert_eq!(batches, 2, "expected a prefix and a continuation");
+        assert!(suffix_held, "suffix completed before the producer advanced");
+        assert_eq!(readback_words(&suffix), WORDS);
     }
 }
