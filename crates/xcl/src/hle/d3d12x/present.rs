@@ -427,8 +427,10 @@ fn window_thread() {
         RegisterClassW(&wc);
         let cfg = crate::state::config();
         let title = window_name();
-        let fullscreen = std::env::var("XCL_FULLSCREEN").map_or(false, |v| v != "0")
-            || (cfg.window_width >= 2560 && cfg.window_height >= 1440);
+        let fullscreen = match std::env::var("XCL_FULLSCREEN") {
+            Ok(v) => v.trim() != "0",
+            Err(_) => cfg.window_width >= 2560 && cfg.window_height >= 1440,
+        };
         let (style, x, y, w, h) = if fullscreen {
             let (x, y, mw, mh) = window_position(&cfg.window_pos, cfg.window_width as i32, cfg.window_height as i32, true);
             let w = if cfg.window_width > 0 { cfg.window_width as i32 } else { mw };

@@ -299,9 +299,6 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
 fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").map_or(true, |v| v.trim() != "0")
 }
-fn bcpack_fill_from_env() -> bool {
-    std::env::var("XCL_DSTORAGE_BCPACK_FILL").map_or(true, |v| v.trim() != "0")
-}
 
 /// BC1 colour block: both endpoints magenta (565 `0xF81F`), every index 0.
 const BC1_MAGENTA: [u8; 8] = [0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0];
