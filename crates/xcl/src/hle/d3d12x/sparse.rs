@@ -209,6 +209,12 @@ struct State {
     /// video-memory pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
     free: Vec<(u32, u32)>,
+    /// pools in system memory (`zero_tiles_in_sysmem`): tiles that have held only zeros so far
+    sys_pool: Vec<bool>,
+    /// free tiles of the system-memory pools
+    free_sys: Vec<(u32, u32)>,
+    /// a tile moving from system to video memory passes through it (`migrate`)
+    migrate_buf: Option<ID3D12Resource>,
     /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
     /// went by (titles' queues may still read what was mapped there)
     retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
@@ -593,6 +599,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             windows,
             pools: Vec::new(),
             free: Vec::new(),
+            sys_pool: Vec::new(),
+            free_sys: Vec::new(),
+            migrate_buf: None,
             retired: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
@@ -1720,6 +1729,9 @@ mod tests {
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
+                sys_pool: Vec::new(),
+                free_sys: Vec::new(),
+                migrate_buf: None,
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
