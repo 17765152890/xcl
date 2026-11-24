@@ -411,13 +411,14 @@ impl<'a> Pe<'a> {
     }
 
     /// Refuse an RVA the loader would write into when it still needs the headers intact
-    /// (IAT thunks, delay-load module handles, TLS `AddressOfIndex`). Targets must lie in
-    /// `[size_of_headers, size_of_image)`.
-    fn ensure_data_write_rva(&self, rva: u32) -> Result<(), PeError> {
+    /// (IAT thunks, delay-load module handles, TLS `AddressOfIndex`). The whole write of
+    /// `width` bytes must lie in `[size_of_headers, size_of_image)`.
+    fn ensure_data_write_rva(&self, rva: u32, width: u32) -> Result<(), PeError> {
         if rva < self.size_of_headers {
             return Err(PeError::HeaderWriteTarget(rva));
         }
-        if rva >= self.size_of_image {
+        let end = rva.checked_add(width).ok_or(PeError::BadRva(rva))?;
+        if end > self.size_of_image {
             return Err(PeError::BadRva(rva));
         }
         Ok(())
@@ -441,7 +442,7 @@ impl<'a> Pe<'a> {
                 ImportName::Name { hint, name }
             };
             let slot_iat = iat_rva.checked_add(i * 8).ok_or(PeError::BadRva(iat_rva))?;
-            self.ensure_data_write_rva(slot_iat)?;
+            self.ensure_data_write_rva(slot_iat, 8)?;
             out.push(ImportEntry { iat_rva: slot_iat, what });
         }
         Ok(out)
@@ -502,7 +503,7 @@ impl<'a> Pe<'a> {
             }
             let dll = self.cstr_at(name_rva).ok_or(PeError::BadRva(name_rva))?;
             if hmod_rva != 0 {
-                self.ensure_data_write_rva(hmod_rva)?;
+                self.ensure_data_write_rva(hmod_rva, 8)?;
             }
             let entries = self.thunks(int_rva, iat_rva)?;
             out.push(ImportDll { dll, delay: true, entries, module_handle_rva: hmod_rva });
@@ -561,7 +562,7 @@ impl<'a> Pe<'a> {
         // but image_base+0 (RVA 0) would overwrite the DOS header – refuse it too.
         if address_of_index != 0 {
             let index_rva = self.va_to_rva(address_of_index).ok_or(PeError::BadRva(0))?;
-            self.ensure_data_write_rva(index_rva)?;
+            self.ensure_data_write_rva(index_rva, 4)?;
         }
         Ok(Some(TlsDir {
             start_raw: r(0)?,
@@ -924,6 +925,46 @@ mod tests {
         data[d + 4..d + 8].copy_from_slice(&0x40u32.to_le_bytes());
         let pe = Pe::parse(&data, Layout::File).unwrap();
         assert_eq!(pe.delay_imports().unwrap_err(), PeError::HeaderWriteTarget(0x80));
+    }
+
+    #[test]
+    fn import_address_table_straddling_image_end_is_error() {
+        // FirstThunk at SizeOfImage - 4: start is in-range, the 8-byte write is not.
+        let size_of_image = 0x2000u32;
+        let iat_rva = size_of_image - 4;
+        let mut payload = vec![0u8; 0x80];
+        let int_rva: u32 = 0x1000 + 0x20;
+        let name_rva: u32 = 0x1000 + 0x40;
+        payload[0..4].copy_from_slice(&int_rva.to_le_bytes());
+        payload[12..16].copy_from_slice(&name_rva.to_le_bytes());
+        payload[16..20].copy_from_slice(&iat_rva.to_le_bytes());
+        payload[0x20..0x28].copy_from_slice(&(1u64 << 63 | 1).to_le_bytes());
+        payload[0x40..0x44].copy_from_slice(b"a\0\0\0");
+        let mut data = pe_with_headers(0x400, 0x140000000, 0x1000, &payload);
+        // pe_with_headers already sets SizeOfImage to 0x2000
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_IMPORT * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&0x28u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.size_of_image, size_of_image);
+        assert_eq!(pe.imports().unwrap_err(), PeError::BadRva(iat_rva));
+    }
+
+    #[test]
+    fn tls_index_straddling_image_end_is_error() {
+        let image_base = 0x140000000u64;
+        let size_of_image = 0x2000u32;
+        let index_rva = size_of_image - 2; // 4-byte write past the end
+        let mut payload = vec![0u8; 40];
+        payload[16..24].copy_from_slice(&(image_base + index_rva as u64).to_le_bytes());
+        let mut data = pe_with_headers(0x400, image_base, 0x1000, &payload);
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_TLS * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&40u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.tls().unwrap_err(), PeError::BadRva(index_rva));
     }
 
     #[test]
