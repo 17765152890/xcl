@@ -51,8 +51,8 @@ class TestOnlyApprovalTests(unittest.TestCase):
 
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
-        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n\n"
-                "xcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n```\n")
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\npeak commit: 100 MB\n\n"
+                "xcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\npeak commit: 100 MB\n```\n")
         blocks = smoke_blocks(body)
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
