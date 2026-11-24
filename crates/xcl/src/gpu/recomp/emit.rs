@@ -4259,6 +4259,7 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
+        let _ = writeln!(h, "#define XCL_LOOP_BUDGET {}u", super::loop_budget());
         h.push_str(PRELUDE);
         if self.x64() {
             self.x64_prelude(&mut h);
@@ -5535,7 +5536,7 @@ void xcl_s_barrier() {
 const PRELUDE: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
-static uint xcl_budget = 1u << 16;
+static uint xcl_budget = XCL_LOOP_BUDGET;
 // the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)
