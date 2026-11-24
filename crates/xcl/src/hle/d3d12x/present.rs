@@ -426,15 +426,25 @@ fn window_thread() {
         RegisterClassW(&wc);
         let cfg = crate::state::config();
         let title = window_name();
-        let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
-        let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
-        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        let (x, y) = window_position(&cfg.window_pos, w, h);
+        let fullscreen = std::env::var("XCL_FULLSCREEN").map_or(false, |v| v != "0")
+            || (cfg.window_width >= 2560 && cfg.window_height >= 1440);
+        let (style, x, y, w, h) = if fullscreen {
+            let (x, y, mw, mh) = window_position(&cfg.window_pos, cfg.window_width as i32, cfg.window_height as i32, true);
+            let w = if cfg.window_width > 0 { cfg.window_width as i32 } else { mw };
+            let h = if cfg.window_height > 0 { cfg.window_height as i32 } else { mh };
+            (WS_POPUP | WS_VISIBLE, x, y, w, h)
+        } else {
+            let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
+            let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+            let (x, y, _, _) = window_position(&cfg.window_pos, w, h, false);
+            (WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, w, h)
+        };
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            style,
             x,
             y,
             w,
@@ -449,7 +459,7 @@ fn window_thread() {
             return;
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        crate::xlog_info!("XCL window created ({w}x{h} at {x},{y})");
         crate::hle::kbm::attach(hwnd.0);
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
@@ -460,43 +470,59 @@ fn window_thread() {
     }
 }
 
-/// The XCL window's top-left from `window_pos` (`XCL_WINDOW_POS` overrides): "auto" keeps
-/// CW_USEDEFAULT (Windows may pick any monitor), "center" centers on the primary monitor's
-/// work area, "x,y" is clamped into the nearest monitor's work area — a multi-monitor desktop
-/// otherwise gets the window on whichever monitor Windows' cascade picks.
-unsafe fn window_position(setting: &str, w: i32, h: i32) -> (i32, i32) {
+/// The XCL window's top-left and monitor dimensions from `window_pos` (`XCL_WINDOW_POS` overrides):
+/// "auto" keeps CW_USEDEFAULT (Windows may pick any monitor), "center" centers on the primary
+/// monitor, "x,y" maps to the monitor containing (x,y). For fullscreen, it snaps to the full
+/// monitor rectangle (rcMonitor) rather than the work area (rcWork).
+unsafe fn window_position(setting: &str, w: i32, h: i32, fullscreen: bool) -> (i32, i32, i32, i32) {
     let env = std::env::var("XCL_WINDOW_POS").ok();
     let mode = env.as_deref().unwrap_or(setting).trim();
     if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
-        return (CW_USEDEFAULT, CW_USEDEFAULT);
+        if fullscreen {
+            return (0, 0, w, h);
+        }
+        return (CW_USEDEFAULT, CW_USEDEFAULT, w, h);
     }
-    let work = |pt: POINT, flags: u32| -> Option<RECT> {
+    let mon_rect = |pt: POINT, flags: u32| -> Option<RECT> {
         let mon = MonitorFromPoint(pt, MONITOR_FROM_FLAGS(flags));
         if mon.is_invalid() {
             return None;
         }
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcWork)
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return None;
+        }
+        Some(if fullscreen { mi.rcMonitor } else { mi.rcWork })
     };
     if mode.eq_ignore_ascii_case("center") {
-        let Some(r) = work(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY.0) else {
-            return (CW_USEDEFAULT, CW_USEDEFAULT);
+        let Some(r) = mon_rect(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY.0) else {
+            return if fullscreen { (0, 0, w, h) } else { (CW_USEDEFAULT, CW_USEDEFAULT, w, h) };
         };
-        return (r.left + ((r.right - r.left) - w).max(0) / 2, r.top + ((r.bottom - r.top) - h).max(0) / 2);
+        let mw = r.right - r.left;
+        let mh = r.bottom - r.top;
+        if fullscreen {
+            return (r.left, r.top, mw, mh);
+        }
+        return (r.left + (mw - w).max(0) / 2, r.top + (mh - h).max(0) / 2, mw, mh);
     }
     let Some((xs, ys)) = mode.split_once(',') else {
         crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
-        return (CW_USEDEFAULT, CW_USEDEFAULT);
+        return if fullscreen { (0, 0, w, h) } else { (CW_USEDEFAULT, CW_USEDEFAULT, w, h) };
     };
     let (Ok(x), Ok(y)) = (xs.trim().parse::<i32>(), ys.trim().parse::<i32>()) else {
         crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
-        return (CW_USEDEFAULT, CW_USEDEFAULT);
+        return if fullscreen { (0, 0, w, h) } else { (CW_USEDEFAULT, CW_USEDEFAULT, w, h) };
     };
-    // clamp into the work area of the monitor nearest the requested top-left
-    let Some(r) = work(POINT { x, y }, MONITOR_DEFAULTTONEAREST.0) else {
-        return (x, y);
+    let Some(r) = mon_rect(POINT { x, y }, MONITOR_DEFAULTTONEAREST.0) else {
+        return (x, y, w, h);
     };
-    (x.clamp(r.left, (r.right - w).max(r.left)), y.clamp(r.top, (r.bottom - h).max(r.top)))
+    let mw = r.right - r.left;
+    let mh = r.bottom - r.top;
+    if fullscreen {
+        (r.left, r.top, mw, mh)
+    } else {
+        (x.clamp(r.left, (r.right - w).max(r.left)), y.clamp(r.top, (r.bottom - h).max(r.top)), mw, mh)
+    }
 }
 
 fn ensure_window() -> Option<HWND> {

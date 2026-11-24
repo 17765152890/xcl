@@ -358,7 +358,8 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// For binding: wait for real compute pipelines so dispatches are accurate; graphics pipelines
+/// resolve immediately (stand-ins if compiling, real as soon as ready) to avoid stalling render thread.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
