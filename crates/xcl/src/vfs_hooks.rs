@@ -990,6 +990,13 @@ fn collect_game_entries(
     rel: &str,
     collect_fn: impl Fn(&str) -> Vec<WIN32_FIND_DATAW>,
 ) -> Result<Vec<WIN32_FIND_DATAW>, u32> {
+    if rel.is_empty() {
+        // FindFirstFile on the bare mount root ("G:\"): the relative path is empty,
+        // so the search would run on the overlay and game folders themselves and
+        // list the host directories as game entries. Windows has no entries for a
+        // bare drive root either: report none.
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
     let (dir_rel, pattern) = match rel.rsplit_once('\\') {
         Some((d, p)) => (d.to_string(), p.to_string()),
         None => (String::new(), rel.to_string()),
@@ -1733,5 +1740,14 @@ mod tests {
             .collect();
         after.sort();
         assert_eq!(after, vec![".", ".."]);
+    }
+
+    #[test]
+    fn search_on_the_bare_mount_root_finds_nothing() {
+        // #577 case 3: FindFirstFile("G:\\") must not list the overlay/game host
+        // folders as entries of the title.
+        let f = HookFixture::new("rootsearch");
+        let got = collect_game_entries(&f.vfs, "", |_| Vec::new());
+        assert!(matches!(got, Err(vfs::ERROR_FILE_NOT_FOUND)));
     }
 }
