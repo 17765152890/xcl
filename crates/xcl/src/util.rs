@@ -122,14 +122,29 @@ unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buf))
 }
 
-/// The process runs under Wine (its ntdll exports `wine_get_version`).
-pub fn under_wine() -> bool {
+fn probe_under_wine() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: ntdll is always loaded and both names are NUL-terminated.
+    // Saving and restoring the thread's last error keeps a missing export on
+    // Windows from clobbering the caller's GetLastError() with ERROR_PROC_NOT_FOUND.
+    unsafe {
+        let saved = GetLastError();
+        let found = GetProcAddress(
+            GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8),
+            c"wine_get_version".as_ptr() as *const u8,
+        )
+        .is_some();
+        SetLastError(saved);
+        found
+    }
+}
+
+/// The process runs under Wine (its ntdll exports `wine_get_version`).
+/// Preserves the calling thread's Win32 last error even on its first call.
+pub fn under_wine() -> bool {
     static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // SAFETY: ntdll is always loaded; both names are NUL-terminated.
-    *WINE.get_or_init(|| unsafe {
-        GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
-    })
+    *WINE.get_or_init(probe_under_wine)
 }
 
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
@@ -461,6 +476,28 @@ mod tests {
             assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
             assert_eq!(decode_cp(&buf, CP_UTF8), "a😀");
             assert_eq!(buf[5], 0);
+        }
+    }
+
+    #[test]
+    fn under_wine_preserves_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_ACCESS_DENIED};
+        const SENTINEL: u32 = 0x1234_5678;
+
+        // SAFETY: SetLastError/GetLastError operate on the current thread's TEB.
+        unsafe {
+            // Exercise under_wine() first so a cold single-test run hits OnceLock init.
+            SetLastError(SENTINEL);
+            let cached = under_wine();
+            assert_eq!(GetLastError(), SENTINEL);
+
+            // Also probe directly so the uncached GetProcAddress path is always checked
+            // even when another test in the same process already initialized WINE.
+            for expected in [0, ERROR_ACCESS_DENIED, SENTINEL] {
+                SetLastError(expected);
+                assert_eq!(probe_under_wine(), cached);
+                assert_eq!(GetLastError(), expected);
+            }
         }
     }
 }
