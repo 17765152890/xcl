@@ -7250,3 +7250,199 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+#[test]
+fn gpu_cube_face_sc_tc_ma_and_ties() {
+    fn ref_cube(x: f32, y: f32, z: f32) -> (f32, f32, f32, f32) {
+        let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
+        if az >= ax && az >= ay {
+            (if z < 0.0 { 5.0 } else { 4.0 }, if z < 0.0 { -x } else { x }, -y, 2.0 * z)
+        } else if ay >= ax {
+            (if y < 0.0 { 3.0 } else { 2.0 }, x, if y < 0.0 { -z } else { z }, 2.0 * y)
+        } else {
+            (if x < 0.0 { 1.0 } else { 0.0 }, if x < 0.0 { z } else { -z }, -y, 2.0 * x)
+        }
+    }
+
+    let code = prog(&[
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("NEG", 0b101)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("ABS", 0b111), ("OMOD", 3)], None),
+    ]);
+
+    let cases: [(f32, f32, f32); 32] = [
+        // all 6 dominant faces with asymmetric off-axis coordinates
+        (4.0, 1.25, -0.5),
+        (-4.0, 1.25, -0.5),
+        (0.75, 5.0, -1.5),
+        (0.75, -5.0, -1.5),
+        (1.5, -0.75, 6.0),
+        (1.5, -0.75, -6.0),
+        // two-way edge ties (|z| == |x| > |y|)
+        (3.0, 0.5, 3.0),
+        (-3.0, 0.5, 3.0),
+        (3.0, 0.5, -3.0),
+        (-3.0, 0.5, -3.0),
+        // two-way edge ties (|z| == |y| > |x|)
+        (0.25, 3.0, 3.0),
+        (0.25, -3.0, 3.0),
+        (0.25, 3.0, -3.0),
+        (0.25, -3.0, -3.0),
+        // two-way edge ties (|y| == |x| > |z|)
+        (3.0, 3.0, 0.5),
+        (-3.0, 3.0, 0.5),
+        (3.0, -3.0, 0.5),
+        (-3.0, -3.0, 0.5),
+        // all 8 three-way corner ties
+        (2.0, 2.0, 2.0),
+        (-2.0, 2.0, 2.0),
+        (2.0, -2.0, 2.0),
+        (-2.0, -2.0, 2.0),
+        (2.0, 2.0, -2.0),
+        (-2.0, 2.0, -2.0),
+        (2.0, -2.0, -2.0),
+        (-2.0, -2.0, -2.0),
+        // signed zeros and tiny/large magnitudes
+        (0.0, 0.0, 0.0),
+        (-0.0, -0.0, -0.0),
+        (0.0, -1.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (1e-20, -2e-20, 0.5e-20),
+        (-1e20, 0.5e20, 0.25e20),
+    ];
+
+    let mut st = KernelState::default();
+    for l in 0..64 {
+        let (x, y, z) = cases[l % cases.len()];
+        st.vgpr[l][1] = x.to_bits();
+        st.vgpr[l][2] = y.to_bits();
+        st.vgpr[l][3] = z.to_bits();
+    }
+
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, y, z) = cases[l % cases.len()];
+            let (id, sc, tc, ma) = ref_cube(x, y, z);
+            let (neg_id, _, _, _) = ref_cube(-x, y, -z);
+            let (_, _, _, abs_ma) = ref_cube(x.abs(), y.abs(), z.abs());
+            assert_eq!(f32::from_bits(v[10]), id, "wave{lanes} lane {l} v_cubeid_f32 ({x}, {y}, {z})");
+            assert_eq!(f32::from_bits(v[11]), sc, "wave{lanes} lane {l} v_cubesc_f32 ({x}, {y}, {z})");
+            assert_eq!(f32::from_bits(v[12]), tc, "wave{lanes} lane {l} v_cubetc_f32 ({x}, {y}, {z})");
+            assert_eq!(f32::from_bits(v[13]), ma, "wave{lanes} lane {l} v_cubema_f32 ({x}, {y}, {z})");
+            assert_eq!(f32::from_bits(v[14]), neg_id, "wave{lanes} lane {l} v_cubeid_f32 neg xz ({x}, {y}, {z})");
+            assert_eq!(f32::from_bits(v[15]), abs_ma * 0.5, "wave{lanes} lane {l} v_cubema_f32 abs+omod/2 ({x}, {y}, {z})");
+        }
+    }
+}
+
+#[test]
+fn gpu_legacy_zero_wins_mul_fma_fmac() {
+    fn mul_legacy_ref(a: f32, b: f32) -> f32 {
+        if a == 0.0 || b == 0.0 { 0.0 } else { a * b }
+    }
+    fn fma_legacy_ref(a: f32, b: f32, c: f32) -> f32 {
+        if a == 0.0 || b == 0.0 { c } else { a.mul_add(b, c) }
+    }
+
+    let code = prog(&[
+        ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_MUL_LEGACY_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", V + 2), ("NEG", 0b01), ("CLAMP", 1)], None),
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("ABS", 0b010), ("CLAMP", 1)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 2), ("NEG", 0b10)], None),
+    ]);
+
+    let qnan = f32::from_bits(0x7FC0_0123);
+    let snan = f32::from_bits(0x7F80_0123);
+    let one_ulp = f32::from_bits(0x3F80_0001); // 1 + 2^-23
+    let neg_two_ulp = f32::from_bits(0xBF80_0002); // -(1 + 2^-22)
+
+    let cases: [(f32, f32, f32); 32] = [
+        // zero wins over +inf, -inf, qNaN, sNaN in either multiplicand
+        (0.0, f32::INFINITY, 3.5),
+        (0.0, f32::NEG_INFINITY, -2.25),
+        (-0.0, f32::INFINITY, 0.5),
+        (-0.0, f32::NEG_INFINITY, 0.0),
+        (f32::INFINITY, 0.0, 2.0),
+        (f32::NEG_INFINITY, -0.0, 0.25),
+        (0.0, qnan, 1.5),
+        (-0.0, qnan, -0.5),
+        (qnan, 0.0, 0.75),
+        (0.0, snan, 4.0),
+        (-0.0, snan, 0.0),
+        (snan, -0.0, -1.25),
+        // zero * zero
+        (0.0, 0.0, 0.5),
+        (-0.0, 0.0, 2.0),
+        (0.0, -0.0, -1.0),
+        (-0.0, -0.0, 0.0),
+        // fused rounding witness: (1 + 2^-23)^2 - (1 + 2^-22) == 2^-46 (unfused gives 0)
+        (one_ulp, one_ulp, neg_two_ulp),
+        (-one_ulp, one_ulp, neg_two_ulp),
+        // finite multiplication, clamp, neg, abs
+        (0.5, 1.5, 0.125),
+        (-0.5, 1.5, 0.25),
+        (2.0, 3.0, -4.5),
+        (-2.0, -3.0, -7.0),
+        (1.5, -2.0, 2.5),
+        (1e-10, 1e-10, 0.5),
+        (1e20, 1e20, 0.0),
+        (-1e20, 1e20, 1.0),
+        // non-zero * inf / NaN propagates inf / NaN
+        (2.0, f32::INFINITY, 0.5),
+        (-2.0, f32::INFINITY, 0.5),
+        (2.0, qnan, 0.5),
+        (qnan, -3.0, 0.5),
+        (1.5, f32::INFINITY, f32::NEG_INFINITY),
+        (-1.5, snan, 1.0),
+    ];
+
+    let mut st = KernelState::default();
+    for l in 0..64 {
+        let (a, b, c) = cases[l % cases.len()];
+        st.vgpr[l][1] = a.to_bits();
+        st.vgpr[l][2] = b.to_bits();
+        st.vgpr[l][3] = c.to_bits();
+        st.vgpr[l][14] = c.to_bits();
+        st.vgpr[l][15] = c.to_bits();
+    }
+
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, c) = cases[l % cases.len()];
+
+            let e_mul = mul_legacy_ref(a, b);
+            let e_mul_neg_clamp = mul_legacy_ref(-a, b).clamp(0.0, 1.0);
+            let e_fma = fma_legacy_ref(a, b, c);
+            let e_fma_abs_clamp = fma_legacy_ref(a, b.abs(), c).clamp(0.0, 1.0);
+            let e_fmac = fma_legacy_ref(a, b, c);
+            let e_fmac_neg = fma_legacy_ref(a, -b, c);
+
+            let check = |got_bits: u32, expected: f32, op: &str| {
+                let got = f32::from_bits(got_bits);
+                if expected.is_nan() {
+                    assert!(got.is_nan(), "wave{lanes} lane {l} {op} ({a}, {b}, {c}): expected NaN, got {got}");
+                } else {
+                    assert_eq!(got, expected, "wave{lanes} lane {l} {op} ({a}, {b}, {c})");
+                }
+            };
+
+            check(v[10], e_mul, "v_mul_legacy_f32");
+            if !e_mul.is_nan() {
+                assert_eq!(f32::from_bits(v[11]), e_mul_neg_clamp, "wave{lanes} lane {l} v_mul_legacy_f32 neg+clamp ({a}, {b})");
+            }
+            check(v[12], e_fma, "v_fma_legacy_f32");
+            if !e_fma.is_nan() {
+                assert_eq!(f32::from_bits(v[13]), e_fma_abs_clamp, "wave{lanes} lane {l} v_fma_legacy_f32 abs+clamp ({a}, {b}, {c})");
+            }
+            check(v[14], e_fmac, "v_fmac_legacy_f32");
+            check(v[15], e_fmac_neg, "v_fmac_legacy_f32 neg");
+        }
+    }
+}
