@@ -30,6 +30,7 @@ const LANE_ID: u8 = 8;
 const MASK_DATA: u8 = 16;
 const CROSS_LANE: u8 = 32;
 const TAINTED_EXEC: u8 = 64;
+const STALE_SCALAR: u8 = 128;
 
 const VCC: usize = 106;
 const EXEC: usize = 126;
@@ -218,6 +219,7 @@ fn reasons_of(t: u8, out: &mut BTreeSet<&'static str>) {
         (MASK_DATA, "mask-data"),
         (CROSS_LANE, "cross-lane"),
         (TAINTED_EXEC, "tainted-exec"),
+        (STALE_SCALAR, "stale-scalar"),
     ] {
         if t & bit != 0 {
             out.insert(name);
@@ -351,13 +353,51 @@ pub fn classify(insts: &[Decoded]) -> Partition {
         return Partition { tier: Tier::Exact, reasons };
     }
     let ipdom = g.post_dominators();
-    // block-entry states to a fixed point (the bits only grow, the flags only fall)
+    // first without stale scalars, to find the votes; then with the scalars each vote's
+    // dependent blocks write marked stale where its sides join
+    let none = vec![Vec::new(); nb];
+    let at = fixed_point(insts, &g, &none);
+    let stale = stale_at_joins(insts, &g, &ipdom, &at);
+    let at = fixed_point(insts, &g, &stale);
+    // the sinks, and the votes, from the fixed point
+    for b in 0..nb {
+        let Some(mut st) = at[b].clone() else { continue };
+        mark_stale(&mut st, &stale[b]);
+        let range = g.range(b);
+        let last = range.end - 1;
+        for i in range {
+            if i == last {
+                vote(insts, &g, &ipdom, b, &insts[i], &st, &mut reasons);
+            }
+            step(&insts[i], &mut st, &mut reasons);
+        }
+    }
+    let tier = if reasons.is_empty() { Tier::Exact } else { Tier::MayDiffer };
+    Partition { tier, reasons }
+}
+
+/// Marks scalar registers (and SCC) stale.
+fn mark_stale(st: &mut State, regs: &[Reg]) {
+    for r in regs {
+        match *r {
+            Reg::S(s) => st.s[s] |= STALE_SCALAR,
+            Reg::Scc => st.scc |= STALE_SCALAR,
+            Reg::V(_) => {}
+        }
+    }
+}
+
+/// Block-entry states to a fixed point (the bits only grow, the flags only fall), with the
+/// registers of `stale[b]` marked stale on entering block `b`.
+fn fixed_point(insts: &[Decoded], g: &Cfg, stale: &[Vec<Reg>]) -> Vec<Option<State>> {
+    let nb = g.start.len();
     let mut at: Vec<Option<State>> = vec![None; nb];
     at[0] = Some(State::entry());
     let mut work = BTreeSet::from([0usize]);
     let mut scratch = BTreeSet::new();
     while let Some(b) = work.pop_first() {
         let mut st = at[b].clone().expect("queued with a state");
+        mark_stale(&mut st, &stale[b]);
         for i in g.range(b) {
             step(&insts[i], &mut st, &mut scratch);
         }
@@ -372,20 +412,74 @@ pub fn classify(insts: &[Decoded]) -> Partition {
             }
         }
     }
-    // the sinks, and the votes, from the fixed point
-    for b in 0..nb {
-        let Some(mut st) = at[b].clone() else { continue };
-        let range = g.range(b);
-        let last = range.end - 1;
-        for i in range {
-            if i == last {
-                vote(insts, &g, &ipdom, b, &insts[i], &st, &mut reasons);
-            }
-            step(&insts[i], &mut st, &mut reasons);
+    at
+}
+
+/// Whether the conditional branch `d` (state `st` before it) is a vote a half can take
+/// differently from the wave: on a mask, unless every half has lanes and votes as the wave does
+/// (the launch EXEC, or a mask that is all or none of its lanes).
+fn is_vote(d: &Decoded, st: &State) -> bool {
+    let mask = match d.inst.name {
+        "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ" => EXEC,
+        "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ" => VCC,
+        "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1" => match st.scc_vote {
+            SccVote::No => return false,
+            SccVote::Exec => EXEC,
+            SccVote::Mask(Some(m)) => m,
+            SccVote::Mask(None) => return true,
+        },
+        _ => return false,
+    };
+    let uniform = mask == EXEC || (mask + 1 < 128 && st.uniform_mask[mask] && st.uniform_mask[mask + 1]);
+    !(st.exec_launch && uniform)
+}
+
+/// For each block, the scalars (SGPRs, VCC, M0, SCC; not EXEC, which the join restores) that
+/// the blocks a vote decides write, when the vote's sides join there: a half that took the
+/// other side has not written them, so what it reads there is not the wave's.
+fn stale_at_joins(insts: &[Decoded], g: &Cfg, ipdom: &[PostDom], at: &[Option<State>]) -> Vec<Vec<Reg>> {
+    let nb = g.start.len();
+    let cd = g.control_dependence(ipdom);
+    // branch block -> the blocks that depend on it
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (x, on) in cd.iter().enumerate() {
+        for &c in on {
+            dependents[c].push(x);
         }
     }
-    let tier = if reasons.is_empty() { Tier::Exact } else { Tier::MayDiffer };
-    Partition { tier, reasons }
+    let mut stale: Vec<Vec<Reg>> = vec![Vec::new(); nb];
+    for b in 0..nb {
+        let (Some(st), PostDom::Block(join)) = (&at[b], ipdom[b]) else { continue };
+        let mut st = st.clone();
+        let range = g.range(b);
+        let last = range.end - 1;
+        let mut scratch = BTreeSet::new();
+        for i in range.start..last {
+            step(&insts[i], &mut st, &mut scratch);
+        }
+        if g.succ[b].len() < 2 || !is_vote(&insts[last], &st) {
+            continue;
+        }
+        // the blocks it decides, nested branches' blocks included
+        let mut region: BTreeSet<usize> = BTreeSet::new();
+        let mut todo = dependents[b].clone();
+        while let Some(x) = todo.pop() {
+            if region.insert(x) {
+                todo.extend(dependents[x].iter().copied());
+            }
+        }
+        for &x in &region {
+            for i in g.range(x) {
+                for w in regs(&insts[i]).1 {
+                    let scalar = matches!(w, Reg::Scc) || matches!(w, Reg::S(s) if s != EXEC && s != EXEC + 1);
+                    if scalar && !stale[join].contains(&w) {
+                        stale[join].push(w);
+                    }
+                }
+            }
+        }
+    }
+    stale
 }
 
 /// A conditional branch at the end of block `b` (state `st` before it): a vote that may run a
@@ -562,6 +656,30 @@ mod tests {
         const VAND: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", VCC as u64), ("SSRC0", EXEC as u64), ("SSRC1", 10)], None);
         const ELSE: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 240)], None);
         let p: &[I] = &[SCMP, SEL, VAND, ("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", 2)], None), ELSE, ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None), BODY, EXP];
+        assert_eq!(reasons(p), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_scalar_written_behind_a_vote_and_read_after_the_join_may_differ() {
+        // 0 cmp, 1 saveexec, 2 execz → 4; 3 s5 = 1 (only where some lane voted yes); 4 restore,
+        // 5 v0 = s5, 6 exp
+        const DEF: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 129)], None);
+        const USE: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 5)], None);
+        let p: &[I] = &[CMP, NARROW, ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None), DEF, RESTORE, USE, EXP];
+        assert_eq!(reasons(p), vec!["stale-scalar"]);
+        // not read after the join: exact
+        let q: &[I] = &[CMP, NARROW, ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None), DEF, RESTORE, EXP];
+        assert_eq!(reasons(q), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_scalar_behind_a_vote_every_half_takes_as_the_wave_is_exact() {
+        // a compare of values every lane has, under the launch exec: every half takes the same side
+        const UCMP: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 2), ("VSRC1", 7)], None);
+        const UV7: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 3)], None);
+        const DEF: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 129)], None);
+        const USE: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 5)], None);
+        let p: &[I] = &[UV7, UCMP, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None), DEF, USE, EXP];
         assert_eq!(reasons(p), Vec::<&str>::new());
     }
 
