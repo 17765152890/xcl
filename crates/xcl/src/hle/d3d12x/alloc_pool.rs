@@ -178,9 +178,14 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let a = alloc as usize;
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
+    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+}
+
+/// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
+unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
+    let a = alloc as usize;
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
         if let Some(b) = s.backings.get_mut(&c) {
@@ -189,20 +194,21 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         if c == a {
             return None;
         }
-        return Some(super::real::reset_pc_allocator(c as *mut c_void));
+        return Some(reset(c as *mut c_void));
     }
     let ty = *s.types.get(&a)?;
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
     let next = match reuse {
         Some(f) => {
+            // Keep ownership until Reset succeeds so a failure can be retried.
+            let hr = reset(f as *mut c_void);
+            if hr < 0 {
+                return Some(hr);
+            }
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
-            }
-            let hr = super::real::reset_pc_allocator(f as *mut c_void);
-            if hr < 0 {
-                return Some(hr);
             }
             f
         }
@@ -237,6 +243,45 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spare_whose_reset_fails_stays_available_for_retry() {
+        let (alloc, spare, list) = (0x1000usize, 0x2000usize, 0x3000usize);
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        move_list(&mut s, list, alloc);
+        s.aside.insert(alloc, vec![spare]);
+        s.backings.insert(spare, Backing::default());
+        let mut calls = Vec::new();
+
+        for _ in 0..2 {
+            let hr = unsafe {
+                title_reset_in(&mut s, alloc as *mut c_void, |raw| {
+                    calls.push(raw as usize);
+                    crate::util::E_FAIL
+                })
+            };
+            assert_eq!(hr, Some(crate::util::E_FAIL));
+            assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
+            assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
+            assert_eq!(s.of_list.get(&list), Some(&alloc));
+            assert!(s.backings[&alloc].users.contains(&list), "the old recording is still held");
+            assert_eq!((s.made, s.swaps), (0, 0));
+        }
+
+        let hr = unsafe {
+            title_reset_in(&mut s, alloc as *mut c_void, |raw| {
+                calls.push(raw as usize);
+                0
+            })
+        };
+        assert_eq!(hr, Some(0));
+        assert_eq!(calls, vec![spare; 3], "all attempts used the same spare without creating another");
+        assert_eq!(s.cur.get(&alloc), Some(&spare));
+        assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
+        assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
+        assert_eq!((s.made, s.swaps), (0, 1));
+    }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
     /// recording is still there (the device is not removed), the title's allocator goes on with
