@@ -27,6 +27,8 @@ pub(super) struct Em {
     pub unsupported_why: BTreeMap<String, usize>,
     pub ignored: BTreeMap<String, usize>,
     tmp: usize,
+    cached_lane_active: bool,
+    pub used_lane_active: bool,
     /// extra write enable of the current DPP16 instruction
     dpp_enable: Option<String>,
     /// PS: interpolation modifier per attribute ("", "centroid", "nointerpolation" …)
@@ -474,6 +476,8 @@ impl Em {
             unsupported_why: BTreeMap::new(),
             ignored: BTreeMap::new(),
             tmp: 0,
+            cached_lane_active: false,
+            used_lane_active: false,
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
             ps_done: false,
@@ -554,6 +558,7 @@ impl Em {
     }
 
     pub fn take(&mut self) -> String {
+        self.cached_lane_active = false;
         std::mem::take(&mut self.out)
     }
 
@@ -607,7 +612,9 @@ impl Em {
 
     fn act(&self) -> &'static str {
         // no short-circuit `?:` (HLSL 2021 makes it a branch – one per instruction at -O0)
-        if self.opt.wave64 {
+        if self.cached_lane_active {
+            "xcl_lane_active"
+        } else if self.opt.wave64 {
             "lanebit(exec_lo, exec_hi)"
         } else {
             "(((exec_lo >> lane_id) & 1u) != 0u)"
@@ -851,7 +858,27 @@ impl Em {
 
     // ---------------------------------------------------------------- one instruction
 
-    pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
+    // Only ordinary vector ALU instructions whose sole output is a VGPR.
+    // Scalar destinations, compare-and-update-EXEC, and modified encodings stay on the
+    // general path. Never carry a predicate around a branch or into another basic block.
+    fn masked_vector_result(d: &Decoded) -> bool {
+        if d.variant != Variant::Plain || !matches!(d.enc.name, "ENC_VOP1" | "ENC_VOP2" | "ENC_VOP3")
+            || d.inst.name.starts_with("V_CMP") {
+            return false;
+        }
+        let mut outputs = d.ienc.operands.iter().filter(|o| o.output);
+        outputs.next().is_some_and(|o| o.field == Some("VDST") && o.ty == "OPR_VGPR")
+            && outputs.next().is_none()
+    }
+
+    pub fn inst(&mut self, d: &Decoded, next: u64, following: Option<&Decoded>) -> Flow {
+        if !Self::masked_vector_result(d) {
+            self.cached_lane_active = false;
+        } else if !self.cached_lane_active && following.is_some_and(Self::masked_vector_result) {
+            self.line(&format!("xcl_lane_active = {};", self.act()));
+            self.cached_lane_active = true;
+            self.used_lane_active = true;
+        }
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));

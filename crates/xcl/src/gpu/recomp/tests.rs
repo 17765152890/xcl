@@ -6919,6 +6919,62 @@ fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
 }
 
 #[test]
+fn gpu_exec_predicate_recomputed_at_branch_join() {
+    if !gpu_ready() {
+        return;
+    }
+
+    for wave64 in [false, true] {
+        let mut code = Vec::new();
+        let mut inst = |name, enc, fields: &[(&str, u64)], literal| {
+            code.extend(encode(name, enc, fields, literal).unwrap());
+        };
+        inst("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555));
+        if wave64 {
+            inst("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555));
+        }
+        inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None);
+        inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 130)], None);
+        inst("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None);
+        // Jump over the two-dword mask write and its two vector instructions.
+        inst("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 4)], None);
+        let changed_half = if wave64 { 127 } else { 126 };
+        inst("S_MOV_B32", "ENC_SOP1", &[("SDST", changed_half), ("SSRC0", 255)], Some(0xAAAA_AAAA));
+        inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 131)], None);
+        inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 132)], None);
+        inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 133)], None);
+        inst("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 134)], None);
+        inst("S_ENDPGM", "ENC_SOPP", &[], None);
+
+        let options = on_gpu(Options { wave64, ..Default::default() });
+        let t = translate(&code, &options).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert_eq!(t.hlsl.matches("xcl_lane_active =").count(), 3, "{}", t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let lanes = if wave64 { 64 } else { 32 };
+        for (branch_input, taken) in [(0, true), (1, false)] {
+            let mut st = KernelState::default();
+            st.sgpr[0] = branch_input;
+            let result = runner::run(&dxil, &st, &[]).unwrap();
+            for (lane, registers) in result.vgpr.iter().enumerate().take(lanes) {
+                let initially_active = lane % 2 == 0;
+                let flip = !taken && (!wave64 || lane >= 32);
+                let active = initially_active ^ flip;
+                let expected = [
+                    u32::from(initially_active),
+                    2 * u32::from(initially_active),
+                    3 * u32::from(!taken && active),
+                    4 * u32::from(!taken && active),
+                    5 * u32::from(active),
+                    6 * u32::from(active),
+                ];
+                assert_eq!(registers[4..10], expected, "wave{lanes}, split={}, lane {lane}, taken={taken}", options.split_wave64);
+            }
+        }
+    }
+}
+
+#[test]
 fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
     let run_case = |wave64: bool, split_wave64: bool| {
         let mut insns: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
