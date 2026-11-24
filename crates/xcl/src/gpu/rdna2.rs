@@ -246,6 +246,25 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
 // formatting (LLVM-like, not byte-for-byte identical)
 // ---------------------------------------------------------------------------------------
 
+/// An operand of a flat / global / scratch instruction as LLVM writes it, None for one the
+/// instruction's form has not. The result register: of an atomic only when it returns one
+/// (GLC), of a load not when it goes to LDS. The address: global, a 64-bit VGPR pair, or a
+/// 32-bit offset beside an SGPR base; scratch, a VGPR or an SGPR, the other `off` (both with
+/// SADDR 0x7f: the offset alone).
+fn flat_operand(d: &Decoded, o: &Operand, f: &str) -> Option<String> {
+    let fv = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (v, saddr, scratch) = (fv(f), fv("SADDR"), d.enc.name == "ENC_FLAT_SCRATCH");
+    match f {
+        "VDST" if d.inst.name.contains("ATOMIC") && fv("GLC") == 0 => None,
+        "VDST" if fv("LDS") == 1 => None,
+        "ADDR" if scratch && saddr != 125 => Some("off".into()),
+        "ADDR" if scratch || (d.enc.name == "ENC_FLAT_GLBL" && saddr != 125) => Some(reg_range("v", v, 32)),
+        "SADDR" if saddr == 125 || (scratch && saddr == 127) => Some("off".into()),
+        "SADDR" => Some(scalar_operand(saddr, if scratch { 32 } else { 64 }, None)),
+        _ => Some(reg_range("v", v, o.size)),
+    }
+}
+
 fn reg_range(prefix: &str, n: u64, size: u16) -> String {
     let k = (size as u64).div_ceil(32).max(1);
     if k == 1 {
@@ -310,6 +329,9 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
     }
     if f == "LITERAL" {
         return Some(format!("{:#x}", d.literal.unwrap_or(0)));
+    }
+    if matches!(d.enc.name, "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH") {
+        return flat_operand(d, o, f);
     }
     if f == "SRC0" && d.variant != Variant::Plain {
         // SDWA / DPP: the real src0 lives in the extension dword
@@ -629,7 +651,20 @@ pub fn format(d: &Decoded) -> String {
                 }
             }
         }
-        "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
+        // the offset: 12 bits, signed but for a flat address; then the flags in LLVM's order
+        "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" => {
+            let offset = field_value(d.enc, &d.words, "OFFSET").unwrap_or(0) as i64;
+            let offset = if d.enc.name != "ENC_FLAT" && offset >= 0x800 { offset - 0x1000 } else { offset };
+            if offset != 0 {
+                let _ = write!(s, " offset:{offset}");
+            }
+            for flag in ["GLC", "SLC", "DLC", "LDS"] {
+                if field_value(d.enc, &d.words, flag) == Some(1) {
+                    let _ = write!(s, " {}", flag.to_ascii_lowercase());
+                }
+            }
+        }
+        "ENC_DS" => {
             for (f, label) in [("OFFSET", "offset"), ("OFFSET0", "offset0"), ("OFFSET1", "offset1")] {
                 if let Some(v) = field_value(d.enc, &d.words, f).filter(|&v| v != 0) {
                     let _ = write!(s, " {label}:{v}");
@@ -712,6 +747,30 @@ mod tests {
 
     fn dis(bytes: &[u8]) -> String {
         format(&decode(bytes, 0).unwrap())
+    }
+
+    /// Every flat / global / scratch line of LLVM's gfx10 tests reads as LLVM writes it: the
+    /// operands the addressing mode has (`off` for the base it has not), a signed offset, the
+    /// flags in LLVM's order.
+    #[test]
+    fn llvm_gfx10_flat_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut wrong) = ([0usize; 3], Vec::new());
+        for file in ["gfx10_flat.txt", "gfx1030_new.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                let Some(kind) = ["flat_", "global_", "scratch_"].iter().position(|k| asm.starts_with(k)) else { continue };
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let got = dis(&bytes);
+                total[kind] += 1;
+                if got != asm {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total[0] > 80 && total[1] > 150 && total[2] > 80, "the flat / global / scratch tests are not all there: {total:?}");
+        assert!(wrong.is_empty(), "{} of {total:?} flat / global / scratch lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
