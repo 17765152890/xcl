@@ -62,6 +62,8 @@ pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_compact;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
