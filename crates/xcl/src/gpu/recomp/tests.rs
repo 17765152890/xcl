@@ -4942,6 +4942,8 @@ fn retail_translation_survey() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    // every program in the general structured form is walked against its control flow graph
+    super::structure::CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
     let every: usize = std::env::var("XCL_SURVEY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
     let data = std::fs::read(path).unwrap();
     // XCL_SURVEY_SEED=<n> or "random": a random 1/every of the records (splitmix64), else every N-th
@@ -7451,4 +7453,236 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// An item of `assemble`: an instruction, a branch to a label, or a label.
+enum Asm<'a> {
+    I(&'a str, &'a str, Vec<(&'a str, u64)>),
+    Br(&'a str, &'a str),
+    L(&'a str),
+}
+
+/// Assemble a program with labels (branches: SOPP with the label's offset), ending in s_endpgm.
+fn assemble(items: &[Asm]) -> Vec<u8> {
+    let one = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut labels = std::collections::HashMap::new();
+    let mut pc = 0u64;
+    for a in items {
+        match a {
+            Asm::I(n, e, f) => pc += one(n, e, f).len() as u64,
+            Asm::Br(..) => pc += 4,
+            Asm::L(l) => {
+                labels.insert(*l, pc);
+            }
+        }
+    }
+    let mut v = Vec::new();
+    for a in items {
+        match a {
+            Asm::I(n, e, f) => v.extend(one(n, e, f)),
+            Asm::Br(n, l) => {
+                let off = (labels[l] as i64 - (v.len() as i64 + 4)) / 4;
+                v.extend(one(n, "ENC_SOPP", &[("SIMM16", off as i16 as u16 as u64)]));
+            }
+            Asm::L(_) => {}
+        }
+    }
+    v.extend(one("S_ENDPGM", "ENC_SOPP", &[]));
+    v
+}
+
+fn s_add(d: u64, a: u64, b: u64) -> Asm<'static> {
+    Asm::I("S_ADD_U32", "ENC_SOP2", vec![("SDST", d), ("SSRC0", a), ("SSRC1", b)])
+}
+
+/// scc = bit `bit_reg` (its low 5 bits) of `reg`
+fn s_bit(reg: u64, bit_reg: u64) -> Asm<'static> {
+    Asm::I("S_BITCMP1_B32", "ENC_SOPC", vec![("SSRC0", reg), ("SSRC1", bit_reg)])
+}
+
+/// Retail layout the first structured form could not take (a third of the pack's DXC time
+/// was in such programs): blocks placed after the code they jump back into, entered from
+/// before it – acyclic, though the jumps go backwards – in a loop.
+fn bottom_entries_program() -> Vec<u8> {
+    use Asm::*;
+    assemble(&[
+        L("top"),
+        s_bit(10, 15),
+        Br("S_CBRANCH_SCC1", "bot1"),
+        s_bit(11, 15),
+        Br("S_CBRANCH_SCC1", "bot2"),
+        L("h1"),
+        s_add(0, 0, 129),
+        s_bit(12, 15),
+        Br("S_CBRANCH_SCC1", "h3"),
+        L("h2"),
+        s_add(1, 1, 131),
+        L("h3"),
+        s_add(2, 2, 0),
+        I("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 2), ("VSRC1", 1)]),
+        Br("S_BRANCH", "next"),
+        L("bot1"),
+        s_add(3, 3, 133),
+        s_bit(13, 15),
+        Br("S_CBRANCH_SCC1", "h1"),
+        L("bot2"),
+        s_add(4, 4, 135),
+        s_bit(14, 15),
+        Br("S_CBRANCH_SCC1", "h2"),
+        Br("S_BRANCH", "h3"),
+        L("next"),
+        s_add(15, 15, 129),
+        I("S_CMP_LT_U32", "ENC_SOPC", vec![("SSRC0", 15), ("SSRC1", 160)]),
+        Br("S_CBRANCH_SCC1", "top"),
+    ])
+}
+
+/// Nested loops with a back edge to the outer head from the middle of the inner one, two
+/// back edges to the inner head and a jump out of both.
+fn nested_exits_program() -> Vec<u8> {
+    use Asm::*;
+    assemble(&[
+        L("outer"),
+        s_add(6, 6, 129),
+        L("inner"),
+        I("S_CMP_GE_U32", "ENC_SOPC", vec![("SSRC0", 7), ("SSRC1", 128 + 64)]),
+        Br("S_CBRANCH_SCC1", "out"),
+        s_add(7, 7, 129),
+        I("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 7), ("VSRC1", 2)]),
+        s_bit(10, 7),
+        Br("S_CBRANCH_SCC1", "out"),
+        s_bit(11, 7),
+        Br("S_CBRANCH_SCC1", "inner"),
+        s_bit(12, 7),
+        Br("S_CBRANCH_SCC1", "outer"),
+        I("S_CMP_LT_U32", "ENC_SOPC", vec![("SSRC0", 7), ("SSRC1", 128 + 40)]),
+        Br("S_CBRANCH_SCC1", "inner"),
+        L("out"),
+        s_add(5, 5, 7),
+    ])
+}
+
+/// A loop with an if: the first structured form's.
+fn loop_with_if_program() -> Vec<u8> {
+    use Asm::*;
+    assemble(&[
+        L("loop"),
+        s_add(0, 0, 129),
+        s_bit(10, 0),
+        Br("S_CBRANCH_SCC1", "skip"),
+        s_add(1, 1, 131),
+        I("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 1), ("VSRC1", 1)]),
+        L("skip"),
+        I("S_CMP_LT_U32", "ENC_SOPC", vec![("SSRC0", 0), ("SSRC1", 128 + 40)]),
+        Br("S_CBRANCH_SCC1", "loop"),
+    ])
+}
+
+/// A loop entered at two points (irreducible): it stays on the `pc` chain.
+fn two_entry_loop_program() -> Vec<u8> {
+    use Asm::*;
+    assemble(&[
+        s_bit(10, 128),
+        Br("S_CBRANCH_SCC1", "b"),
+        L("a"),
+        s_add(0, 0, 129),
+        I("S_CMP_GE_U32", "ENC_SOPC", vec![("SSRC0", 0), ("SSRC1", 128 + 20)]),
+        Br("S_CBRANCH_SCC1", "end"),
+        L("b"),
+        s_add(1, 1, 0),
+        s_bit(11, 0),
+        Br("S_CBRANCH_SCC1", "a"),
+        s_add(2, 2, 129),
+        Br("S_BRANCH", "a"),
+        L("end"),
+    ])
+}
+
+/// `translate` with the general structured form for every program with branches.
+fn translate_general(code: &[u8], opt: &Options) -> Result<super::Translation, String> {
+    super::structure::GENERAL_ONLY.with(|g| g.set(true));
+    let t = translate(code, opt);
+    super::structure::GENERAL_ONLY.with(|g| g.set(false));
+    t
+}
+
+/// Programs `structurable` rejects get the general structured form (`structure`), checked
+/// against their control flow graph (`structure::CHECK`); an irreducible one keeps the
+/// `pc` chain.
+#[test]
+fn general_structure_takes_what_the_first_form_cannot() {
+    super::structure::CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+    for (name, code) in [("bottom entries", bottom_entries_program()), ("nested exits", nested_exits_program())] {
+        for t in [translate(&code, &Options::default()), translate_general(&code, &Options::default())] {
+            let t = t.unwrap();
+            assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+            assert!(!t.hlsl.contains("pc =="), "{name}:\n{}", t.hlsl);
+            if super::dxc::location().is_ok() {
+                super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name}: {e}\n{}", t.hlsl));
+            }
+        }
+    }
+    // a jump out of both loops: through xcl_br
+    let t = translate(&nested_exits_program(), &Options::default()).unwrap();
+    assert!(t.hlsl.contains("xcl_br = ") && t.hlsl.contains("do {"), "{}", t.hlsl);
+    // the first form's program, also in the general one
+    let code = loop_with_if_program();
+    let (first, general) = (translate(&code, &Options::default()).unwrap(), translate_general(&code, &Options::default()).unwrap());
+    assert!(!general.hlsl.contains("pc =="), "{}", general.hlsl);
+    if std::env::var_os("XCL_RECOMP_GENERAL").is_none() {
+        assert!(first.hlsl != general.hlsl);
+    }
+    let t = translate(&two_entry_loop_program(), &Options::default()).unwrap();
+    assert!(t.hlsl.contains("pc =="), "{}", t.hlsl);
+}
+
+/// The general structured form computes what the `pc` chain does (several inputs, both wave
+/// sizes): the programs above, also forced through it where the first form would do.
+#[test]
+fn gpu_general_structure_matches_the_pc_chain() {
+    super::structure::CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+    // wave64 also where the GPU runs it in the split form
+    let waves = if gpu_ready() { vec![true, false] } else { vec![] };
+    for wave64 in waves {
+        let opt = on_gpu(Options { wave64, ..Default::default() });
+        let programs = [
+            ("bottom entries", bottom_entries_program()),
+            ("nested exits", nested_exits_program()),
+            ("two entries", two_entry_loop_program()),
+            ("loop with if", loop_with_if_program()),
+        ];
+        for (name, code) in programs {
+            let compile = |t: Result<super::Translation, String>| {
+                let t = t.unwrap();
+                super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name}: {e}\n{}", t.hlsl))
+            };
+            let pc = compile(translate(&code, &Options { structured: false, ..opt.clone() }));
+            let default = compile(translate(&code, &opt));
+            let general = compile(translate_general(&code, &opt));
+            let mut seed = 0x1234_5678_9ABC_DEF1u64;
+            for case in 0..6 {
+                let mut st = KernelState::default();
+                for r in 10..15 {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    // the loops' exits: not every bit set
+                    st.sgpr[r] = (seed as u32) & !(1 << (case * 5));
+                }
+                for l in 0..64 {
+                    st.vgpr[l][1] = l as u32;
+                    st.vgpr[l][2] = 100 + l as u32;
+                }
+                let want = runner::run(&pc, &st, &[]).unwrap();
+                for (form, dxil) in [("default", &default), ("general", &general)] {
+                    let got = runner::run(dxil, &st, &[]).unwrap();
+                    let w = if wave64 { 64 } else { 32 };
+                    assert_eq!(got.sgpr[..16], want.sgpr[..16], "{name}, {form}, wave{w}, case {case}");
+                    for l in 0..w {
+                        assert_eq!((got.vgpr[l][1], got.vgpr[l][2]), (want.vgpr[l][1], want.vgpr[l][2]), "{name}, {form}, wave{w}, lane {l}, case {case}");
+                    }
+                }
+            }
+        }
+    }
 }
