@@ -5831,7 +5831,8 @@ fn gpu_split_wave64_uniform_readfirstlane() {
     }
     let r = runner::run_code(&code, &st, &[]).unwrap();
     let expected_rcp = ((1.0f32 / 7.0f32) * f32::from_bits(0x4f7f_fffe)) as u32;
-    assert!((r.sgpr[6] as i64 - expected_rcp as i64).abs() <= 2, "s6={} expected~={expected_rcp}", r.sgpr[6]);
+    // At magnitude ~6.1e8 (2^29), 1 float32 ULP is 2^(29-23) = 64 (AMD v_rcp_f32 differs by 1 ULP from 1.0f/7.0f).
+    assert!((r.sgpr[6] as i64 - expected_rcp as i64).abs() <= 128, "s6={} expected~={expected_rcp}", r.sgpr[6]);
     assert_eq!(r.sgpr[7], 3, "both halves compute (uint)(1.5 + 2.25) == 3 with exec_lo == 0");
     assert_eq!(r.vgpr[40][3], 3, "active lane 40 updated v3");
     assert_eq!(r.vgpr[0][3], 0xBEEF_0000, "inactive lane 0 kept old v3");
