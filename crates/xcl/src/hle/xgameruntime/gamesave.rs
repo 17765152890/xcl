@@ -130,13 +130,59 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+/// Encode `path` as a NUL-terminated UTF-16 Win32 verbatim path (`\\?\...` or `\\?\UNC\...`) so
+/// `MoveFileExW` accepts paths longer than `MAX_PATH` (260 UTF-16 units), matching `std::fs`.
+#[cfg(windows)]
+fn verbatim_wide(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Component;
+    const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const DEVICE: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16];
+    const VERBATIM_UNC: [u16; 8] = [
+        b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16, b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16,
+    ];
+    let abs = std::path::absolute(path)?;
+    let raw: Vec<u16> = abs.as_os_str().encode_wide().collect();
+    if raw.starts_with(&VERBATIM) || raw.starts_with(&DEVICE) {
+        let mut out = raw;
+        out.push(0);
+        return Ok(out);
+    }
+    // Verbatim `\\?\` paths bypass Win32 path normalization, so fold `.`, `..`, and `/` first.
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::Prefix(p) => norm.as_mut_os_string().push(p.as_os_str()),
+            Component::RootDir => norm.as_mut_os_string().push(r"\"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                norm.pop();
+            }
+            Component::Normal(seg) => norm.push(seg),
+        }
+    }
+    let wide: Vec<u16> = norm.as_os_str().encode_wide().collect();
+    let mut out = if let Some(rest) = wide.strip_prefix(&[b'\\' as u16, b'\\' as u16]) {
+        let mut v = Vec::with_capacity(VERBATIM_UNC.len() + rest.len() + 1);
+        v.extend_from_slice(&VERBATIM_UNC);
+        v.extend_from_slice(rest);
+        v
+    } else {
+        let mut v = Vec::with_capacity(VERBATIM.len() + wide.len() + 1);
+        v.extend_from_slice(&VERBATIM);
+        v.extend_from_slice(&wide);
+        v
+    };
+    out.push(0);
+    Ok(out)
+}
+
 fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let src = verbatim_wide(tmp)?;
+        let dst = verbatim_wide(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -1132,6 +1178,102 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// A blob whose path passes MAX_PATH (260 UTF-16 units) is created, overwritten, and read back
+    /// through both `apply` and the public `XGameSave` API without leaving temp files behind.
+    #[test]
+    fn a_blob_past_max_path_is_saved() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-path-{}-{nonce}", std::process::id()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let dir = root.join("a".repeat(200));
+        let blob_path = dir.join("b").join("data");
+        assert!(blob_path.as_os_str().len() > 260, "test path must exceed MAX_PATH: {}", blob_path.display());
+
+        let ops1 = [("data".to_string(), Some(b"first".to_vec()))];
+        assert_eq!(apply(&dir, Some("Long 1"), &ops1), S_OK);
+        assert_eq!(std::fs::read(&blob_path).ok().as_deref(), Some(&b"first"[..]));
+        assert_eq!(std::fs::read_to_string(dir.join("display")).ok().as_deref(), Some("Long 1"));
+
+        // Overwrite an existing blob and display file past MAX_PATH (MOVEFILE_REPLACE_EXISTING).
+        let ops2 = [("data".to_string(), Some(b"second".to_vec()))];
+        assert_eq!(apply(&dir, Some("Long 2"), &ops2), S_OK);
+        assert_eq!(std::fs::read(&blob_path).ok().as_deref(), Some(&b"second"[..]));
+        assert_eq!(std::fs::read_to_string(dir.join("display")).ok().as_deref(), Some("Long 2"));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("b"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+        // End-to-end C API with a 190-character container name (GDK allows up to 256).
+        let api_root = root.join("provider");
+        std::fs::create_dir_all(&api_root).unwrap();
+        let cname = format!("{}\0", "c".repeat(190));
+        unsafe {
+            let p = Box::into_raw(Box::new(Provider { magic: MAGIC_PROVIDER, root: api_root.clone() }));
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr(), &mut c), S_OK);
+            assert!((*c).dir.join("b").join("slot").as_os_str().len() > 260);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, c"API Long".as_ptr().cast(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, c"slot".as_ptr().cast(), b"payload".as_ptr(), 7), S_OK);
+            let hr = XGameSaveSubmitUpdate(u);
+            XGameSaveCloseUpdate(u);
+            assert_eq!(hr, S_OK);
+
+            let names = [c"slot".as_ptr().cast()];
+            let mut n = 1u32;
+            let mut buf = vec![0u64; 32];
+            assert_eq!(XGameSaveReadBlobData(c, names.as_ptr(), &mut n, 256, buf.as_mut_ptr() as *mut Blob), S_OK);
+            assert_eq!(n, 1);
+            let b0 = &*(buf.as_ptr() as *const Blob);
+            assert_eq!(std::slice::from_raw_parts(b0.data, b0.info.size as usize), b"payload");
+
+            XGameSaveCloseContainer(c);
+            XGameSaveCloseProvider(p);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_wide_normalizes_and_prefixes_win32_paths() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let to_os = |p: &Path| {
+            let w = verbatim_wide(p).unwrap();
+            assert_eq!(w.last(), Some(&0));
+            OsString::from_wide(&w[..w.len() - 1])
+        };
+        assert_eq!(to_os(Path::new(r"C:\saves\slot\data")), OsString::from(r"\\?\C:\saves\slot\data"));
+        assert_eq!(to_os(Path::new(r"C:/saves/a/../b/./data")), OsString::from(r"\\?\C:\saves\b\data"));
+        assert_eq!(to_os(Path::new(r"C:\..\..\root")), OsString::from(r"\\?\C:\root"));
+        assert_eq!(to_os(Path::new(r"\\?\C:\already\verbatim")), OsString::from(r"\\?\C:\already\verbatim"));
+        assert_eq!(to_os(Path::new(r"\\.\C:\device\path")), OsString::from(r"\\.\C:\device\path"));
+        assert_eq!(
+            to_os(Path::new(r"\\server\share\dir\..\file")),
+            OsString::from(r"\\?\UNC\server\share\file")
+        );
+
+        // Unpaired UTF-16 surrogate code units must survive without UTF-8 lossy replacement.
+        let mut surrogate: Vec<u16> = OsString::from(r"C:\saves\").encode_wide().collect();
+        surrogate.push(0xD800);
+        let input = PathBuf::from(OsString::from_wide(&surrogate));
+        let mut expected: Vec<u16> = OsString::from(r"\\?\C:\saves\").encode_wide().collect();
+        expected.push(0xD800);
+        assert_eq!(to_os(&input), OsString::from_wide(&expected));
     }
 
 }
