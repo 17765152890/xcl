@@ -345,6 +345,69 @@ fn gpu_v_swaprel_b32() {
 }
 
 #[test]
+fn gpu_v_movrelsd_and_movrelsd_2() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        // v_movrelsd_b32: m0 = 3 -> v23 = v13 (all lanes)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 131)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // v_movrelsd_b32 under EXEC (even lanes only): m0 = 2 -> v22 = v12
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 130)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // restore EXEC = all lanes
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 32)], None),
+        // v_movrelsd_2_b32: m0 = (5 << 16) | 1 | high junk bits -> v25 = v11
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0xFC00_FC00 | (5 << 16) | 1)),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // v_movrelsd_2_b32 under EXEC (odd lanes only): m0 = (4 << 16) | 0 -> v24 = v10
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 34)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(4 << 16)),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // restore EXEC = all lanes; overlapping self-copy v11 = v11 is a no-op
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 32)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 129)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 10)], None),
+        // relative targets lie within the program's VGPRs: v26 used directly
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V + 26)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[30] = 0x5555_5555;
+    st.sgpr[31] = 0x5555_5555;
+    st.sgpr[32] = 0xFFFF_FFFF;
+    st.sgpr[33] = 0xFFFF_FFFF;
+    st.sgpr[34] = 0xAAAA_AAAA;
+    st.sgpr[35] = 0xAAAA_AAAA;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        for k in 0..6u32 {
+            r[10 + k as usize] = 1000 + k * 100 + l as u32;
+            r[20 + k as usize] = 5000 + k * 100 + l as u32;
+        }
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let lane = l as u32;
+        // Untouched slots stay intact
+        assert_eq!(v[20], 5000 + lane, "lane {l} v20 untouched");
+        assert_eq!(v[21], 5100 + lane, "lane {l} v21 untouched");
+        // v_movrelsd_b32 (all lanes): v23 = v13
+        assert_eq!(v[23], 1300 + lane, "lane {l} v_movrelsd_b32");
+        // v_movrelsd_b32 (even lanes): v22 = v12 on even, original on odd
+        assert_eq!(v[22], if l % 2 == 0 { 1200 + lane } else { 5200 + lane }, "lane {l} v_movrelsd_b32 EXEC");
+        // v_movrelsd_2_b32 (all lanes, masked M0): v25 = v11
+        assert_eq!(v[25], 1100 + lane, "lane {l} v_movrelsd_2_b32");
+        // v_movrelsd_2_b32 (odd lanes): v24 = v10 on odd, original on even
+        assert_eq!(v[24], if l % 2 == 1 { 1000 + lane } else { 5400 + lane }, "lane {l} v_movrelsd_2_b32 EXEC");
+        // Overlapping self-copy kept v11 intact
+        assert_eq!(v[11], 1100 + lane, "lane {l} v_movrelsd_b32 self-copy");
+    }
+    assert_eq!((r.sgpr[126], r.sgpr[127]), (0xFFFF_FFFF, 0xFFFF_FFFF), "exec restored");
+}
+
+#[test]
 fn atomic_inc_dec_x2_encoding_families() {
     let code = prog(&[
         ("BUFFER_ATOMIC_INC_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 0), ("SOFFSET", 128)], None),
