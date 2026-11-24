@@ -25,3 +25,9 @@ The host present total counts calls accepted by DXGI. Confirm visible rendering 
 VIctory `d2a4bae` passed mapping and import binding on the same 69-file set. An isolated boot using native D3D12 logged presented frames through index 16 and then stopped at `0x80000003`, guest image offset `+0x1dac734`. Both runtimes stopped before the menu on this file set. [VIctory source revision](https://github.com/Marvisak/VIctory/commit/d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989)
 
 An additional run with XCL `4017f8f` first presented at 5.445 seconds and hit the same stop at 9.062 seconds. Its activity log counted two host presents and 5,372 DirectStorage requests with zero failures through the last completed interval at 8.004 seconds. The final partial interval falls outside those counts. [XCL source revision](https://github.com/ivall/xcl/commit/4017f8ff8faaae6007fd83910d230a027dd85a33)
+
+## Complete package
+
+The next XCL run added the rest of the pinned package for 109 verified files total. It used the `7ebf1b8` diagnostics branch, a 512 MiB coherent window, `XCL_ACTIVITY=1`, and a cleared frame-dump setting. The first accepted 4K present was at 5.466 seconds. XCL continued presenting until the isolated launcher stopped it at its 60-second limit. The earlier `+0x1dac734` exception did not recur.
+
+The last ten two-second activity windows each counted 6–8 host presents, with no reported frame-event timeout or DirectStorage failure in those windows. That is 3–4 accepted presents per second in the late samples. Visible rendering and input remain to be checked. [Pinned package manifest](https://github.com/4ld0-vito/Leonida/blob/05e821e2/game/xbox-1.0.2.1.json)
