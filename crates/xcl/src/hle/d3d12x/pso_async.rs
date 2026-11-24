@@ -157,15 +157,29 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
+                BUSY.fetch_add(1, Ordering::AcqRel);
+                BACKLOG.fetch_sub(1, Ordering::AcqRel);
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
                     build(&p, job, false);
                 }
+                BUSY.fetch_sub(1, Ordering::AcqRel);
             });
         }
         Mutex::new(tx)
     })
+}
+
+/// builds sent to the workers that none has taken yet
+static BACKLOG: AtomicUsize = AtomicUsize::new(0);
+/// workers at a build
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// `p`'s build goes to the workers.
+fn send(p: Arc<Pending>) {
+    BACKLOG.fetch_add(1, Ordering::AcqRel);
+    let _ = queue().lock().unwrap().send(p);
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -216,7 +230,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        self::send(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -429,6 +443,56 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A build is waited for when a worker has started it or is free to; not behind others.
+    #[test]
+    fn a_bind_waits_only_for_a_build_a_worker_has_or_can_start() {
+        assert!(worth_waiting(false, 1, 0, 4), "its own build in the queue, every worker free");
+        assert!(worth_waiting(false, 1, 3, 4), "one worker free for it");
+        assert!(!worth_waiting(false, 1, 4, 4), "every worker at a build");
+        assert!(!worth_waiting(false, 3, 2, 4), "two free workers, two builds ahead of it");
+        assert!(worth_waiting(true, 9, 4, 4), "a worker is at it");
+    }
+
+    /// With a build ahead for every worker, binds of other pipelines do not each wait their
+    /// budget: they get the stand-in at once, and the real pipeline once the workers have come to it.
+    #[test]
+    fn binds_of_pipelines_behind_the_workers_queue_do_not_wait() {
+        let workers = crate::gpu::recomp::dxc::compile_threads();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let blockers: Vec<usize> = (0..workers).map(|k| 0x7E57_C000 + k).collect();
+        for &standin in &blockers {
+            let gate = gate.clone();
+            submit(standin, false, Box::new(move || {
+                let (open, cv) = &*gate;
+                let _ = cv.wait_timeout_while(open.lock().unwrap(), std::time::Duration::from_secs(20), |o| !*o).unwrap();
+                0x5252
+            }));
+        }
+        // (as many builds held as there are workers: each is in the queue or at a worker)
+        let standins: Vec<usize> = (0..6).map(|k| 0x7E57_D000 + k).collect();
+        for (k, &standin) in standins.iter().enumerate() {
+            submit_lazy(standin, true, Box::new(move || 0x6000 + k), 0);
+        }
+        let budget = Some(std::time::Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        for &standin in &standins {
+            assert_eq!(resolve_wait_for(standin, budget), standin, "behind the workers' queue: the stand-in");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(900), "six binds waited {:?} (6 x 300 ms when each waits its budget)", t.elapsed());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let start = std::time::Instant::now();
+        while blockers.iter().chain(&standins).any(|&s| is_pending(s)) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for (k, &standin) in standins.iter().enumerate() {
+            assert_eq!(resolve_wait_for(standin, budget), 0x6000 + k, "built by a worker");
+        }
+        for standin in blockers.into_iter().chain(standins) {
+            let _ = released(standin);
+        }
+    }
+
     #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
@@ -472,7 +536,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                send(p);
             }
             pso
         }
@@ -517,8 +581,19 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
+/// A bind with a budget waits for a build only when the budget can help: a worker has `started`
+/// it, or one is free to (`backlog` builds no worker has taken yet, this one among them, and
+/// `busy` workers at a build, of `workers`). A build behind others in the queue is not waited
+/// for: each such bind held the title its whole budget for nothing, and a retail game binds
+/// hundreds of pipelines for the first time when its world starts (over 513 in 10 s at 50 ms:
+/// its three recording threads submitted nothing for 22 s, with a 30 s watchdog).
+fn worth_waiting(started: bool, backlog: usize, busy: usize, workers: usize) -> bool {
+    started || backlog + busy <= workers
+}
+
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
-/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
+/// pipeline not built by then – or behind other builds in the workers' queue, which is not
+/// waited for (`worth_waiting`) – is `late`: it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
@@ -529,9 +604,20 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        send(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
+        return pso;
+    }
+    let started = p.job.lock().unwrap().is_none();
+    let (backlog, busy) = (BACKLOG.load(Ordering::Acquire), BUSY.load(Ordering::Acquire));
+    if !worth_waiting(started, backlog, busy, crate::gpu::recomp::dxc::compile_threads()) {
+        p.late.store(true, Ordering::Release);
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 4 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: a pipeline in the workers' queue ({backlog} builds waiting, {busy} workers busy) is not waited for: its binds go on without it until it is built ({} so far)", n + 1);
+        }
         return pso;
     }
     p.want();
