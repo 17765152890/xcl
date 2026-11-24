@@ -1,7 +1,7 @@
 # XCL – Xbox Series X|S → Windows compatibility layer
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
-**Discord: <https://discord.gg/yB5tstRHrn>**
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/xcl)
+**Discord: <https://discord.com/invite/xcl>**
 
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
 x64 code runs natively and XCL stands in for the console libraries the PC does not have
@@ -149,6 +149,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
 
+Run the full suite before opening a pull request. Runtime changes in
+`crates/xcl/src` additionally require a regression run with
+`scripts/smoke.ps1 -Game <game folder>`; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+Post GPU test results and hardware reports in
+[#42](https://github.com/ivall/xcl/issues/42).
+
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
 another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
@@ -167,3 +174,13 @@ part of the repository.
 machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, AnyPS5,
 libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
 repository contains no headers or binaries from the console SDK.
+
+## Contributing
+
+Contributions are welcome. Before opening a pull request, read
+[`CONTRIBUTING.md`](CONTRIBUTING.md); it explains the required tests, pull-request
+scope, commit style and regression-run rules.
+
+AI-assisted contributions are allowed under the rules in
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md). Test results for
+specific GPUs belong in [#42](https://github.com/ivall/xcl/issues/42).
