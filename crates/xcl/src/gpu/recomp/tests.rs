@@ -6901,6 +6901,39 @@ fn gpu_ldexp_f32() {
     }
 }
 
+// With a zero product the legacy FMA still adds: the product is +0.0 and c is added to it,
+// so c = -0.0 comes out +0.0 (LLVM folds fma_legacy(+/-0.0, x, y) to fadd y, 0.0).
+#[test]
+fn gpu_fma_legacy_zero_product_adds_c() {
+    let p = prog(&[
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V), ("VSRC1", 1)], None),
+    ]);
+    const NEG0: u32 = 0x8000_0000;
+    // (a, b, c, want)
+    const CASES: [(u32, u32, u32, u32); 6] = [
+        (0x0000_0000, 0x4040_0000, NEG0, 0x0000_0000),         // +0 * 3 + -0 = +0
+        (NEG0, 0x4040_0000, NEG0, 0x0000_0000),                // -0 * 3 + -0 = +0
+        (0x4040_0000, NEG0, NEG0, 0x0000_0000),                // 3 * -0 + -0 = +0
+        (0x0000_0000, 0x7F80_0000, NEG0, 0x0000_0000),         // +0 * inf + -0 = +0
+        (NEG0, 0xFFC0_0000, NEG0, 0x0000_0000),                // -0 * NaN + -0 = +0
+        (0x0000_0000, 0x4040_0000, 0xBF80_0000, 0xBF80_0000),  // +0 * 3 + -1 = -1
+    ];
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, c, _) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2], r[5]) = (a, b, c, c);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, c, want) = CASES[l % CASES.len()];
+            assert_eq!(v[4], want, "wave{lanes} lane {l} v_fma_legacy_f32({a:#010x}, {b:#010x}, {c:#010x})");
+            assert_eq!(v[5], want, "wave{lanes} lane {l} v_fmac_legacy_f32({a:#010x}, {b:#010x}, {c:#010x})");
+        }
+    }
+}
+
 #[test]
 fn gpu_f64_literal_high_word() {
     for wave64 in gpu_waves() {
