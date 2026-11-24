@@ -201,6 +201,11 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     r
 }
 
+struct PendingBatch {
+    fence_value: u64,
+    temp_staging: Option<ID3D12Resource>,
+}
+
 /// Reusable command allocator, list, fence, event, and persistently-mapped upload staging
 /// buffer for repeated texture batch uploads (e.g. per-frame video planes and streamed textures).
 pub struct BatchUploader {
@@ -209,7 +214,10 @@ pub struct BatchUploader {
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
     fence_value: u64,
+    wait_timeout_ms: u32,
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    pending: Option<PendingBatch>,
+    removed: bool,
 }
 
 // SAFETY: D3D12 objects, the event handle, and the persistently-mapped upload buffer pointer
@@ -240,7 +248,48 @@ impl BatchUploader {
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(err)?;
-        Ok(Self { alloc, list, fence, event, fence_value: 0, staging: None })
+        Ok(Self {
+            alloc,
+            list,
+            fence,
+            event,
+            fence_value: 0,
+            wait_timeout_ms: 10_000,
+            staging: None,
+            pending: None,
+            removed: false,
+        })
+    }
+
+    /// Wait for any previously submitted batch to complete before touching the staging buffer or
+    /// resetting the command allocator. Retains `pending` (and any temporary staging allocation)
+    /// across timeouts; clears it and marks the uploader unusable on device removal.
+    unsafe fn finish_pending(&mut self, dev: &ID3D12Device) -> Result<(), String> {
+        if self.removed {
+            let reason = dev
+                .GetDeviceRemovedReason()
+                .err()
+                .unwrap_or_else(|| windows::core::Error::from_hresult(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED));
+            return Err(format!("texture copy: {}", fence::FenceError::Removed(reason)));
+        }
+        let Some(target) = self.pending.as_ref().map(|p| p.fence_value) else {
+            return Ok(());
+        };
+        if target == u64::MAX {
+            return Err("texture copy: previous upload did not signal its fence".into());
+        }
+        match fence::wait(&self.fence, target, dev, Some(self.event), self.wait_timeout_ms) {
+            Ok(()) => {
+                self.pending = None;
+                Ok(())
+            }
+            Err(fence::FenceError::Removed(e)) => {
+                self.removed = true;
+                self.pending = None;
+                Err(format!("texture copy: {}", fence::FenceError::Removed(e)))
+            }
+            Err(e) => Err(format!("texture copy: {e}")),
+        }
     }
 
     /// Upload `items` on `queue` using the reused allocator, list, fence, and staging buffer.
@@ -253,6 +302,7 @@ impl BatchUploader {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.finish_pending(dev)?;
         struct Plan {
             index: usize,
             fps: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -379,11 +429,19 @@ impl BatchUploader {
         self.list.Close().map_err(err)?;
         queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&self.list).map_err(err)?)]);
         self.fence_value += 1;
-        let copy_error = |e| format!("texture copy: {e}");
-        queue.Signal(&self.fence, self.fence_value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-        let r = fence::wait(&self.fence, self.fence_value, dev, Some(self.event), 10_000).map_err(copy_error);
-        drop(temp_staging);
-        r?;
+        if let Err(e) = queue.Signal(&self.fence, self.fence_value) {
+            let fe = fence::api_error(dev, "Signal", e);
+            if matches!(fe, fence::FenceError::Removed(_)) {
+                self.removed = true;
+            } else {
+                // The list was submitted without a fence signal; retain any temporary staging and
+                // block reuse permanently rather than racing the GPU.
+                self.pending = Some(PendingBatch { fence_value: u64::MAX, temp_staging });
+            }
+            return Err(format!("texture copy: {fe}"));
+        }
+        self.pending = Some(PendingBatch { fence_value: self.fence_value, temp_staging });
+        self.finish_pending(dev)?;
         Ok(failed)
     }
 }
@@ -878,6 +936,43 @@ mod tests {
             let failed3 = uploader.upload_batch(&dev, &queue, &[(res_a.clone(), bad, vec![SHADER_READ])]).unwrap();
             assert_eq!(failed3.len(), 1);
             assert_eq!(failed3[0].0, 0);
+        }
+    }
+
+    #[test]
+    fn gpu_batch_uploader_retains_pending_batch_and_blocks_reuse_until_completion() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
+        let t = image(rgba8, ImageType::D2, 32, 16, 1, 1, 0, 0x68_0000);
+        let (subs_old, mem) = console_texture(&t);
+        let subs_new: Vec<Subresource> = subs_old.iter().map(|s| Subresource { data: s.data.iter().map(|&b| b ^ 0xA5).collect(), ..s.clone() }).collect();
+        unsafe {
+            let res = create(&dev, &queue, &t, &mem, CONSOLE_PIPES).unwrap();
+            let mut uploader = BatchUploader::new(&dev).unwrap();
+
+            // Simulate a submitted batch whose fence wait timed out while still in flight.
+            let held = buffer(&dev, 4096).unwrap();
+            uploader.fence_value = 1;
+            uploader.wait_timeout_ms = 0;
+            uploader.pending = Some(PendingBatch { fence_value: 1, temp_staging: Some(held) });
+
+            let err = uploader.upload_batch(&dev, &queue, &[(res.clone(), subs_new.clone(), vec![SHADER_READ])]).unwrap_err();
+            assert!(err.contains("still pending"), "expected timeout error, got: {err}");
+            assert!(uploader.pending.as_ref().is_some_and(|p| p.fence_value == 1 && p.temp_staging.is_some()));
+            // Texture was not overwritten while the earlier batch remained pending.
+            assert_eq!(read_back(&dev, &queue, &res, &subs_old), subs_old);
+
+            // Once the pending fence completes, the next upload reclaims staging and succeeds.
+            uploader.fence.Signal(1).unwrap();
+            uploader.wait_timeout_ms = 10_000;
+            let failed = uploader.upload_batch(&dev, &queue, &[(res.clone(), subs_new.clone(), vec![SHADER_READ])]).unwrap();
+            assert!(failed.is_empty());
+            assert!(uploader.pending.is_none());
+            assert_eq!(read_back(&dev, &queue, &res, &subs_new), subs_new);
         }
     }
 
