@@ -430,16 +430,90 @@ pub fn missing_console_cpu_features() -> Vec<&'static str> {
     })
 }
 
+/// `XCL_KEEP_ENV=1` copies the caller's environment into the game process unchanged.
+fn inherit_host_env(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Names the game process keeps. `XCL_*` always stays. `PATH` is named here but replaced
+/// with `%SystemRoot%\System32` so a user directory on `PATH` is not copied.
+fn keep_env_name(name: &str) -> bool {
+    if name.len() >= 4 && name[..4].eq_ignore_ascii_case("XCL_") {
+        return true;
+    }
+    const KEEP: &[&str] = &[
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
+        "TEMP",
+        "TMP",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
+        "ProgramData",
+        "ALLUSERSPROFILE",
+    ];
+    KEEP.iter().any(|k| name.eq_ignore_ascii_case(k))
+}
+
+/// UTF-16 environment block for `CreateProcessW` (`NAME=value\0` … `\0`). Credentials and
+/// the user profile are absent. `PATH` is only the system directory.
+fn build_host_env_block(vars: &[(String, String)]) -> Vec<u16> {
+    let system_root = vars
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("SystemRoot"))
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| r"C:\Windows".to_string());
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (k, v) in vars {
+        if k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') || k.eq_ignore_ascii_case("PATH") {
+            continue;
+        }
+        if !keep_env_name(k) || !seen.insert(k.to_ascii_uppercase()) {
+            continue;
+        }
+        out.push((k.clone(), v.clone()));
+    }
+    out.push(("PATH".to_string(), format!(r"{system_root}\System32")));
+    let mut block = Vec::new();
+    for (k, v) in out {
+        block.extend(wide(&format!("{k}={v}")));
+    }
+    block.push(0);
+    block
+}
+
 fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
     };
+    // Unicode environment block. windows-sys names this CREATE_UNICODE_ENVIRONMENT.
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x00000400;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     std::env::set_var("XCL_HOST", boot_path);
     let app = wide(&me.to_string_lossy());
     let mut cmd = wide(cmdline);
     let dir = wide(&cwd.to_string_lossy());
+    let inherit = inherit_host_env(std::env::var("XCL_KEEP_ENV").ok().as_deref());
+    let env_block = if inherit { None } else { Some(build_host_env_block(&std::env::vars().collect::<Vec<_>>())) };
+    if !inherit {
+        println!("  environment: Windows and XCL_* only (XCL_KEEP_ENV=1 keeps the rest)");
+    }
     unsafe {
         let mut si: STARTUPINFOW = std::mem::zeroed();
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -450,8 +524,8 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
             std::ptr::null(),
             std::ptr::null(),
             1,
-            0,
-            std::ptr::null(),
+            if env_block.is_some() { CREATE_UNICODE_ENVIRONMENT } else { 0 },
+            env_block.as_ref().map(|b| b.as_ptr().cast()).unwrap_or(std::ptr::null()),
             dir.as_ptr(),
             &si,
             &mut pi,
@@ -520,6 +594,60 @@ fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_env_block(block: &[u16]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < block.len() && block[i] != 0 {
+            let start = i;
+            while i < block.len() && block[i] != 0 {
+                i += 1;
+            }
+            let s = String::from_utf16_lossy(&block[start..i]);
+            i += 1;
+            let (k, v) = s.split_once('=').expect("NAME=value");
+            out.push((k.to_string(), v.to_string()));
+        }
+        assert_eq!(block.last().copied(), Some(0), "the block ends with an extra NUL");
+        out
+    }
+
+    #[test]
+    fn game_process_environment_drops_credentials_and_the_user_profile() {
+        let vars = vec![
+            ("SystemRoot".into(), r"C:\Windows".into()),
+            ("windir".into(), r"C:\Windows".into()),
+            ("TEMP".into(), r"C:\Users\Ada\AppData\Local\Temp".into()),
+            ("TMP".into(), r"C:\Users\Ada\AppData\Local\Temp".into()),
+            ("LOCALAPPDATA".into(), r"C:\Users\Ada\AppData\Local".into()),
+            ("PATH".into(), r"C:\Users\Ada\bin;C:\Windows\System32".into()),
+            ("Path".into(), r"C:\duplicate".into()),
+            ("XCL_NETWORK".into(), "0".into()),
+            ("xcl_data_root".into(), r"D:\xcl-data".into()),
+            ("USERNAME".into(), "Ada".into()),
+            ("USERPROFILE".into(), r"C:\Users\Ada".into()),
+            ("CLOUD_SECRET".into(), "super-secret-value".into()),
+            ("APPDATA".into(), r"C:\Users\Ada\AppData\Roaming".into()),
+        ];
+        let block = build_host_env_block(&vars);
+        let decoded = decode_env_block(&block);
+        let get = |name: &str| decoded.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+        assert_eq!(get("SystemRoot"), Some(r"C:\Windows"));
+        assert_eq!(get("TEMP"), Some(r"C:\Users\Ada\AppData\Local\Temp"));
+        assert_eq!(get("XCL_NETWORK"), Some("0"));
+        assert_eq!(get("xcl_data_root"), Some(r"D:\xcl-data"));
+        assert_eq!(get("PATH"), Some(r"C:\Windows\System32"));
+        assert_eq!(decoded.iter().filter(|(k, _)| k.eq_ignore_ascii_case("PATH")).count(), 1);
+        for gone in ["USERNAME", "USERPROFILE", "CLOUD_SECRET", "APPDATA"] {
+            assert!(get(gone).is_none(), "{gone} was copied");
+        }
+        let text = String::from_utf16_lossy(&block);
+        assert!(!text.contains("super-secret-value"));
+        assert!(!text.contains(r"C:\Users\Ada\bin"));
+        assert!(inherit_host_env(Some("1")));
+        assert!(!inherit_host_env(Some("0")));
+        assert!(!inherit_host_env(None));
+    }
 
     #[test]
     fn microsoft_game_config_parsing() {

@@ -130,6 +130,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- The game process does not inherit the rest of the environment. It keeps `SystemRoot`, `windir`,
+  `SystemDrive`, `TEMP`, `TMP`, `LOCALAPPDATA`, `XCL_*`, the machine Program Files paths, and a
+  `PATH` of only `%SystemRoot%\System32`. User-profile variables and credentials stored as
+  variables stay in the launching process, so a crash dump of the game does not carry them.
+  `XCL_KEEP_ENV=1` passes the whole environment through.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
