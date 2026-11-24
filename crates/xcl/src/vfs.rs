@@ -446,6 +446,29 @@ impl Vfs {
         !self.is_whiteout(rel) && Path::new(&self.original_path(rel)).exists()
     }
 
+    /// Whether the merged view of `rel` (overlay first, game files second, minus whiteouts)
+    /// holds at least one entry. `RemoveDirectoryW` fails on a non-empty directory, and the
+    /// entries that make it non-empty are often only in the game files.
+    fn merged_dir_has_entries(&self, rel: &str) -> bool {
+        let child_rel = |name: &str| {
+            if rel.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel}\\{name}")
+            }
+        };
+        for root in [self.overlay_path(rel), self.original_path(rel)] {
+            let Ok(entries) = std::fs::read_dir(&root) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !self.is_whiteout(&child_rel(&name)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn exists(&self, rel: &str) -> bool {
         self.visible_in_overlay(rel) || self.visible_in_original(rel)
     }
@@ -642,6 +665,9 @@ impl Vfs {
             if !meta.is_dir() {
                 return Err(ERROR_DIRECTORY);
             }
+            if self.merged_dir_has_entries(rel) {
+                return Err(ERROR_DIR_NOT_EMPTY);
+            }
             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
             if Path::new(&self.original_path(rel)).exists() {
                 self.add_whiteout(rel);
@@ -654,6 +680,11 @@ impl Vfs {
         }
         if !Path::new(&self.original_path(rel)).is_dir() {
             return Err(ERROR_DIRECTORY);
+        }
+        // A game-only folder whose entries are still visible cannot be removed: Windows
+        // reports ERROR_DIR_NOT_EMPTY and the title keeps seeing the contents.
+        if self.merged_dir_has_entries(rel) {
+            return Err(ERROR_DIR_NOT_EMPTY);
         }
         self.add_whiteout(rel);
         self.record_write(rel);
@@ -849,9 +880,49 @@ mod tests {
         assert_eq!(v.create_dir("saves\\slot1"), Ok(()));
         assert!(!f.game().join("saves").exists());
         assert!(v.visible_in_overlay("saves\\slot1"));
+        // `data\` still holds two game files, so the removal fails the way the API does.
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert!(!v.is_whiteout("data"), "a refused removal must not hide the folder");
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(f.game().join("data").exists());
         assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
+    }
+
+    #[test]
+    fn a_non_empty_directory_is_not_removed() {
+        let f = Fixture::new("rmne");
+        let v = &f.vfs;
+
+        // game-only folder with visible entries: refused, and nothing is hidden
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert!(!v.is_whiteout("data\\hello.txt"));
+        assert!(matches!(
+            v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(_)
+        ));
+
+        // an overlay folder holding a file is just as non-empty
+        assert_eq!(v.create_dir("saves"), Ok(()));
+        let ov = v.overlay_path("saves");
+        std::fs::write(Path::new(&ov).join("slot.dat"), b"x").unwrap();
+        assert_eq!(v.remove_dir("saves"), Err(ERROR_DIR_NOT_EMPTY));
+        std::fs::remove_file(Path::new(&ov).join("slot.dat")).unwrap();
+        assert_eq!(v.remove_dir("saves"), Ok(()));
+
+        // an empty game folder is removable, and the removal is recorded as a whiteout
+        std::fs::create_dir_all(f.game().join("empty")).unwrap();
+        assert_eq!(v.remove_dir("empty"), Ok(()));
+        assert!(v.is_whiteout("empty"));
+
+        // a folder whose entries are all deleted (whiteouted) counts as empty
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(v.remove_dir("data"), Ok(()));
+
+        // missing folder keeps the error it had
+        assert_eq!(v.remove_dir("nope"), Err(ERROR_FILE_NOT_FOUND));
     }
 
     #[test]
@@ -1017,6 +1088,12 @@ mod tests {
         std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
         std::fs::write(f.game().join("data").join("sub").join("deep.txt"), b"deep").unwrap();
 
+        // RemoveDirectoryW refuses a non-empty directory, so the entries go first.
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\sub\\deep.txt"), Ok(()));
+        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(v.is_whiteout("data"));
         assert!(v.is_whiteout("data\\hello.txt"));
