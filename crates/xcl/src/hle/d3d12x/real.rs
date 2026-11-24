@@ -170,6 +170,9 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// `mem`, `mem1`.. of recompiled shaders. (buffer, GPU VA) per window, kept for the process
 /// lifetime.
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// Lock-free mirror of the first 4 UMA window GPU VAs (`u2`..`u5`), published on `open_uma`.
+static UMA_WINDOW_VAS_FAST: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static UMA_WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
 static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
 /// console buffers placed in unified memory: resource → (address, bytes)
@@ -195,7 +198,43 @@ pub fn uma_gpu_va() -> u64 {
 
 /// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
 pub fn uma_window_vas() -> Vec<u64> {
+    let n = UMA_WINDOW_COUNT.load(Ordering::Acquire);
+    if n > 0 && n <= UMA_WINDOW_VAS_FAST.len() {
+        return (0..n).map(|i| UMA_WINDOW_VAS_FAST[i].load(Ordering::Acquire)).collect();
+    }
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
+}
+
+/// Lock-free stack snapshot `(vas, count)` of the first 4 UMA window GPU VAs (`u2`..`u5`).
+#[inline]
+pub fn uma_window_vas_fast() -> ([u64; 4], usize) {
+    let n = UMA_WINDOW_COUNT.load(Ordering::Acquire);
+    if n == 0 {
+        return ([0; 4], 0);
+    }
+    if n <= UMA_WINDOW_VAS_FAST.len() {
+        let mut out = [0u64; 4];
+        for i in 0..n {
+            out[i] = UMA_WINDOW_VAS_FAST[i].load(Ordering::Acquire);
+        }
+        return (out, n);
+    }
+    let vas = uma_window_vas();
+    let mut out = [0u64; 4];
+    let copy_n = vas.len().min(4);
+    out[..copy_n].copy_from_slice(&vas[..copy_n]);
+    (out, vas.len())
+}
+
+/// GPU virtual address of a UMA address using an already-acquired `Uma` and `uma_window_vas_fast` snapshot.
+#[inline]
+pub fn uma_va_of_in(u: &crate::gpu::uma::Uma, windows: &[u64; 4], count: usize, p: usize) -> Option<u64> {
+    let k = u.window_of(p)?;
+    if k < count && k < windows.len() {
+        return Some(windows[k] + (p - u.window(k).0) as u64);
+    }
+    let base = UMA_BUFFER.lock().ok()?.get(k)?.1;
+    Some(base + (p - u.window(k).0) as u64)
 }
 
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
@@ -213,7 +252,12 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
-    Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
+    let n = UMA_WINDOW_COUNT.load(Ordering::Acquire);
+    if k < n && k < UMA_WINDOW_VAS_FAST.len() {
+        return Some(UMA_WINDOW_VAS_FAST[k].load(Ordering::Acquire) + (p - u.window(k).0) as u64);
+    }
+    let base = UMA_BUFFER.lock().ok()?.get(k)?.1;
+    Some(base + (p - u.window(k).0) as u64)
 }
 
 /// What the start-up check of the coherent UMA windows found (`check_uma_import`): empty – not
@@ -359,7 +403,17 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
+    let count = bufs.len();
+    let mut fast_vas = [0u64; 4];
+    for (i, slot) in fast_vas.iter_mut().enumerate() {
+        *slot = bufs.get(i).map_or(0, |b| b.1);
+    }
+    UMA_WINDOW_COUNT.store(0, Ordering::Release);
     *UMA_BUFFER.lock().unwrap() = bufs;
+    for (slot, va) in UMA_WINDOW_VAS_FAST.iter().zip(fast_vas) {
+        slot.store(va, Ordering::Release);
+    }
+    UMA_WINDOW_COUNT.store(count, Ordering::Release);
 }
 
 pub fn stats() -> D3d12Stats {
@@ -2493,6 +2547,8 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::bind::invalidate_pc_bindings(this);
+        super::bind::note_pc_pso(this, resolved as usize);
     }
     hr
 }
@@ -3256,7 +3312,7 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
 }
 
 /// XCL ABI root signature, created once on the backend device.
-unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
+pub(super) unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
     let cur = ABI_RS.load(Ordering::Acquire);
     if cur != 0 {
         return Some(cur as *mut c_void);
@@ -4582,16 +4638,20 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
 }
 
 /// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for).
-/// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
-pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
-    cl_set_pipeline_state(this, pso)
+/// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in);
+/// returns the resolved PC pipeline state actually passed to the PC command list.
+pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) -> usize {
+    let resolved = super::pso_async::resolve_for_bind(pso as usize);
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
+    f(this, resolved as *mut c_void);
+    super::list_x::on_set_pipeline_state(this, pso as usize);
+    resolved
 }
 
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
-    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
-    super::list_x::on_set_pipeline_state(this, pso as usize);
+    let resolved = bind_pipeline(this, pso);
+    super::bind::note_pc_pso(this, resolved);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {

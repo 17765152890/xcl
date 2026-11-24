@@ -163,16 +163,36 @@ pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
 }
 
-fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
-    let mut s = vec![0u32; first];
-    s[0] = table_at as u32;
-    s[1] = (table_at >> 32) as u32;
+/// Write `user_data` for a compute shader directly into a preallocated `out` slice (no heap alloc).
+pub fn write_user_data_for(out: &mut [u32], l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at: u64) {
+    write_sgprs(out, FIRST_SGPR, inline_for(l, user_sgprs), args, table_at);
+}
+
+/// Write `user_data` for a draw directly into a preallocated `out` slice (no heap alloc).
+pub fn write_user_data_gfx(out: &mut [u32], l: &Layout, args: &[u8], table_at: u64) {
+    write_sgprs(out, FIRST_SGPR_GFX, l.inline_gfx, args, table_at);
+}
+
+fn write_sgprs(out: &mut [u32], first: usize, inline: u32, args: &[u8], table_at: u64) {
+    out.fill(0);
+    if !out.is_empty() {
+        out[0] = table_at as u32;
+    }
+    if out.len() >= 2 {
+        out[1] = (table_at >> 32) as u32;
+    }
     let inline = &args[..(inline as usize).min(args.len())];
-    s.extend(inline.chunks(4).map(|c| {
+    for (slot, c) in out.iter_mut().skip(first).zip(inline.chunks(4)) {
         let mut w = [0u8; 4];
         w[..c.len()].copy_from_slice(c);
-        u32::from_le_bytes(w)
-    }));
+        *slot = u32::from_le_bytes(w);
+    }
+}
+
+fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
+    let inline_len = (inline as usize).min(args.len());
+    let mut s = vec![0u32; first + inline_len.div_ceil(4)];
+    write_sgprs(&mut s, first, inline, args, table_at);
     s
 }
 
