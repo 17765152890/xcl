@@ -16,6 +16,8 @@ struct Pending {
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
+    /// already promoted to `urgent_queue()` after being bound/used on a title thread
+    urgent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -169,11 +171,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                             if let Some(big_job) = deferred {
                                 if p.orphan.load(Ordering::Acquire) {
                                     complete(&p, 0);
-                                } else if p.waiters.load(Ordering::SeqCst) > 0 {
+                                } else if p.waiters.load(Ordering::SeqCst) > 0 || p.urgent.load(Ordering::SeqCst) {
                                     complete(&p, big_job());
                                 } else {
                                     *p.job.lock().unwrap() = Some(big_job);
-                                    if p.waiters.load(Ordering::SeqCst) > 0 {
+                                    if p.waiters.load(Ordering::SeqCst) > 0 || p.urgent.load(Ordering::SeqCst) {
                                         if let Some(j) = p.job.lock().unwrap().take() {
                                             complete(&p, j());
                                         }
@@ -224,6 +226,15 @@ pub fn lazy_compute() -> bool {
     *L.get_or_init(|| lazy() && std::env::var("XCL_LAZY_COMPUTE_PSO").is_ok_and(|v| v == "1"))
 }
 
+/// Opt-in non-blocking compute pipelines (`XCL_ASYNC_COMPUTE=1`): when set, compute pipelines
+/// still compiling in the background are promoted to the urgent pool and skipped until ready
+/// instead of blocking bind / dispatch (useful to warm all shader caches without tripping a
+/// title's frame watchdog).
+pub fn async_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var("XCL_ASYNC_COMPUTE").is_ok_and(|v| v == "1"))
+}
+
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
     submit_as(standin, compute, job, false);
@@ -233,6 +244,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
+        urgent: std::sync::atomic::AtomicBool::new(false),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
@@ -254,15 +266,20 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+fn promote_urgent(p: &Arc<Pending>) {
+    p.sent.store(true, Ordering::Release);
+    if !p.urgent.swap(true, Ordering::AcqRel) {
+        let _ = urgent_queue().lock().unwrap().send(p.clone());
+    }
+}
+
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy one is wanted now: straight to the urgent graphics workers
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = urgent_queue().lock().unwrap().send(p);
-            }
+            // an actually-bound pipeline: promote straight to the urgent workers
+            promote_urgent(&p);
             pso
         }
         r => r,
@@ -295,27 +312,25 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// For binding: compute pipelines are waited for (unless `XCL_ASYNC_COMPUTE=1`), graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
+        Some(p) if p.compute && !async_compute() => resolve_wait(pso),
         Some(_) => resolve(pso),
         None => pso,
     }
 }
 
-/// Non-blocking resolve for graphics draws: returns `None` while the real pipeline is still
-/// being built (triggering lazy submission if needed), or `Some(real)` once built (`Some(pso)`
-/// when not managed by `pso_async` or when the build failed).
+/// Non-blocking resolve for draws (and compute dispatches under `XCL_ASYNC_COMPUTE=1`): returns
+/// `None` while the real pipeline is still being built (promoting it to the urgent pool), or
+/// `Some(real)` once built (`Some(pso)` when not managed by `pso_async` or when the build failed).
 pub fn resolve_nonblocking(pso: usize) -> Option<usize> {
     let Some(p) = entry(pso) else { return Some(pso) };
     let r = p.real.load(Ordering::Acquire);
     if r != 0 {
         return Some(r);
     }
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = urgent_queue().lock().unwrap().send(p.clone());
-    }
+    promote_urgent(&p);
     if *p.done.lock().unwrap() {
         Some(match p.real.load(Ordering::Acquire) {
             0 => pso,
@@ -326,11 +341,20 @@ pub fn resolve_nonblocking(pso: usize) -> Option<usize> {
     }
 }
 
-/// Resolve for `ExecuteIndirect`: waits for compute pipelines (never skips dispatches), and
-/// returns `None` while a graphics pipeline is still compiling in the background.
+/// Resolve for `Dispatch`: waits by default; skips while compiling when `XCL_ASYNC_COMPUTE=1`.
+pub fn resolve_compute(pso: usize) -> Option<usize> {
+    if async_compute() {
+        resolve_nonblocking(pso)
+    } else {
+        Some(resolve_wait(pso))
+    }
+}
+
+/// Resolve for `ExecuteIndirect`: waits for compute pipelines (unless `XCL_ASYNC_COMPUTE=1`),
+/// and returns `None` while a graphics (or async compute) pipeline is still compiling.
 pub fn resolve_indirect(pso: usize) -> Option<usize> {
     match entry(pso) {
-        Some(p) if p.compute => Some(resolve_wait(pso)),
+        Some(p) if p.compute && !async_compute() => Some(resolve_wait(pso)),
         Some(_) => resolve_nonblocking(pso),
         None => Some(pso),
     }
