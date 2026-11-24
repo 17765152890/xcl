@@ -2360,7 +2360,10 @@ mod tests {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no adapter");
                 return;
             };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            if adapter.GetDesc1().is_ok_and(|d| {
+                d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || String::from_utf16_lossy(&d.Description).contains("Basic Render Driver")
+            }) {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: software adapter");
                 return;
             }

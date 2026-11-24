@@ -1334,9 +1334,13 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             away.page.insert(p, at);
             continue;
         }
-        if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
-            fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
-            return std::ptr::null_mut();
+        if !in_uma(at) {
+            let mut old = 0;
+            let _ = mem::VirtualProtect(at as *const c_void, PHYS_PAGE, mem::PAGE_READWRITE, &mut old);
+            if mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+                fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+                return std::ptr::null_mut();
+            }
         }
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
