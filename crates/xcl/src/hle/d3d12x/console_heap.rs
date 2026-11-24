@@ -82,7 +82,7 @@ struct Global {
     inc: u32,
     cap: u32,
     next: u32,
-    /// released ranges (first, count)
+    /// released ranges (first, count), in order, none touching another or `next`
     free: Vec<(u32, u32)>,
 }
 
@@ -111,7 +111,7 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
     if let Some(i) = free.iter().position(|&(_, n)| n >= count) {
         let (f, n) = free[i];
         if n == count {
-            free.swap_remove(i);
+            free.remove(i);
         } else {
             free[i] = (f + count, n - count);
         }
@@ -122,6 +122,30 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
     }
     *next += count;
     Some(*next - count)
+}
+
+/// `count` descriptors from `first` are free again: into `free` in order, merged with the ranges
+/// on either side, and given back to `next` when they end there – else heaps made and released
+/// over a session leave the shared heap in pieces too small for a page, and it fills up.
+fn give_back(free: &mut Vec<(u32, u32)>, next: &mut u32, first: u32, count: u32) {
+    if count == 0 {
+        return;
+    }
+    let mut i = free.partition_point(|&(f, _)| f < first);
+    free.insert(i, (first, count));
+    if i + 1 < free.len() && free[i].0 + free[i].1 == free[i + 1].0 {
+        free[i].1 += free[i + 1].1;
+        free.remove(i + 1);
+    }
+    if i > 0 && free[i - 1].0 + free[i - 1].1 == free[i].0 {
+        free[i - 1].1 += free[i].1;
+        free.remove(i);
+        i -= 1;
+    }
+    if i + 1 == free.len() && free[i].0 + free[i].1 == *next {
+        *next = free[i].0;
+        free.pop();
+    }
 }
 
 /// The shared shader-visible heap, made on first use. False: there is none (it could not be
@@ -197,7 +221,7 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
 /// The shared range starting at `first` (`count` descriptors) is free again.
 pub fn release_global(first: u32, count: u32) {
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        s.free.push((first, count));
+        give_back(&mut s.free, &mut s.next, first, count);
     }
 }
 
@@ -502,6 +526,40 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    /// Released ranges merge with their neighbours and with the unused end: pages of a full heap
+    /// released, then small heaps made and released over them, leave room for the pages again.
+    #[test]
+    fn released_shared_ranges_merge() {
+        let (mut free, mut next, cap) = (Vec::new(), 0u32, 2048);
+        let pages: Vec<u32> = (0..4).map(|_| take_range(&mut free, &mut next, cap, 512).unwrap()).collect();
+        assert_eq!(pages, [0, 512, 1024, 1536]);
+        for &p in &pages {
+            give_back(&mut free, &mut next, p, 512);
+        }
+        assert_eq!((free.as_slice(), next), (&[][..], 0), "all of it back to the unused end");
+        // pages released out of order, small heaps in between
+        let pages: Vec<u32> = (0..4).map(|_| take_range(&mut free, &mut next, cap, 512).unwrap()).collect();
+        for p in [pages[1], pages[3], pages[0]] {
+            give_back(&mut free, &mut next, p, 512);
+        }
+        assert_eq!((free.as_slice(), next), (&[(0, 1024)][..], 1536));
+        let small: Vec<u32> = (0..4).map(|_| take_range(&mut free, &mut next, cap, 8).unwrap()).collect();
+        assert_eq!(small, [0, 8, 16, 24]);
+        for &p in small.iter().rev() {
+            give_back(&mut free, &mut next, p, 8);
+        }
+        give_back(&mut free, &mut next, pages[2], 512);
+        assert_eq!((free.as_slice(), next), (&[][..], 0));
+        let again: Vec<Option<u32>> = (0..4).map(|_| take_range(&mut free, &mut next, cap, 512)).collect();
+        assert_eq!(again, [Some(0), Some(512), Some(1024), Some(1536)]);
+        // a range between two others joins both
+        let (mut free, mut next) = (vec![(0, 10), (20, 10)], 40u32);
+        give_back(&mut free, &mut next, 10, 10);
+        assert_eq!((free.as_slice(), next), (&[(0, 30)][..], 40));
+        give_back(&mut free, &mut next, 30, 10);
+        assert_eq!((free.as_slice(), next), (&[][..], 0));
     }
 
     #[test]
