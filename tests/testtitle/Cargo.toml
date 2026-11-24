@@ -10,6 +10,11 @@ publish = false
 name = "xcl_testtitle"
 path = "src/main.rs"
 
+[[bin]]
+name = "xcl_privacy_probe"
+path = "src/privacy.rs"
+test = false # kernelx.dll is resolved by XCL, not by the native test runner
+
 [dependencies]
 # zlib for the synthetic retail-format console shader (XBCH)
 miniz_oxide = "0.9"

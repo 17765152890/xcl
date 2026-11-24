@@ -145,6 +145,20 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+### Title privacy
+
+`xcl run` starts the title host without inheriting arbitrary environment variables from the
+launcher. It passes `SystemRoot`, `windir`, `LOCALAPPDATA`, `TEMP`, `TMP` and `XCL_*` settings.
+If a title needs another variable for compatibility, `XCL_INHERIT_ENV=1` restores inheritance
+for that run and exposes those variables to the title again. Never put secrets in `XCL_*` settings.
+
+This reduces accidental exposure of host variables to the title and its crash reporter; it does
+not scrub dumps. Titles run as your Windows user and can still access files and other process
+data; retained paths can also contain personal information. A dump can contain arbitrary process
+memory and is not safe to share just because the environment was filtered. Networking is unchanged:
+`XCL_NETWORK=0` blocks common guest networking paths, not all outbound traffic. If the title must
+not upload a report, block outbound traffic for `xcl.exe` with the OS firewall as well.
+
 ## Tests
 
 ```powershell
