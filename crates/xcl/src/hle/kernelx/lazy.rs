@@ -41,7 +41,20 @@ unsafe fn commit(page: usize) -> bool {
     if !g.remove(&page) {
         return false;
     }
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    let ok = !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null();
+    // a page of a sparse window: its tile gets video memory now
+    if ok && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(page)) {
+        crate::hle::d3d12x::sparse::committed(page, PAGE);
+    }
+    ok
+}
+
+/// `XCL_LAZY_SPARSE=1`: physical pages mapped into a sparse window while still zero are lazy too
+/// (no video memory until first used; a GPU write to such a page before any use is lost unless
+/// XCL commits it first – `real::uma_window_buffer` does for what it gives the GPU)
+pub(super) fn in_sparse_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LAZY_SPARSE").is_ok_and(|v| v == "1"))
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {

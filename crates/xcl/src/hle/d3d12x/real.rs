@@ -206,6 +206,12 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     if p - base + len > size {
         return None;
     }
+    // what the GPU is given here must have memory behind it: pages mapped but not used yet
+    // (`kernelx::lazy`, sparse windows) are committed – a GPU write to an unmapped tile is lost
+    // (a title waiting for a value its GPU writes there waited for good)
+    if u.is_sparse(p) {
+        crate::hle::kernelx::lazy::ensure(p, len);
+    }
     Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
 }
 

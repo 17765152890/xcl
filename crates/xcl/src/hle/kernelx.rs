@@ -1199,7 +1199,10 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         let home = page_home(p).unwrap();
         // a page never used (its home not committed) at the title's own reserved address space:
         // committed on first use (`lazy`) – GPU-owned targets placed there are never touched
-        let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
+        // (`XCL_LAZY_SPARSE=1`: in a sparse window too – its tile gets video memory when the page
+        // is first used, `lazy::commit`; a retail game maps 4 GB of zero pages into a pool there
+        // at start and fills it over minutes)
+        let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at) || (lazy::in_sparse_windows() && u.is_sparse(at)));
         if fresh && plain && !committed_page(home) {
             lazy::mark(at);
             away.at.insert(at, p);

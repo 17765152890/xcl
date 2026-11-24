@@ -251,6 +251,8 @@ pub fn in_global(obj: usize) -> bool {
 unsafe fn title_memory(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
     use crate::hle::kernelx::{runtime_alloc, runtime_free, D3D_DESCRIPTOR_HEAP};
     let p = runtime_alloc(bytes, D3D_DESCRIPTOR_HEAP)?;
+    // pages mapped but not used yet (`kernelx::lazy`) are the title's memory all the same
+    crate::hle::kernelx::lazy::ensure(p, bytes);
     let readable = crate::gpu::shader::readable(p, bytes);
     if readable && u.window_of(p) == Some(0) && u.window_of(p + bytes - 1) == Some(0) {
         return Some(p);
