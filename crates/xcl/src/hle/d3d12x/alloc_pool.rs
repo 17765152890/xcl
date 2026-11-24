@@ -72,20 +72,26 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
     s.backings.entry(backing).or_default().users.insert(list);
 }
 
-/// `list` (of type `ty`; negative: not known) is reset on the title's allocator `alloc`: the
-/// PC allocator to give the PC list.
-pub fn for_list(list: usize, alloc: usize, ty: i32) -> usize {
-    if !enabled() || alloc == 0 {
-        return alloc;
+/// Reset `list` on the title's allocator `alloc`, committing its new recording association
+/// only after native Reset succeeds. No pool lock is held across the driver call.
+pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
+    let backing = current(alloc);
+    let hr = reset(backing);
+    if hr < 0 || !enabled() || alloc == 0 {
+        return hr;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
     if ty >= 0 {
         s.types.insert(alloc, ty);
     }
-    let backing = s.cur.get(&alloc).copied().unwrap_or(alloc);
     move_list(s, list, backing);
-    backing
+    hr
+}
+
+#[cfg(test)]
+pub(super) fn recording_backing_for_test(list: usize) -> Option<usize> {
+    STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
 }
 
 /// The PC allocator the title's allocator `alloc` stands for now.
@@ -283,10 +289,11 @@ mod tests {
             assert!(dev.GetDeviceRemovedReason().is_ok(), "the recording was still there");
 
             // the list is reset on the title's allocator: it records on the PC allocator in use
-            let pc = for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
-            assert_eq!(pc, second);
             let second_alloc = ID3D12CommandAllocator::from_raw_borrowed(&(second as *mut c_void)).unwrap().clone();
-            list.Reset(&second_alloc, None).unwrap();
+            assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
+                assert_eq!(pc, second);
+                list.Reset(&second_alloc, None).map_or_else(|e| e.code().0, |_| 0)
+            }), 0);
             list.Close().unwrap();
             queue.ExecuteCommandLists(&lists);
             executed(queue.as_raw(), &[l]);
@@ -299,8 +306,10 @@ mod tests {
 
             // the title's allocator goes while another PC allocator stands for it: nothing of
             // it stays (the next allocator at its address is its own)
-            list.Reset(&alloc, None).unwrap();
-            for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
+                assert_eq!(pc, a as usize);
+                list.Reset(&alloc, None).map_or_else(|e| e.code().0, |_| 0)
+            }), 0);
             list.Close().unwrap();
             alloc.Reset().unwrap();
             assert_ne!(current(a as usize), a as usize);
