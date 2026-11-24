@@ -151,26 +151,28 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
-fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// A unique temp name next to `dest` (it starts with `TMP_PREFIX`, so no listing shows it).
+fn tmp_beside(dest: &Path) -> std::io::Result<PathBuf> {
     let parent = dest
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"))?;
     let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!("{TMP_PREFIX}{}.{id}", std::process::id()));
+    Ok(parent.join(format!("{TMP_PREFIX}{}.{id}", std::process::id())))
+}
+
+/// Write `data` to a unique sibling temp file and flush it to disk; the caller moves it into place.
+fn stage_file(dest: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let tmp = tmp_beside(dest)?;
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
-        f.sync_all()?;
-        drop(f);
-        replace_file(&tmp, dest)?;
-        Ok(())
+        f.sync_all()
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    res
+    res.map(|()| tmp)
 }
 
 unsafe fn provider<'a>(p: *mut Provider) -> Option<&'a Provider> {
@@ -561,29 +563,92 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
+/// One step of an update: `dest` gets the staged file (a write) or goes away (a delete). `backup` is
+/// where the old `dest` was set aside while the update was being committed.
+struct Step {
+    dest: PathBuf,
+    staged: Option<PathBuf>,
+    backup: Option<PathBuf>,
+}
+
+/// An update is all or nothing (`XGameSaveSubmitUpdate`, Remarks): every write is first staged in a
+/// temp file next to its destination; only when all of them are on disk is the update committed,
+/// each old file being moved aside first. A failure on the way puts every old file back and leaves
+/// the container as it was (#324).
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
     }
+    let mut steps: Vec<Step> = Vec::new();
+    let discard = |steps: &[Step]| {
+        for s in steps {
+            if let Some(t) = &s.staged {
+                let _ = std::fs::remove_file(t);
+            }
+        }
+    };
+    let mut writes: Vec<(PathBuf, Option<&[u8]>)> = Vec::new();
     if let Some(d) = display {
-        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
+        writes.push((dir.join("display"), Some(d.as_bytes())));
+    }
+    for (name, data) in ops {
+        writes.push((blobs.join(enc(name)), data.as_deref()));
+    }
+    for (dest, data) in writes {
+        if dest.is_dir() {
+            // nothing to replace or delete here: a write fails as it always did, a delete is a no-op
+            if data.is_some() {
+                discard(&steps);
+                return crate::util::E_FAIL;
+            }
+            continue;
+        }
+        let staged = match data {
+            Some(d) => match stage_file(&dest, d) {
+                Ok(t) => Some(t),
+                Err(_) => {
+                    discard(&steps);
+                    return crate::util::E_FAIL;
+                }
+            },
+            None => None,
+        };
+        steps.push(Step { dest, staged, backup: None });
+    }
+    for i in 0..steps.len() {
+        let failed = {
+            let s = &mut steps[i];
+            let moved_aside = match s.dest.symlink_metadata() {
+                Ok(_) => match tmp_beside(&s.dest) {
+                    Ok(b) if std::fs::rename(&s.dest, &b).is_ok() => {
+                        s.backup = Some(b);
+                        true
+                    }
+                    _ => false,
+                },
+                Err(_) => true, // nothing there yet
+            };
+            !moved_aside || s.staged.as_ref().is_some_and(|t| replace_file(t, &s.dest).is_err())
+        };
+        if failed {
+            // undo: the files this update put in place go, the old ones come back
+            for s in steps[..=i].iter().rev() {
+                if s.staged.as_ref().is_some_and(|t| !t.exists()) {
+                    let _ = std::fs::remove_file(&s.dest);
+                }
+                if let Some(b) = &s.backup {
+                    let _ = std::fs::rename(b, &s.dest);
+                }
+            }
+            discard(&steps);
             return crate::util::E_FAIL;
         }
     }
-    for (name, data) in ops {
-        let path = blobs.join(enc(name));
-        match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
-                    return crate::util::E_FAIL;
-                }
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+    for s in &steps {
+        if let Some(b) = &s.backup {
+            let _ = std::fs::remove_file(b);
         }
     }
     S_OK
@@ -669,6 +734,104 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// A container folder (`b/` made) in a fresh temp dir, removed on drop.
+    struct UpdateFixture {
+        dir: PathBuf,
+    }
+
+    impl UpdateFixture {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("xcl-gamesave-update-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(dir.join("b")).unwrap();
+            Self { dir }
+        }
+
+        fn put(&self, blob: &str, data: &[u8]) {
+            std::fs::write(self.dir.join("b").join(enc(blob)), data).unwrap();
+        }
+
+        fn blob(&self, name: &str) -> Option<Vec<u8>> {
+            std::fs::read(self.dir.join("b").join(enc(name))).ok()
+        }
+
+        fn display(&self) -> Option<String> {
+            std::fs::read_to_string(self.dir.join("display")).ok()
+        }
+
+        /// every file in the container, as relative names: nothing but blobs and `display` may be left
+        fn files(&self) -> Vec<String> {
+            let mut v = Vec::new();
+            for d in [self.dir.clone(), self.dir.join("b")] {
+                for e in std::fs::read_dir(d).unwrap().flatten() {
+                    if e.file_type().unwrap().is_file() {
+                        v.push(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for UpdateFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A blob name whose folder entry Windows cannot create (a component over 255 characters).
+    fn unwritable_blob() -> String {
+        "n".repeat(300)
+    }
+
+    /// An update is all or nothing (#324): when one write cannot be committed, the display name and
+    /// the blobs before it are as they were, a delete is undone and nothing of the update is left.
+    #[test]
+    fn a_failing_write_leaves_the_whole_update_undone() {
+        let fx = UpdateFixture::new();
+        fx.put("a", b"old");
+        fx.put("kept", b"stays");
+        std::fs::write(fx.dir.join("display"), "Old").unwrap();
+        let before = fx.files();
+        let ops = vec![
+            ("a".to_string(), Some(b"new".to_vec())),
+            ("kept".to_string(), None),
+            ("fresh".to_string(), Some(b"1".to_vec())),
+            (unwritable_blob(), Some(b"x".to_vec())),
+        ];
+        assert_eq!(apply(&fx.dir, Some("New"), &ops), E_FAIL);
+        assert_eq!(fx.display().as_deref(), Some("Old"), "display name");
+        assert_eq!(fx.blob("a").as_deref(), Some(&b"old"[..]));
+        assert_eq!(fx.blob("kept").as_deref(), Some(&b"stays"[..]), "a delete is undone");
+        assert_eq!(fx.blob("fresh"), None, "a blob the update created is gone again");
+        assert_eq!(fx.files(), before, "no temp or backup file is left");
+    }
+
+    #[test]
+    fn an_update_applies_its_steps_in_order() {
+        let fx = UpdateFixture::new();
+        fx.put("a", b"old");
+        fx.put("gone", b"x");
+        std::fs::write(fx.dir.join("display"), "Old").unwrap();
+        let ops = vec![
+            ("a".to_string(), Some(b"new".to_vec())),
+            ("gone".to_string(), None),
+            ("temp".to_string(), Some(b"1".to_vec())),
+            ("temp".to_string(), None),
+            ("again".to_string(), Some(b"1".to_vec())),
+            ("again".to_string(), Some(b"2".to_vec())),
+            ("never-there".to_string(), None),
+        ];
+        assert_eq!(apply(&fx.dir, Some("New"), &ops), S_OK);
+        assert_eq!(fx.display().as_deref(), Some("New"));
+        assert_eq!(fx.blob("a").as_deref(), Some(&b"new"[..]));
+        assert_eq!(fx.blob("gone"), None);
+        assert_eq!(fx.blob("temp"), None);
+        assert_eq!(fx.blob("again").as_deref(), Some(&b"2"[..]));
+        assert_eq!(fx.files(), vec!["a".to_string(), "again".to_string(), "display".to_string()]);
     }
 
     #[test]
@@ -983,17 +1146,19 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(b1.data, b1.info.size as usize), b"next-xcltmp");
             assert_eq!(std::slice::from_raw_parts(b2.data, b2.info.size as usize), b"orig-tilde");
 
-            // Failed atomic replace (dest is an existing directory) removes its temp file.
+            // A write onto an existing directory fails and leaves no temp file; the directory stays.
             let _ = std::fs::remove_file(&leftover);
             let blocker = blobs_dir.join("dir_blocker");
             std::fs::create_dir_all(&blocker).unwrap();
-            assert!(write_atomic(&blocker, b"cannot-replace-dir").is_err());
+            let blocked = [("dir_blocker".to_string(), Some(b"cannot-replace-dir".to_vec()))];
+            assert_eq!(apply(&(*c).dir, None, &blocked), E_FAIL);
+            assert!(blocker.is_dir());
             let remaining_tmps: Vec<_> = std::fs::read_dir(&blobs_dir)
                 .unwrap()
                 .flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
                 .collect();
-            assert!(remaining_tmps.is_empty(), "temp file leaked on failed write_atomic: {remaining_tmps:?}");
+            assert!(remaining_tmps.is_empty(), "temp file leaked on a failed update: {remaining_tmps:?}");
 
             XGameSaveCloseContainer(c);
             XGameSaveCloseProvider(p);
