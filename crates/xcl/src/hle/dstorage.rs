@@ -26,7 +26,8 @@
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
 //! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
 //! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused
+//! (a refused BCPack request's source can be kept on disk with `XCL_DSTORAGE_BCPACK_DUMP`).
 
 #![allow(non_snake_case)]
 
