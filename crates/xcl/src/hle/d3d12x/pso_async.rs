@@ -80,6 +80,13 @@ pub fn defer_big(rest: Job) {
     DEFER_BIG.with(|slot| *slot.borrow_mut() = Some(rest));
 }
 
+fn lower_worker_priority() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
 fn big_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static BIG_Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     BIG_Q.get_or_init(|| {
@@ -88,14 +95,17 @@ fn big_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         let n = std::env::var("XCL_BIG_PSO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).clamp(1, 4);
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-big-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let Ok(p) = rx.lock().unwrap().recv() else { return };
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    if p.orphan.load(Ordering::Acquire) {
-                        complete(&p, 0);
-                    } else {
-                        complete(&p, job());
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-big-{k}")).stack_size(64 << 20).spawn(move || {
+                lower_worker_priority();
+                loop {
+                    let Ok(p) = rx.lock().unwrap().recv() else { return };
+                    let job = p.job.lock().unwrap().take();
+                    if let Some(job) = job {
+                        if p.orphan.load(Ordering::Acquire) {
+                            complete(&p, 0);
+                        } else {
+                            complete(&p, job());
+                        }
                     }
                 }
             });
@@ -114,37 +124,40 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         let n = crate::gpu::recomp::dxc::compile_threads().min(16);
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    if p.orphan.load(Ordering::Acquire) {
-                        complete(&p, 0);
-                    } else {
-                        IN_NORMAL_WORKER.with(|c| c.set(true));
-                        DEFER_BIG.with(|s| *s.borrow_mut() = None);
-                        let real = job();
-                        IN_NORMAL_WORKER.with(|c| c.set(false));
-                        let deferred = DEFER_BIG.with(|s| s.borrow_mut().take());
-                        if let Some(big_job) = deferred {
-                            if p.orphan.load(Ordering::Acquire) {
-                                complete(&p, 0);
-                            } else if p.waiters.load(Ordering::SeqCst) > 0 {
-                                complete(&p, big_job());
-                            } else {
-                                *p.job.lock().unwrap() = Some(big_job);
-                                if p.waiters.load(Ordering::SeqCst) > 0 {
-                                    if let Some(j) = p.job.lock().unwrap().take() {
-                                        complete(&p, j());
-                                    }
-                                } else {
-                                    let _ = big_queue().lock().unwrap().send(p);
-                                }
-                            }
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                lower_worker_priority();
+                loop {
+                    let next = rx.lock().unwrap().recv();
+                    let Ok(p) = next else { return };
+                    // (None: a bind took it and builds it itself)
+                    let job = p.job.lock().unwrap().take();
+                    if let Some(job) = job {
+                        if p.orphan.load(Ordering::Acquire) {
+                            complete(&p, 0);
                         } else {
-                            complete(&p, real);
+                            IN_NORMAL_WORKER.with(|c| c.set(true));
+                            DEFER_BIG.with(|s| *s.borrow_mut() = None);
+                            let real = job();
+                            IN_NORMAL_WORKER.with(|c| c.set(false));
+                            let deferred = DEFER_BIG.with(|s| s.borrow_mut().take());
+                            if let Some(big_job) = deferred {
+                                if p.orphan.load(Ordering::Acquire) {
+                                    complete(&p, 0);
+                                } else if p.waiters.load(Ordering::SeqCst) > 0 {
+                                    complete(&p, big_job());
+                                } else {
+                                    *p.job.lock().unwrap() = Some(big_job);
+                                    if p.waiters.load(Ordering::SeqCst) > 0 {
+                                        if let Some(j) = p.job.lock().unwrap().take() {
+                                            complete(&p, j());
+                                        }
+                                    } else {
+                                        let _ = big_queue().lock().unwrap().send(p);
+                                    }
+                                }
+                            } else {
+                                complete(&p, real);
+                            }
                         }
                     }
                 }
