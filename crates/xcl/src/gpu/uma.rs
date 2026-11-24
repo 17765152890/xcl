@@ -730,6 +730,11 @@ impl Uma {
     }
 }
 
+/// The title's graphics memory if it has been created – without creating it (`get` does).
+pub fn current() -> Option<&'static Uma> {
+    GLOBAL.get().and_then(Option::as_ref)
+}
+
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048).
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
@@ -758,6 +763,13 @@ pub fn get() -> Option<&'static Uma> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `current` is what `get` made, once it has made it.
+    #[test]
+    fn current_is_what_get_made() {
+        let made = get().map(|u| u as *const Uma);
+        assert_eq!(current().map(|u| u as *const Uma), made);
+    }
 
     /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
     /// back to it when freed.
