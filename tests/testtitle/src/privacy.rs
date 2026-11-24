@@ -22,6 +22,7 @@ extern "system" {
     fn WinHttpSetTimeouts(session: Handle, resolve: i32, connect: i32, send: i32, receive: i32) -> i32;
     fn WinHttpOpenRequest(connection: Handle, verb: *const u16, path: *const u16, version: *const u16, referer: *const u16, accept: *const *const u16, flags: u32) -> Handle;
     fn WinHttpSendRequest(request: Handle, headers: *const u16, header_len: u32, data: *const c_void, len: u32, total: u32, context: usize) -> i32;
+    fn WinHttpReceiveResponse(request: Handle, reserved: *mut c_void) -> i32;
     fn WinHttpCloseHandle(h: Handle) -> i32;
 }
 
@@ -65,6 +66,7 @@ fn main() {
         assert!(!request.is_null(), "WinHttpOpenRequest: {}", std::io::Error::last_os_error());
         let len = body.len() as u32;
         assert_ne!(WinHttpSendRequest(request, null(), 0, body.as_ptr().cast(), len, len, 0), 0, "WinHttpSendRequest: {}", std::io::Error::last_os_error());
+        assert_ne!(WinHttpReceiveResponse(request, std::ptr::null_mut()), 0, "WinHttpReceiveResponse: {}", std::io::Error::last_os_error());
         WinHttpCloseHandle(request);
         WinHttpCloseHandle(conn);
         WinHttpCloseHandle(session);
