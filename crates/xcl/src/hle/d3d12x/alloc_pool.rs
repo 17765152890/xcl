@@ -114,16 +114,25 @@ pub fn current(alloc: usize) -> usize {
     STATE.lock().unwrap().as_ref().and_then(|s| s.cur.get(&alloc).copied()).unwrap_or(alloc)
 }
 
-/// `list` (of type `ty`) was made recording on the PC allocator `raw` itself
-/// (CreateCommandList).
-pub fn created_on(list: usize, raw: usize, ty: i32) {
-    if !enabled() || raw == 0 {
+/// `list` (of type `ty`; negative: unknown) was made recording on `pc_alloc` for `title_alloc`
+/// (`CreateCommandList` or a mid-list split segment).
+pub fn created_on_backing(list: usize, title_alloc: usize, pc_alloc: usize, ty: i32) {
+    if !enabled() || title_alloc == 0 || pc_alloc == 0 {
         return;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    s.types.entry(raw).or_insert(ty);
-    move_list(s, list, raw);
+    if ty >= 0 {
+        s.types.entry(title_alloc).or_insert(ty);
+    }
+    move_list(s, list, pc_alloc);
+}
+
+/// `list` (of type `ty`) was made recording on the PC allocator `raw` itself
+/// (CreateCommandList).
+#[cfg(test)]
+fn created_on(list: usize, raw: usize, ty: i32) {
+    created_on_backing(list, raw, raw, ty);
 }
 
 /// `lists` were just submitted to `queue`.
@@ -442,6 +451,89 @@ mod tests {
             drop(alloc);
             assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
             assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
+        }
+    }
+
+    /// Creating a new command list or resetting an adopted PC list after `alloc` swapped to a
+    /// substitute backing must record on `current(alloc)` so a later `alloc.Reset()` keeps the
+    /// live recording intact instead of resetting the active backing underneath it.
+    #[test]
+    fn cl_reset_and_new_list_after_swap_use_active_backing() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a = alloc.as_raw();
+            if !super::super::real::is_adopted(a) {
+                super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
+            }
+            let list1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            created_on(list1.as_raw() as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            list1.Close().unwrap();
+
+            // First allocator reset puts `a` aside because `list1` still holds a recording on it.
+            alloc.Reset().unwrap();
+            let second = current(a as usize);
+            assert_ne!(second, a as usize);
+
+            // Resetting an adopted PC command list via `ID3D12GraphicsCommandList::Reset` with the
+            // title's `alloc` must redirect to `second = current(a)`, not record onto busy `a`.
+            let list2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let l2 = list2.as_raw();
+            if !super::super::real::is_adopted(l2) {
+                super::super::real::adopt(l2, super::super::real::Kind::CommandList);
+            }
+            list2.Close().unwrap();
+            list2.Reset(&alloc, None).expect("cl_reset must resolve title allocator to active backing");
+            assert_eq!(recording_backing_for_test(l2 as usize), Some(second), "cl_reset must track list2 on the active substitute backing");
+            list2.Close().unwrap();
+
+            // A second allocator reset must keep `second` aside because `list2` is live on it.
+            alloc.Reset().unwrap();
+            let third = current(a as usize);
+            assert_ne!(third, second, "active substitute backing holding list2 must not be reset");
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            drop(list2);
+            drop(list1);
+            drop(alloc);
+            assert_eq!(current(a as usize), a as usize);
+        }
+    }
+
+    #[test]
+    fn created_list_after_swap_tracks_active_backing() {
+        let (title_alloc, second, l1, l2) = (0x7E57_A000usize, 0x7E57_B000usize, 0x7E57_C000usize, 0x7E57_D000usize);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.types.insert(title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.cur.insert(title_alloc, second);
+            s.aside.insert(title_alloc, vec![title_alloc]);
+            move_list(s, l1, title_alloc);
+        }
+        created_on_backing(l2, title_alloc, second, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        assert_eq!(recording_backing_for_test(l2), Some(second));
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert!(!s.types.contains_key(&second));
+            assert!(s.backings[&second].users.contains(&l2));
+            assert!(!s.backings[&second].users.contains(&l1));
+        }
+        forget_list(l2);
+        assert_eq!(recording_backing_for_test(l2), None);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(s.backings[&second].users.is_empty());
+            s.aside.remove(&title_alloc);
+            s.cur.remove(&title_alloc);
+            s.types.remove(&title_alloc);
+            s.backings.remove(&second);
+            s.backings.remove(&title_alloc);
+            s.of_list.remove(&l1);
         }
     }
 }
