@@ -1493,7 +1493,9 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack");
+        // BCPack: BC1 is rebuilt (`bcunpack`), the other modes are refused
+        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Ok(()), "BCPack BC1");
+        assert_eq!(Request::parse(&request(1 | 7 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC7");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1718,12 +1720,15 @@ mod tests {
         // Zlib only with invalid intermediate_size (<= src or > dst)
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION, invalid intermediate -> E_DESTINATION_SIZE
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        // Two-stage zlib + BCPack: valid sizes -> BC1 accepted (`bcunpack`), other modes E_DECOMPRESSION;
+        // invalid intermediate -> E_DESTINATION_SIZE
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION
-        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        // Single-stage BCPack: intermediate must be 0, then BC1 accepted, other modes E_DECOMPRESSION
+        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(bc7, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Hardware swizzle mode unsupported
         assert_eq!(Request::parse(&request_ex(swiz, 0x1000, 0, 64, 0x2000, 0, 64, 0, 0)).check(false), Err(E_DECOMPRESSION));
@@ -2281,7 +2286,8 @@ mod tests {
         let bc7_zlib = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
         let bc1 = Request::parse(&request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
         for (i, r) in [&bc7, &bc7_zlib, &bc1, &bc7].into_iter().enumerate() {
-            assert_eq!(r.check(true), Err(E_DECOMPRESSION), "the request fails as before");
+            // BC1 is rebuilt (`bcunpack`); the other modes fail as before
+            assert_eq!(r.check(true), if r.bcpack() == 1 { Ok(()) } else { Err(E_DECOMPRESSION) });
             assert_eq!(counts.note(r), i as u64 + 1);
         }
         let s = counts.stats();
@@ -2289,7 +2295,7 @@ mod tests {
         assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
         assert_eq!((s["BC1"].requests, s["BC1"].with_zlib, s["BC1"].destination_bytes), (1, 0, 0x8000));
         assert_eq!(counts.summary(), "BC1 1 (32768 bytes), BC7 3 (196608 bytes)");
-        for m in 1..=7u64 {
+        for m in 2..=7u64 {
             let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
             assert_eq!(r.check(true), Err(E_DECOMPRESSION));
         }
