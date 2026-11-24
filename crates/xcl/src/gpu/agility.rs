@@ -67,6 +67,25 @@ pub(crate) fn candidates(env_override: Option<PathBuf>, exe_dir: Option<PathBuf>
     dirs
 }
 
+/// The `D3D12Core.dll` the probe reads in each candidate directory.  `host.rs` registers
+/// these with the VFS as XCL's own paths before the hooks go in (#595): on a drive a console
+/// mount names, the probe runs after the hooks and must read the host's file, not the
+/// console's.  The files and not their directories: the exe directory can be a drive root
+/// (`D:\xcl.exe`), and a root among XCL's own folders would take the whole drive from the
+/// console mount.  (The loader that `CreateDeviceFactory` uses is not hooked.)
+pub(crate) fn sdk_files(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    dirs.into_iter().map(|d| d.join("D3D12Core.dll")).collect()
+}
+
+/// `sdk_files` for the candidate directories of the host process's environment.
+pub(crate) fn host_sdk_files() -> Vec<PathBuf> {
+    sdk_files(candidates(
+        clean_env_path(std::env::var_os(ENV)),
+        std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
+        clean_env_path(std::env::var_os("LOCALAPPDATA")),
+    ))
+}
+
 /// Read the exported `u32` `D3D12SDKVersion` directly from a `D3D12Core.dll` image on disk
 /// without loading or executing the DLL.
 pub(crate) fn read_sdk_version_from_bytes(bytes: &[u8]) -> Result<u32, String> {
