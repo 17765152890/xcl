@@ -58,6 +58,19 @@ fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> mpsc::Sender<Job
         let handle = event.as_deref().copied();
         for job in rx {
             let mut completed = fence::wait(&fence, job.value, &dev, handle, WAIT_MS);
+            // A strict progress write holds the suffix. Only a legacy prefix can take the fallback.
+            if matches!(&completed, Err(FenceError::Timeout(_)))
+                && job.writes.first().is_some_and(|w| !matches!(w, Write::ImmediateU64(..)))
+            {
+                let value = fence.GetCompletedValue();
+                if value < job.value {
+                    static LATE: AtomicU64 = AtomicU64::new(0);
+                    let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k.is_power_of_two() {
+                        crate::xlog_warn!("D3D12.X: {k} CPU-write submissions using legacy fallback after {WAIT_MS} ms (fence at {value}, wanted {}; {} queued writes)", job.value, job.writes.len());
+                    }
+                }
+            }
             for w in &job.writes {
                 match w {
                     Write::Immediate(va, words) => write_now(*va, words),
