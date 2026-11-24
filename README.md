@@ -83,6 +83,7 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+  GameInput keeps half a second of recent state changes so titles can read inputs between frames.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
