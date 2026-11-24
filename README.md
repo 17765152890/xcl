@@ -130,6 +130,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- `XCL_DXC_ARGS` supplies extra whitespace-separated DXC arguments for runtime shaders and
+  `shaders --precompile`, e.g. `-O1`. While it is set, the caches that skip translation are
+  bypassed so a previous run's translation cannot hide the requested arguments. The DXIL
+  cache stays active and keys entries by the supplied arguments.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
