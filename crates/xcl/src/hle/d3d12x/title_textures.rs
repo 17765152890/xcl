@@ -1736,6 +1736,17 @@ mod tests {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
         }
+        if let Ok(factory) = windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory4>() {
+            if let Ok(adapter) = factory.EnumAdapters1(0) {
+                if adapter.GetDesc1().is_ok_and(|d| {
+                    d.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                        || String::from_utf16_lossy(&d.Description).contains("Basic Render Driver")
+                }) {
+                    crate::gpu::recomp::runner::skip_test("software adapter");
+                    return;
+                }
+            }
+        }
         // Larger than all four UMA windows together. These public allocations
         // must use the watched Windows fallback, reserving space rather than RAM.
         const SIZE: usize = 24usize << 30;
