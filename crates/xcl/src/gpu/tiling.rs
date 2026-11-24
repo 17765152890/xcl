@@ -6,10 +6,13 @@
 //! offset is linear over GF(2): `offset(x, y, z) = ox[x] ^ oy[y] ^ oz[z]`, small tables per
 //! layout. Blocks (256 B / 4 KB / 64 KB) are laid out row-major; `Chain` lays out the mips.
 
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+
 use super::tiling_tables::{NIBBLE01, NIBBLE2, NIBBLE3, NIBBLE4, PATTERNS, PATTERNS_3D};
 
 /// The part of GB_ADDR_CONFIG the XOR modes depend on (number of pipes and packers, log2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PipeConfig {
     pub pipes_log2: u32,
     pub pkrs_log2: u32,
@@ -63,14 +66,21 @@ pub struct Layout {
     /// XORed into every in-block byte offset: the pipe / bank swizzle a T# base address carries
     /// in its low bits (`base & (block_bytes - 1)`), 0 otherwise
     pub base_xor: usize,
-    ox: Vec<u32>,
-    oy: Vec<u32>,
-    oz: Vec<u32>,
+    ox: Arc<[u32]>,
+    oy: Arc<[u32]>,
+    oz: Arc<[u32]>,
     /// the in-block bits the coordinates above the block give (XOR modes with many pipes take
     /// pipe bits from neighbouring blocks' coordinates), by `x >> log2(block_w)` etc.
-    hx: Vec<u32>,
-    hy: Vec<u32>,
-    hz: Vec<u32>,
+    hx: Arc<[u32]>,
+    hy: Arc<[u32]>,
+    hz: Arc<[u32]>,
+}
+
+type LayoutKey = (bool, u32, u32, PipeConfig);
+
+fn layout_cache() -> &'static RwLock<HashMap<LayoutKey, Option<Layout>>> {
+    static CACHE: OnceLock<RwLock<HashMap<LayoutKey, Option<Layout>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 impl Layout {
@@ -78,13 +88,24 @@ impl Layout {
     /// elements over 16 B. Linear (0): rows padded to 256 bytes (addrlib
     /// Gfx10Lib::HwlComputeSurfaceInfoLinear), a "block" of 256 B, one row high.
     pub fn new(mode: u32, elem_log2: u32, cfg: PipeConfig) -> Option<Layout> {
+        let key = (false, mode, elem_log2, cfg);
+        if let Some(hit) = layout_cache().read().unwrap().get(&key) {
+            return hit.clone();
+        }
+        let built = Self::build_2d(mode, elem_log2, cfg);
+        layout_cache().write().unwrap().insert(key, built.clone());
+        built
+    }
+
+    fn build_2d(mode: u32, elem_log2: u32, cfg: PipeConfig) -> Option<Layout> {
         if elem_log2 > 4 {
             return None;
         }
         if mode == 0 {
             let bw = 256 >> elem_log2;
-            let ox = (0..bw as u32).map(|x| x << elem_log2).collect();
-            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0], hx: vec![0], hy: vec![0], hz: vec![0] });
+            let ox: Arc<[u32]> = (0..bw as u32).map(|x| x << elem_log2).collect::<Vec<_>>().into();
+            let z: Arc<[u32]> = Arc::from([0u32]);
+            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: Arc::clone(&z), oz: Arc::clone(&z), hx: Arc::clone(&z), hy: Arc::clone(&z), hz: z });
         }
         let blk = block_log2(mode)?;
         let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
@@ -99,7 +120,11 @@ impl Layout {
     /// each depth slice as a 2D surface. `None`: a mode 3D textures cannot have (addrlib
     /// Gfx10Rsrc3dSwModeMask) or no pattern.
     pub fn new_3d(mode: u32, elem_log2: u32, cfg: PipeConfig) -> Option<Layout> {
-        match mode {
+        let key = (true, mode, elem_log2, cfg);
+        if let Some(hit) = layout_cache().read().unwrap().get(&key) {
+            return hit.clone();
+        }
+        let built = match mode {
             0 | 24 | 27 => Self::new(mode, elem_log2, cfg),
             5 | 9 | 17 | 21 | 25 | 26 if elem_log2 <= 4 => {
                 let blk = block_log2(mode)?;
@@ -111,14 +136,16 @@ impl Layout {
                 Some(Self::from_bits(mode, elem_log2, blk, &bits, (w1k + avg, h1k + avg + rest / 2, d1k + avg + u32::from(rest != 0))))
             }
             _ => None,
-        }
+        };
+        layout_cache().write().unwrap().insert(key, built.clone());
+        built
     }
 
     /// The offset tables of a block `1 << wl` × `1 << hl` × `1 << dl` elements.
     fn from_bits(mode: u32, elem_log2: u32, blk: u32, bits: &[u64; 20], (wl, hl, dl): (u32, u32, u32)) -> Layout {
         // the in-block offset bits coordinate `c << lo` gives
-        let table = |n: usize, shift: u32, lo: u32| -> Vec<u32> {
-            (0..n as u32)
+        let table = |n: usize, shift: u32, lo: u32| -> Arc<[u32]> {
+            let v: Vec<u32> = (0..n as u32)
                 .map(|c| {
                     let mut off = 0u32;
                     for (i, &b) in bits[..blk as usize].iter().enumerate() {
@@ -127,11 +154,19 @@ impl Layout {
                     }
                     off
                 })
-                .collect()
+                .collect();
+            v.into()
         };
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
-        // the pattern masks are 16 bits: coordinates above them do not matter
-        let high = |l: u32, shift: u32| table(1 << (16 - l.min(16)), shift, l);
+        // the pattern masks are 16 bits: only allocate up to the highest actually used bit above `l`
+        let high = |l: u32, shift: u32| -> Arc<[u32]> {
+            let used_hi = bits[..blk as usize].iter().fold(0u32, |acc, &b| acc | ((((b >> shift) & 0xFFFF) as u32) >> l.min(16)));
+            if used_hi == 0 {
+                return Arc::from([0u32]);
+            }
+            let hi_bits = 32 - used_hi.leading_zeros();
+            table(1usize << hi_bits, shift, l)
+        };
         Layout {
             mode,
             elem_log2,
