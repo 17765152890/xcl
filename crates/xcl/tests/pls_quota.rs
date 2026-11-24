@@ -4,13 +4,19 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_PATH_NOT_FOUND};
+use windows_sys::Win32::Foundation::{
+    GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+};
 use windows_sys::Win32::Globalization::GetOEMCP;
 use windows_sys::Win32::Storage::FileSystem::{
     AreFileApisANSI, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW, SetFileApisToANSI, SetFileApisToOEM,
 };
 use xcl::config::{Boot, Config};
-use xcl::util::wide;
+use xcl::util::{under_wine, wide};
+
+fn is_expected_missing_error(error: u32, is_wine: bool) -> bool {
+    error == ERROR_PATH_NOT_FOUND || (is_wine && error == ERROR_FILE_NOT_FOUND)
+}
 
 struct TempDir(PathBuf);
 
@@ -137,11 +143,29 @@ fn disk_free_space_ex_reports_pls_quota() {
             0
         );
 
+        let host_missing = wide(&pls.join("missing").to_string_lossy());
+        let (mut unused_avail, mut unused_total, mut unused_free) = (0, 0, 0);
+        SetLastError(0);
+        let host_missing_result = GetDiskFreeSpaceExW(
+            host_missing.as_ptr(),
+            &mut unused_avail,
+            &mut unused_total,
+            &mut unused_free,
+        );
+        let host_missing_error = GetLastError();
+        assert_eq!(host_missing_result, 0);
+        // Windows returns ERROR_PATH_NOT_FOUND for a missing path below an existing directory;
+        // Wine returns ERROR_FILE_NOT_FOUND, which the hook forwards from the host call.
+        assert!(
+            is_expected_missing_error(host_missing_error, under_wine()),
+            "unexpected host error for missing path: {host_missing_error}"
+        );
+
         let missing = wide(r"S:\missing");
         SetLastError(0);
         let result = GetDiskFreeSpaceExW(missing.as_ptr(), &mut available, &mut total, &mut free);
         let error = GetLastError();
-        assert_eq!((result, error), (0, ERROR_PATH_NOT_FOUND));
+        assert_eq!((result, error), (0, host_missing_error));
         assert_eq!((available, total, free), (MIB - 579, host_total, MIB - 579));
 
         fs::File::create(pls.join("fills-quota.bin"))
@@ -158,4 +182,17 @@ fn disk_free_space_ex_reports_pls_quota() {
             0
         );
     }
+}
+
+#[test]
+fn missing_pls_path_error_policy_matches_platform() {
+    assert!(is_expected_missing_error(ERROR_PATH_NOT_FOUND, false));
+    assert!(!is_expected_missing_error(ERROR_FILE_NOT_FOUND, false));
+    assert!(!is_expected_missing_error(0, false));
+    assert!(!is_expected_missing_error(ERROR_ACCESS_DENIED, false));
+
+    assert!(is_expected_missing_error(ERROR_PATH_NOT_FOUND, true));
+    assert!(is_expected_missing_error(ERROR_FILE_NOT_FOUND, true));
+    assert!(!is_expected_missing_error(0, true));
+    assert!(!is_expected_missing_error(ERROR_ACCESS_DENIED, true));
 }
