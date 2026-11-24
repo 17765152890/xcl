@@ -632,6 +632,26 @@ impl Vfs {
         Ok(())
     }
 
+    /// Whether the merged view of `rel` has no entries: the overlay copy has none and
+    /// every original child is whited out or hidden by an ancestor whiteout.
+    fn merged_dir_is_empty(&self, rel: &str) -> bool {
+        if let Ok(rd) = std::fs::read_dir(self.overlay_path(rel)) {
+            if rd.flatten().next().is_some() {
+                return false;
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(self.original_path(rel)) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                let child = if rel.is_empty() { name } else { format!("{rel}\\{name}") };
+                if self.visible_in_original(&child) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
         if rel.is_empty() {
             return Err(ERROR_ACCESS_DENIED);
@@ -641,6 +661,11 @@ impl Vfs {
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if !meta.is_dir() {
                 return Err(ERROR_DIRECTORY);
+            }
+            // Windows fails RemoveDirectoryW on a non-empty directory; the merged view
+            // counts overlay entries plus original entries that are not whited out.
+            if !self.merged_dir_is_empty(rel) {
+                return Err(ERROR_DIR_NOT_EMPTY);
             }
             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
             if Path::new(&self.original_path(rel)).exists() {
@@ -654,6 +679,9 @@ impl Vfs {
         }
         if !Path::new(&self.original_path(rel)).is_dir() {
             return Err(ERROR_DIRECTORY);
+        }
+        if !self.merged_dir_is_empty(rel) {
+            return Err(ERROR_DIR_NOT_EMPTY);
         }
         self.add_whiteout(rel);
         self.record_write(rel);
@@ -849,6 +877,10 @@ mod tests {
         assert_eq!(v.create_dir("saves\\slot1"), Ok(()));
         assert!(!f.game().join("saves").exists());
         assert!(v.visible_in_overlay("saves\\slot1"));
+        // RemoveDirectoryW fails on a non-empty merged directory, like Windows.
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(f.game().join("data").exists());
         assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
@@ -1017,6 +1049,11 @@ mod tests {
         std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
         std::fs::write(f.game().join("data").join("sub").join("deep.txt"), b"deep").unwrap();
 
+        // Empty the merged directory first: RemoveDirectoryW fails while entries remain.
+        assert_eq!(v.delete_file("data\\sub\\deep.txt"), Ok(()));
+        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(v.is_whiteout("data"));
         assert!(v.is_whiteout("data\\hello.txt"));
