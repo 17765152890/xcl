@@ -396,18 +396,41 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     Ok(())
 }
 
+/// Region cache `(base, end, committed)` from `VirtualQuery` for sorted address scans.
+type RegionCache = Option<(usize, usize, bool)>;
+
+fn va_committed(va: usize, cache: &mut RegionCache) -> bool {
+    if let Some((base, end, committed)) = *cache {
+        if va >= base && va < end {
+            return committed;
+        }
+    }
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return false;
+    }
+    let base = m.BaseAddress as usize;
+    let end = base.saturating_add(m.RegionSize);
+    let committed = m.State == MEM_COMMIT;
+    *cache = Some((base, end, committed));
+    committed
+}
+
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
 /// when nothing is mapped at `va` itself, else `va`. A physical page mapped at `va` counts
 /// before its first use too, while it is still reserved memory (`kernelx::physical_page_at`).
-fn mirror_source(va: usize) -> usize {
+fn mirror_source_cached(va: usize, cache: &mut RegionCache) -> usize {
     let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
     if crate::hle::kernelx::physical_page_at(va) {
         return va;
     }
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
-    if mapped { va } else { src }
+    if va_committed(va, cache) { va } else { src }
+}
+
+fn mirror_source(va: usize) -> usize {
+    let mut cache = None;
+    mirror_source_cached(va, &mut cache)
 }
 
 /// Physical pages were mapped or unmapped in a GPU view since the last look: textures there
@@ -420,11 +443,21 @@ fn recheck_gpu_view_sources() {
         return;
     }
     let mut changed = false;
-    // (the shadowed textures too: one comes back when the texture over it goes)
+    // Iterate in sorted `va` order (`by_va` / `shadowed_by_va`) so consecutive GPU-view textures
+    // inside the same reserved/committed region reuse a single `VirtualQuery` result instead of
+    // repeating 30k+ syscalls on the render thread.
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-        changed |= recheck_source(e);
+    let mut cache: RegionCache = None;
+    for &(_, res) in t.by_va.keys() {
+        if let Some(e) = t.by_res.get_mut(&res) {
+            changed |= recheck_source_cached(e, &mut cache);
+        }
+    }
+    for &(_, res) in t.shadowed_by_va.keys() {
+        if let Some(e) = t.shadowed.get_mut(&res) {
+            changed |= recheck_source_cached(e, &mut cache);
+        }
     }
     drop(g);
     if changed {
@@ -434,11 +467,11 @@ fn recheck_gpu_view_sources() {
 
 /// `e`'s source again (a texture in a GPU view): when it changed, `e` reads the new one and is
 /// uploaded at the next submit. Whether it changed.
-fn recheck_source(e: &mut Entry) -> bool {
+fn recheck_source_cached(e: &mut Entry, cache: &mut RegionCache) -> bool {
     if !e.in_gpu_view {
         return false;
     }
-    let src = mirror_source(e.va);
+    let src = mirror_source_cached(e.va, cache);
     if src == e.src {
         return false;
     }
@@ -448,6 +481,12 @@ fn recheck_source(e: &mut Entry) -> bool {
         PENDING.fetch_add(1, Ordering::Relaxed);
     }
     true
+}
+
+#[cfg(test)]
+fn recheck_source(e: &mut Entry) -> bool {
+    let mut cache = None;
+    recheck_source_cached(e, &mut cache)
 }
 
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
