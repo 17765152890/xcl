@@ -11,6 +11,8 @@ asks git instead of the GitHub API (whether a commit is on main, a blob's size).
 import argparse, os, re, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
+HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
+SECTION_STOP = r"(?:^[ \t]*\*\*(?:" + "|".join(re.escape(h) for h in HEADINGS) + r")\*\*|\Z)"
 # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
 BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)"
 # game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance")
@@ -54,7 +56,8 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
-        if not re.search(r"\*\*" + section + r"\*\*\s*\n\s*\S", body):
+        m = re.search(r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)" + SECTION_STOP, body, re.S | re.M)
+        if not m or not m.group(1).strip():
             problems.append(f"the **{section}** section is missing or empty")
 
     ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
