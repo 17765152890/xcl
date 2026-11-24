@@ -168,11 +168,24 @@ impl Layout {
     /// `offset` of element (x, y, z) of a thick block row (z < `block_d`; the caller places
     /// the z / `block_d` layers)
     pub fn offset_z(&self, x: usize, y: usize, z: usize, w: usize) -> usize {
+        let ((col, xa), (row, ya)) = (self.column_part(x), self.row_part(y, z, w));
+        row + col + (xa ^ ya)
+    }
+
+    /// The part of `offset_z` column `x` gives: (its block's bytes into the row, its share of
+    /// the XOR) – whole rows are placed with one of these per column (`Chain::detile_level`)
+    pub fn column_part(&self, x: usize) -> (usize, usize) {
+        let hi = self.hx[(x / self.block_w) % self.hx.len()];
+        ((x / self.block_w) * self.block_bytes, (self.ox[x % self.block_w] ^ hi) as usize)
+    }
+
+    /// The part of `offset_z` row `y` of z / slice `z` in a surface `w` elements wide gives:
+    /// (the bytes of the block rows above it, its share of the XOR with `base_xor`)
+    pub fn row_part(&self, y: usize, z: usize, w: usize) -> (usize, usize) {
         let pitch_blocks = w.div_ceil(self.block_w);
-        let block = (y / self.block_h) * pitch_blocks + x / self.block_w;
         let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
-        let xor = self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hx, x, self.block_w) ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
-        block * self.block_bytes + (xor as usize ^ self.base_xor)
+        let xor = self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
+        ((y / self.block_h) * pitch_blocks * self.block_bytes, xor as usize ^ self.base_xor)
     }
 
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
@@ -398,11 +411,19 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
+        if out.is_empty() {
+            return out;
+        }
+        // `element_at` with the columns' parts of the offset computed once for all rows (the
+        // per-element divisions made this the submit thread's main cost while a title streams)
+        let cols: Vec<(usize, usize)> = (0..l.width).map(|x| self.layout.column_part(x + l.origin.0)).collect();
+        for (y, dst) in out.chunks_exact_mut(l.width * e).enumerate() {
+            let (row, ya) = self.layout.row_part(y + l.origin.1, slice, l.pitch);
+            let base = l.offset + row;
+            for (d, &(col, xa)) in dst.chunks_exact_mut(e).zip(&cols) {
+                let o = base + col + (xa ^ ya);
                 if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    d.copy_from_slice(s);
                 }
             }
         }
@@ -485,6 +506,44 @@ mod tests {
         ] {
             let c = Chain::new(Layout::new(mode, e, cfg).unwrap(), w, h, side, mips);
             assert_eq!(c.slice_bytes, bytes, "{w}x{h} e{e} mode {mode} mips {mips}");
+        }
+    }
+
+    /// `offset_z` split into column and row parts gives the offsets of the whole formula, and
+    /// `detile_level` (column parts computed once a level) reads the elements `element_at` names –
+    /// every mode, element size, a few pipe configurations, a mip tail, array slice 1, a base XOR.
+    #[test]
+    fn row_and_column_parts_give_the_element_offsets() {
+        let whole = |l: &Layout, x: usize, y: usize, z: usize, w: usize| {
+            let block = (y / l.block_h) * w.div_ceil(l.block_w) + x / l.block_w;
+            let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+            let xor = l.ox[x % l.block_w] ^ l.oy[y % l.block_h] ^ l.oz[z % l.block_d] ^ hi(&l.hx, x, l.block_w) ^ hi(&l.hy, y, l.block_h) ^ hi(&l.hz, z, l.block_d);
+            block * l.block_bytes + (xor as usize ^ l.base_xor)
+        };
+        for mode in MODES {
+            for e in 0..5 {
+                for cfg in [configs()[0], configs()[5], configs()[9]] {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    lay.base_xor = (0x1300 & (lay.block_bytes - 1)) & !((1 << e) - 1);
+                    for (x, y, z) in [(0, 0, 0), (37, 5, 1), (299, 77, 3), (1024, 1023, 2)] {
+                        assert_eq!(lay.offset_z(x, y, z, 1500), whole(&lay, x, y, z, 1500), "mode {mode} e {e} {cfg:?} ({x},{y},{z})");
+                    }
+                    let c = Chain::new(lay, 100, 37, 1, 6);
+                    let n = 2 * c.slice_bytes;
+                    let src: Vec<u8> = (0..n).map(|i| (i * 2_654_435_761usize >> 7) as u8).collect();
+                    for (i, l) in c.levels.iter().enumerate() {
+                        let got = c.detile_level(&src, i, 1);
+                        let eb = 1usize << e;
+                        for y in 0..l.height {
+                            for x in 0..l.width {
+                                let o = c.element_at(l, x, y, 1);
+                                let want = src.get(o..o + eb).map_or(vec![0; eb], |s| s.to_vec());
+                                assert_eq!(got[(y * l.width + x) * eb..][..eb], want[..], "mode {mode} e {e} level {i} ({x},{y})");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
