@@ -373,7 +373,8 @@ impl FrameRate {
 /// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
 /// thousands recompile), the window's title says so:
-/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
+/// Report DXC activity separately from pending pipelines, which include lazy stand-ins
+/// that may never be requested for a build.
 /// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
 /// then only the game name and presented frame rate remain.
 unsafe fn show_compiling(hwnd: HWND) {
@@ -387,9 +388,9 @@ unsafe fn show_compiling(hwnd: HWND) {
         .unwrap()
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
-    let (_, failed, queued) = super::pso_async::counts();
+    let (_, failed, pending) = super::pso_async::counts();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let active = running > 0 || pending > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -399,9 +400,9 @@ unsafe fn show_compiling(hwnd: HWND) {
     };
     let title = format!("XCL – {} | {fps:.1} FPS", window_name());
     let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+        let pending = if pending > 0 { format!(" | pipelines pending (includes deferred): {pending}") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
+        format!("{title} | DXC: {running} running, {done} done{pending}{failed}")
     } else {
         title
     };
