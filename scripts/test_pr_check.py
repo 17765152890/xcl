@@ -51,8 +51,9 @@ class TestOnlyApprovalTests(unittest.TestCase):
 
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
-        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n\n"
-                "xcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n```\n")
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "\n"
+                "xcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
         blocks = smoke_blocks(body)
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
@@ -62,6 +63,24 @@ class SmokeBlockTests(unittest.TestCase):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\n```\ntext\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
+
+    def smoke_problems(self, main_run, pr_run):
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + main_run + "```\n"
+                "```\nxcl-smoke v1\ncommit: 1234567890\n" + pr_run + "```\n")
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        return check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa")
+
+    def test_blocks_with_only_commit_lines_fail(self):
+        problems = self.smoke_problems("", "")
+        for field in ("title", "seconds", "frames shown"):
+            for run in ("the PR's", "the main"):
+                self.assertTrue(any(p.startswith(run) and f"no `{field}` line" in p for p in problems), problems)
+
+    def test_non_numeric_frames_shown_fails(self):
+        run = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
+        problems = self.smoke_problems(run + "frames shown: 100\n", run + "frames shown: many\n")
+        self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
+                      "has a non-numeric `frames shown`: many", problems)
 
 
 class TemplatePlaceholderTests(unittest.TestCase):

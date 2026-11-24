@@ -31,6 +31,10 @@ TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
+# the lines a smoke block needs to be compared with the other (the crash and device-removal
+# counts are checked where they are used), and those of them that are numbers
+SMOKE_FIELDS = ("title", "seconds", "frames shown")
+SMOKE_NUMBERS = ("seconds", "frames shown")
 
 
 def smoke_blocks(body):
@@ -50,6 +54,16 @@ def smoke_blocks(body):
 def number(s):
     m = re.match(r"\s*(\d+)", s or "")
     return int(m.group(1)) if m else None
+
+
+def field_problems(block, run):
+    """What `block` (the smoke block of `run`) lacks for the comparison: a missing line or a
+    number that is not one."""
+    name = f"{run} regression run (`xcl-smoke` block of commit {(block.get('commit') or '?').split()[0]})"
+    out = [f"{name} has no `{k}` line" for k in SMOKE_FIELDS if not block.get(k)]
+    out += [f"{name} has a non-numeric `{k}`: {block[k]}" for k in SMOKE_NUMBERS
+            if block.get(k) and number(block[k]) is None]
+    return out
 
 
 def runtime(path):
@@ -125,6 +139,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                             "with the same title and time as the PR's")
         if clean:
             pr = clean[-1]
+            problems += field_problems(pr, "the PR's")
             for key in ("device removals", "crashes"):
                 if (number(pr.get(key)) or 0) > 0:
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
@@ -132,6 +147,8 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                 problems.append("the PR's regression run did not end by itself (killed)")
             if main:
                 m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
+                for b in [m] if m else main:
+                    problems += field_problems(b, "the main")
                 if m is None:
                     problems.append("the main and PR regression runs are not of the same title for the same time")
                 else:
