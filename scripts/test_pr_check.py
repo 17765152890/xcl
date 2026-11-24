@@ -1,6 +1,6 @@
 import unittest
 
-from pr_check import check
+from pr_check import check, smoke_blocks
 
 
 HEAD = "1234567890abcdef"
@@ -34,6 +34,23 @@ class TestOnlyApprovalTests(unittest.TestCase):
     def test_test_paths_do_not_need_approval(self):
         files = [changed("crates/xcl/tests/integration.rs"), changed("crates/xcl/src/gpu/recomp/tests.rs")]
         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
+
+
+def smoke(commit):
+    return (f"xcl-smoke v1\ncommit: {commit}\ntitle: G\nseconds: 60\nframes shown: 100\n"
+            "peak commit: 100 MB\ndevice removals: 0\ncrashes: 0\nexit: ok\n")
+
+
+class SmokeBlockTests(unittest.TestCase):
+    def test_two_blocks_in_one_fence_are_two_blocks(self):
+        body = "```\n" + smoke("1111111aaaa") + "\n" + smoke(HEAD) + "```\n"
+        blocks = smoke_blocks(body)
+        self.assertEqual(["1111111aaaa", HEAD], [b.get("commit") for b in blocks])
+
+    def test_two_blocks_in_one_fence_pass_the_regression_check(self):
+        body = BODY + "**Regression run**\n```\n" + smoke("1111111aaaa") + "\n" + smoke(HEAD) + "```\n"
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        self.assertEqual([], check(body, HEAD, files, lambda sha: sha == "1111111aaaa"))
 
 
 if __name__ == "__main__":
