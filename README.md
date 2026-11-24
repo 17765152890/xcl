@@ -1,12 +1,42 @@
-# XCL – Xbox Series X|S → Windows compatibility layer
+<h1 align="center">XCL</h1>
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/xcl)
-**Discord: <https://discord.gg/xcl>**
+<p align="center">
+  <b>Xbox Series X|S → Windows compatibility layer</b><br>
+  A console game's own x64 code, running natively on a PC – no CPU emulation.
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/xcl"><img alt="Discord" src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white"></a>
+  <a href="https://github.com/ivall/xcl/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ivall/xcl/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="LICENSE"><img alt="License: GPL-2.0-only" src="https://img.shields.io/badge/license-GPL--2.0--only-blue"></a>
+  <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?logo=windows&logoColor=white">
+  <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable--msvc-B7410E?logo=rust&logoColor=white">
+</p>
+
+<p align="center">
+  <a href="#games">Games</a> ·
+  <a href="#highlights">Highlights</a> ·
+  <a href="#what-works">What works</a> ·
+  <a href="#controls">Controls</a> ·
+  <a href="#building-and-usage">Building and usage</a> ·
+  <a href="#switches-for-a-run">Switches</a> ·
+  <a href="#tests">Tests</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="https://discord.gg/xcl">Discord</a>
+</p>
+
+---
 
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
 x64 code runs natively and XCL stands in for the console libraries the PC does not have
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
 GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
+
+| | |
+|---|---|
+| **1. Native code** | the game's executable and its console DLLs are loaded and run as they are |
+| **2. Console libraries** | XCL's own `kernelx`, XGameRuntime, D3D12.X, DirectStorage, audio … answer the calls the PC has no library for |
+| **3. Shaders** | RDNA2 machine code → HLSL → DXIL, cached on disk |
 
 **Project state:** retail games run – Minecraft Preview and Unicorn Overlord are fully
 playable, Fortnite and XDefiant work as far as each game goes without its online services;
@@ -63,7 +93,7 @@ next steps:
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
-| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
+| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background; the driver's own compile of a compute pipeline is kept in memory and on disk, and the pipelines an earlier run used are built ahead of their first use | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
@@ -144,6 +174,22 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+
+## Switches for a run
+
+Environment variables, set before `xcl run`. These are the ones a user is most likely to want;
+the rest are diagnostics described in [`HANDOFF.md`](HANDOFF.md).
+
+| Variable | What it does |
+|---|---|
+| `XCL_NETWORK=0` | the title runs as on a console without a network: its requests fail at once and nothing leaves the PC |
+| `XCL_ADAPTER=1` / `XCL_ADAPTER=radeon` | another GPU than the first high-performance one |
+| `XCL_DXC_DIR=<folder>` | the DXC to use (`dxcompiler.dll` + `dxil.dll`) |
+| `XCL_D3D12_DEBUG=1` | the D3D12 debug layer; its messages go to `xcl.log` |
+| `XCL_FRAME_DUMP=N` | presented frames are sampled and written to the title's `logs\` folder (see [Building and usage](#building-and-usage)) |
+| `XCL_PSO_DISK_CACHE=0` | the driver's compiled compute pipelines are not kept on disk between runs |
+| `XCL_PSO_PRELOAD=0` | the pipelines an earlier run used are not built ahead of their first use |
+| `XCL_DATA_ROOT=<folder>` | where title data goes instead of `%LOCALAPPDATA%\XCL` |
 
 ## Tests
 
