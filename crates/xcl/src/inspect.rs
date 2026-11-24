@@ -37,8 +37,8 @@ struct Out {
 pub fn console_imports(path: &Path) -> Option<Vec<String>> {
     let data = std::fs::read(path).ok()?;
     let pe = Pe::parse(&data, Layout::File).ok()?;
-    let mut all = pe.imports().unwrap_or_default();
-    all.extend(pe.delay_imports().unwrap_or_default());
+    let mut all = pe.imports().ok()?;
+    all.extend(pe.delay_imports().ok()?);
     let reg = crate::hle::registry();
     let mut out: Vec<String> = Vec::new();
     for d in &all {
@@ -87,8 +87,16 @@ pub fn run(path: &Path, json: bool) -> i32 {
         resolver::set_search_dirs(vec![dir.to_path_buf()]);
     }
     let mut imports = Vec::new();
-    let mut all = pe.imports().unwrap_or_default();
-    all.extend(pe.delay_imports().unwrap_or_default());
+    let all = match pe.imports().and_then(|mut all| {
+        all.extend(pe.delay_imports()?);
+        Ok(all)
+    }) {
+        Ok(all) => all,
+        Err(e) => {
+            eprintln!("xcl inspect: {}: cannot read imports: {e}", path.display());
+            return 3;
+        }
+    };
     for d in &all {
         for e in &d.entries {
             let s = resolver::classify(&d.dll, &e.what);
