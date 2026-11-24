@@ -344,6 +344,90 @@ fn gpu_v_swaprel_b32() {
     assert_eq!((r.sgpr[126], r.sgpr[127]), (0xFFFF_FFFF, 0xFFFF_FFFF), "exec restored");
 }
 
+/// GPU checks for `v_movrelsd_b32`, `v_movrelsd_2_b32` (both `ENC_VOP1` and `ENC_VOP3`,
+/// `M0` bit-field masking, overlapping ranges, and partial `EXEC` masking) and `v_movreld_b32`
+/// with SGPR and inline-literal sources.
+#[test]
+fn gpu_movrelsd_and_movrel_b32() {
+    let p = prog(&[
+        // 1. V_MOVRELSD_B32 (VOP1) with dynamic M0 = s1 (= 2): v22 = v12
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 1)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // 2. V_MOVRELSD_B32 (VOP3) with dynamic M0 = s2 (= 4): v24 = v14
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 2)], None),
+        ("V_MOVRELSD_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // 3. V_MOVRELSD_2_B32 (VOP1) with dynamic M0 = s3 (= (3 << 16) | 1): v23 = v11
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 3)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // 4. V_MOVRELSD_2_B32 (VOP3) with upper junk bits in M0 = s4 (= 0xFC00_FC00 | (0 << 16) | 5): v20 = v15
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 4)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 10)], None),
+        // 5. Overlapping V_MOVRELSD_2_B32 within v30..=v32: v32 = v30, v30 = v32, self-move v31 = v31
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 5)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 30)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 6)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 30)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 7)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 30)], None),
+        // 6. V_MOVRELD_B32 with SGPR (s0 -> v33) and inline-literal (0x1357_9BDF -> v34) sources
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 131)], None),
+        ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 30), ("SRC0", 0)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 132)], None),
+        ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 30), ("SRC0", 255)], Some(0x1357_9BDF)),
+        // 7. V_MOVRELSD_2_B32 under partial EXEC (odd lanes only): v21 = v13 on odd lanes, even lanes keep sentinel
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 8)], None),
+        ("V_MOVRELSD_2_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 10)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 32)], None),
+        // Anchor max_vgpr at v35 so relative ranges cover v20..=v25 and v30..=v35
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 35), ("SRC0", V + 35)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        st.sgpr[0] = 0xCAFE_BABE;
+        st.sgpr[1] = 2;
+        st.sgpr[2] = 4;
+        st.sgpr[3] = (3 << 16) | 1;
+        st.sgpr[4] = 0xFC00_FC00 | 5;
+        st.sgpr[5] = 2 << 16;
+        st.sgpr[6] = 2;
+        st.sgpr[7] = (1 << 16) | 1;
+        st.sgpr[8] = (1 << 16) | 3;
+        st.sgpr[30] = 0xAAAA_AAAA;
+        st.sgpr[31] = 0xAAAA_AAAA;
+        st.sgpr[32] = 0xFFFF_FFFF;
+        st.sgpr[33] = 0xFFFF_FFFF;
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            for k in 0..=5usize {
+                r[10 + k] = 1000 + (k as u32) * 100 + (l as u32);
+                r[20 + k] = 0xA000_0000 | ((k as u32) << 8) | (l as u32);
+                r[30 + k] = 0xB000_0000 | ((k as u32) << 8) | (l as u32);
+            }
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let lu = l as u32;
+            assert_eq!(v[20], 1500 + lu, "wave{lanes} lane {l} v_movrelsd_2_b32 VOP3 M0-masked");
+            let want21 = if l & 1 == 1 { 1300 + lu } else { 0xA000_0100 | lu };
+            assert_eq!(v[21], want21, "wave{lanes} lane {l} v_movrelsd_2_b32 EXEC-gated");
+            assert_eq!(v[22], 1200 + lu, "wave{lanes} lane {l} v_movrelsd_b32 VOP1");
+            assert_eq!(v[23], 1100 + lu, "wave{lanes} lane {l} v_movrelsd_2_b32 VOP1");
+            assert_eq!(v[24], 1400 + lu, "wave{lanes} lane {l} v_movrelsd_b32 VOP3");
+            assert_eq!(v[25], 0xA000_0500 | lu, "wave{lanes} lane {l} untouched v25 sentinel");
+            assert_eq!(v[30], 0xB000_0000 | lu, "wave{lanes} lane {l} overlap v30 <- v32 <- v30");
+            assert_eq!(v[31], 0xB000_0100 | lu, "wave{lanes} lane {l} overlap self-move v31");
+            assert_eq!(v[32], 0xB000_0000 | lu, "wave{lanes} lane {l} overlap v32 <- v30");
+            assert_eq!(v[33], 0xCAFE_BABE, "wave{lanes} lane {l} v_movreld_b32 SGPR src");
+            assert_eq!(v[34], 0x1357_9BDF, "wave{lanes} lane {l} v_movreld_b32 literal src");
+            assert_eq!(v[35], 0xB000_0500 | lu, "wave{lanes} lane {l} untouched v35 sentinel");
+        }
+        assert_eq!((res.sgpr[126], res.sgpr[127]), (0xFFFF_FFFF, 0xFFFF_FFFF), "wave{lanes} exec restored");
+    }
+}
+
 #[test]
 fn atomic_inc_dec_x2_encoding_families() {
     let code = prog(&[
