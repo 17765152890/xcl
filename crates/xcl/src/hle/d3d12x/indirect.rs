@@ -369,7 +369,7 @@ mod tests {
         register(key, 40, &desc);
         let sig = lookup(key).unwrap().unwrap();
         assert_eq!((sig.stride, sig.action_offset, sig.action_bytes), (40, 16, 20));
-        let layout = Layout { params: vec![Param::Constants { at: 0, count: 3 }, Param::Descriptor { at: 12 }], size: 20, inline: 12, inline_gfx: 12 };
+        let layout = Layout { params: vec![Param::Constants { at: 0, count: 3 }, Param::Descriptor { at: 12 }], size: 20, inline: 12, inline_gfx: 12, inline_ms: 12 };
         let patches = sig.patches(&layout, 12, true).unwrap();
         assert_eq!(
             patches.iter().map(|p| (p.source, p.dest, p.shadow)).collect::<Vec<_>>(),
