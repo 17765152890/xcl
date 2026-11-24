@@ -60,10 +60,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
-                let tt = crate::hle::d3d12x::title_textures::stats();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); title textures {} ({} MB covered, {} retired, {} released)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -72,11 +71,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64),
-                    tt.active,
-                    mb(tt.covered_bytes as u64),
-                    tt.retired,
-                    tt.released
+                    mb(pools_mapped as u64)
                 );
                 last = now;
             }
@@ -120,7 +115,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::resolver::set_search_dirs(dirs);
 
     let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
-    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts));
+    // (the shader cache is XCL's too: on a drive a console mount names it must stay where it is)
+    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir()));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {

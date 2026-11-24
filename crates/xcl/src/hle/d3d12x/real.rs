@@ -1795,8 +1795,9 @@ fn note_buffer_view() {
     }
 }
 
-/// #17 CreateConstantBufferView: a raw V# of the buffer's console address (unified memory;
-/// anything else gets an empty V#). No PC CBV: translated shaders read buffers through `mem`.
+/// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
+/// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
+/// shaders read buffers through `mem`.
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
@@ -1808,7 +1809,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         note_buffer_view();
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
-    super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, 0, size, 22));
+    super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
@@ -4418,16 +4419,11 @@ unsafe fn untranslated_stream_desc(desc: *const c_void, stream: bool) -> Option<
 }
 
 /// The GS that completes a rect list's rects behind the console VS `vs` and the PS `ps`; refused
-/// for a PS that reads flat or is not a console one (its inputs' modes are not known).
+/// for a PS that is not a console one (its inputs' modes are not known).
 fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
     use crate::gpu::recomp::pso;
-    if let Some(p) = ps {
-        if !pso::is_console(p) {
-            return Err("a PC pixel shader".into());
-        }
-        if pso::ps_reads_flat(p)? {
-            return Err("the PS reads a flat attribute".into());
-        }
+    if ps.is_some_and(|p| !pso::is_console(p)) {
+        return Err("a PC pixel shader".into());
     }
     pso::rect_list_gs(vs)
 }
@@ -4792,7 +4788,6 @@ unsafe extern "system" fn dev_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         teardown_resource_at(this as usize);
-        super::title_textures::teardown(Some(this as usize));
     }
     n
 }
@@ -4802,7 +4797,6 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
-        super::vram::on_queue_release(this as usize);
     }
     n
 }
@@ -5228,6 +5222,52 @@ mod rect_list_pso_tests {
             assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
             assert!(untranslated_stream_desc(desc(&tri), true).is_none());
             assert!(untranslated_stream_desc(desc(&rect), false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod this_first_tests {
+    use super::*;
+
+    /// `this_first`: either argument order, and a return buffer whose first word is a stale copy
+    /// of the object's vtable pointer (7a033c8: the retail game's C-way call wrote its result
+    /// over the device). Synthetic objects; no GPU and no title.
+    #[test]
+    fn a_return_buffer_with_a_stale_vtable_copy_is_not_the_object() {
+        let pc = [0usize; 32];
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        let plain = 0x1234_5678usize;
+        let p = &plain as *const usize as *mut c_void;
+        // an object off the stack (as a real device is), and a stack buffer holding a stale copy
+        // of its vtable pointer - the retail game's case
+        let obj = Box::into_raw(Box::new([vtbl])) as *mut c_void;
+        let buf = [vtbl];
+        let b = buf.as_ptr() as *mut c_void;
+        unsafe {
+            assert!(is_adopted(obj) && is_adopted(b), "both look adopted");
+            // one adopted: that one is the object, either position
+            assert!(this_first(obj, p));
+            assert!(!this_first(p, obj));
+            // neither adopted: unchanged (the C way is assumed)
+            assert!(!this_first(p, p) && !this_first(std::ptr::null_mut(), std::ptr::null_mut()));
+            // one null argument: the other is taken as `this`, either position
+            assert!(this_first(obj, std::ptr::null_mut()));
+            assert!(!this_first(std::ptr::null_mut(), obj));
+            // both adopted, one on this thread's stack: the stack one is the buffer, so the heap
+            // one is `this` in either order - what 7a033c8 fixed
+            assert!(this_first(obj, b));
+            assert!(!this_first(b, obj));
+            // both on the stack, neither the device: `a` (the C++ way)
+            let stale = [vtbl];
+            let s = stale.as_ptr() as *mut c_void;
+            assert!(this_first(b, s) && this_first(s, b));
+            drop(Box::from_raw(obj as *mut [usize; 1]));
+        }
+        if let Some(g) = EXTS.lock().unwrap().as_mut() {
+            g.remove(&vtbl);
         }
     }
 }
