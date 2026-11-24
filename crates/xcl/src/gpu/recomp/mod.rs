@@ -1356,7 +1356,18 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
     out
 }
 
-pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+/// A decoded program, its block leaders and the emitter set up for it (`translate`,
+/// `compact::translate_compact`).
+struct Prepared {
+    insts: Vec<Decoded>,
+    starts: BTreeSet<u64>,
+    leaders: BTreeSet<u64>,
+    branches: usize,
+    gs_jump: Option<Option<u64>>,
+    em: emit::Em,
+}
+
+fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1422,6 +1433,11 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if let Mode::Pixel(ps) = &opt.mode {
         em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
     }
+    Ok(Prepared { insts, starts, leaders, branches, gs_jump, em })
+}
+
+pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let Prepared { insts, starts, leaders, branches, gs_jump, mut em } = prepare(code, opt)?;
     let mut body = String::new();
     let mut blocks = 0usize;
     if branches == 0 {
