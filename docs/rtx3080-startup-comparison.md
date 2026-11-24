@@ -31,3 +31,9 @@ An additional run with XCL `4017f8f` first presented at 5.445 seconds and hit th
 The next XCL run added the rest of the pinned package for 109 verified files total. It used the `7ebf1b8` diagnostics branch, a 512 MiB coherent window, `XCL_ACTIVITY=1`, and a cleared frame-dump setting. The first accepted 4K present was at 5.466 seconds. XCL continued presenting until the isolated launcher stopped it at its 60-second limit. The earlier `+0x1dac734` exception did not recur.
 
 The last ten two-second activity windows each counted 6–8 host presents, with no reported frame-event timeout or DirectStorage failure in those windows. That is 3–4 accepted presents per second in the late samples. Visible rendering and input remain to be checked. [Pinned package manifest](https://github.com/4ld0-vito/Leonida/blob/05e821e2/game/xbox-1.0.2.1.json)
+
+### 4,095 MiB on the complete package
+
+The matched 109-file rerun kept the same XCL executable, 60-second isolation limit, host counters, and frame-dump setting. The only launch setting changed was `XCL_COHERENT_MB=4095`. XCL opened the requested window, first presented at 6.705 seconds at 3840 × 2160, and ran to the limit without a reported exception.
+
+Each of the final ten two-second activity windows counted 60 accepted host presents, 1,260 draws and 60 dispatches. That is 30 accepted presents per second for those 20 seconds, up from 3–4 in the corresponding default-window samples. The sampled frame-event timeouts and DirectStorage failures remained at zero. Visual output and working input still need direct verification. [Related RTX 3080 heap test](https://github.com/ivall/xcl/pull/632)
