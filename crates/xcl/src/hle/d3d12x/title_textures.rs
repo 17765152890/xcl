@@ -822,11 +822,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     };
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
-        let mut batch = Vec::new();
+        let mut raw = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !raw.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -846,7 +846,37 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             device = dev;
             bytes += tex.size() as usize;
-            let subs = subresources(va, &tex);
+            raw.push((r, va, tex, states));
+        }
+        let mut subs_all: Vec<Vec<Subresource>> = vec![Vec::new(); raw.len()];
+        let workers = if raw.len() >= 2 && bytes >= (256 << 10) {
+            std::thread::available_parallelism().map_or(4, |n| n.get()).min(raw.len()).min(16)
+        } else {
+            1
+        };
+        if workers <= 1 {
+            for (slot, (_, va, tex, _)) in subs_all.iter_mut().zip(raw.iter()) {
+                *slot = subresources(*va, tex);
+            }
+        } else {
+            use std::sync::atomic::AtomicUsize;
+            let next = AtomicUsize::new(0);
+            let tasks: Vec<(usize, Arc<xg::Texture>)> = raw.iter().map(|(_, va, tex, _)| (*va, Arc::clone(tex))).collect();
+            let slots_ptr = subs_all.as_mut_ptr() as usize;
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((va, tex)) = tasks.get(i) else { break };
+                        let subs = subresources(*va, tex);
+                        // SAFETY: each index `i < raw.len()` is claimed by at most one worker thread.
+                        *(slots_ptr as *mut Vec<Subresource>).add(i) = subs;
+                    });
+                }
+            });
+        }
+        let mut batch = Vec::with_capacity(raw.len());
+        for ((r, va, _, states), subs) in raw.into_iter().zip(subs_all) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }

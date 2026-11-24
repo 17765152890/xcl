@@ -415,6 +415,9 @@ impl Chain {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
+        if l.width == 0 || l.height == 0 {
+            return out;
+        }
         if self.layout.mode == 0 && self.layout.base_xor == 0 && l.origin == (0, 0) {
             let row_bytes = l.width * e;
             let stride = l.pitch.div_ceil(self.layout.block_w) * self.layout.block_bytes;
@@ -429,11 +432,84 @@ impl Chain {
             }
             return out;
         }
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
-                if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+        let lay = &self.layout;
+        let bw_shift = lay.block_w.trailing_zeros();
+        let bw_mask = lay.block_w - 1;
+        let bh_shift = lay.block_h.trailing_zeros();
+        let bh_mask = lay.block_h - 1;
+        let bd_shift = lay.block_d.trailing_zeros();
+        let bd_mask = lay.block_d - 1;
+        let blk_shift = lay.block_bytes.trailing_zeros();
+        let hx_mask = lay.hx.len() - 1;
+        let hy_mask = lay.hy.len() - 1;
+        let hz_mask = lay.hz.len() - 1;
+        let pitch_bytes = l.pitch.div_ceil(lay.block_w) << blk_shift;
+        let z_xor = (lay.oz[slice & bd_mask] ^ lay.hz[(slice >> bd_shift) & hz_mask]) as usize ^ lay.base_xor;
+        let ox0 = l.origin.0;
+        let oy0 = l.origin.1;
+
+        let mut x_blk = Vec::with_capacity(l.width);
+        let mut x_xor = Vec::with_capacity(l.width);
+        for x in 0..l.width {
+            let gx = x + ox0;
+            let bx = gx >> bw_shift;
+            x_blk.push(bx << blk_shift);
+            x_xor.push((lay.ox[gx & bw_mask] ^ lay.hx[bx & hx_mask]) as usize);
+        }
+
+        let src_len = src.len();
+        let max_gy = oy0 + l.height - 1;
+        let max_gx = ox0 + l.width - 1;
+        let max_end = l.offset + ((max_gy >> bh_shift) * pitch_bytes) + (((max_gx >> bw_shift) + 1) << blk_shift);
+        let all_in_bounds = max_end <= src_len && (lay.base_xor & (e - 1)) == 0;
+
+        macro_rules! detile_elem {
+            ($n:literal) => {{
+                let row_bytes = l.width * $n;
+                if all_in_bounds {
+                    for y in 0..l.height {
+                        let gy = y + oy0;
+                        let by = gy >> bh_shift;
+                        let row_base = l.offset + by * pitch_bytes;
+                        let y_xor = (lay.oy[gy & bh_mask] ^ lay.hy[by & hy_mask]) as usize ^ z_xor;
+                        let dst_row = &mut out[y * row_bytes..][..row_bytes];
+                        for x in 0..l.width {
+                            let o = row_base + x_blk[x] + (x_xor[x] ^ y_xor);
+                            dst_row[x * $n..x * $n + $n].copy_from_slice(&src[o..o + $n]);
+                        }
+                    }
+                } else {
+                    for y in 0..l.height {
+                        let gy = y + oy0;
+                        let by = gy >> bh_shift;
+                        let row_base = l.offset + by * pitch_bytes;
+                        let y_xor = (lay.oy[gy & bh_mask] ^ lay.hy[by & hy_mask]) as usize ^ z_xor;
+                        let dst_row = &mut out[y * row_bytes..][..row_bytes];
+                        for x in 0..l.width {
+                            let o = row_base + x_blk[x] + (x_xor[x] ^ y_xor);
+                            if let Some(s) = src.get(o..o + $n) {
+                                dst_row[x * $n..x * $n + $n].copy_from_slice(s);
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+
+        match e {
+            1 => detile_elem!(1),
+            2 => detile_elem!(2),
+            4 => detile_elem!(4),
+            8 => detile_elem!(8),
+            16 => detile_elem!(16),
+            _ => {
+                for y in 0..l.height {
+                    for x in 0..l.width {
+                        let o = self.element_at(&l, x, y, slice);
+                        if let Some(s) = src.get(o..o + e) {
+                            out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                        }
+                    }
                 }
             }
         }
