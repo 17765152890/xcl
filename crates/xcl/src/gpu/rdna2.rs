@@ -297,6 +297,17 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
         return None;
     }
     let f = o.field?;
+    if matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF") && matches!(f, "VADDR" | "VDATA") {
+        let bit = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+        let v = field_value(d.enc, &d.words, f)?;
+        return Some(match (f, bit("IDXEN") + bit("OFFEN")) {
+            // TFE: one more data register, for the status
+            ("VDATA", _) => reg_range("v", v, o.size + 32 * bit("TFE") as u16),
+            // the address registers: none, the index or the offset, or both
+            (_, 0) => "off".into(),
+            (_, n) => reg_range("v", v, 32 * n as u16),
+        });
+    }
     if f == "LITERAL" {
         return Some(format!("{:#x}", d.literal.unwrap_or(0)));
     }
@@ -594,7 +605,31 @@ pub fn format(d: &Decoded) -> String {
                 s.push_str(" gds");
             }
         }
-        "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
+        // in LLVM's order; a tbuffer's format by its name (1, 8_UNORM, is what it has unsaid)
+        "ENC_MUBUF" | "ENC_MTBUF" => {
+            let bit = |n: &str| field_value(d.enc, &d.words, n) == Some(1);
+            match field_value(d.enc, &d.words, "FORMAT") {
+                None | Some(1) => {}
+                Some(n) => match crate::gpu::recomp::emit::BUF_FORMATS.get(n as usize) {
+                    Some(name) => drop(write!(s, " format:[BUF_FMT_{name}]")),
+                    None => drop(write!(s, " format:{n}")),
+                },
+            }
+            for flag in ["IDXEN", "OFFEN"] {
+                if bit(flag) {
+                    let _ = write!(s, " {}", flag.to_ascii_lowercase());
+                }
+            }
+            if let Some(offset) = field_value(d.enc, &d.words, "OFFSET").filter(|&v| v != 0) {
+                let _ = write!(s, " offset:{offset}");
+            }
+            for flag in ["GLC", "SLC", "DLC", "LDS", "TFE"] {
+                if bit(flag) {
+                    let _ = write!(s, " {}", flag.to_ascii_lowercase());
+                }
+            }
+        }
+        "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
             for (f, label) in [("OFFSET", "offset"), ("OFFSET0", "offset0"), ("OFFSET1", "offset1")] {
                 if let Some(v) = field_value(d.enc, &d.words, f).filter(|&v| v != 0) {
                     let _ = write!(s, " {label}:{v}");
@@ -716,6 +751,47 @@ mod tests {
         let b = encode("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 1), ("SDST", 106), ("SRC0", 256 + 2), ("SRC1", 256 + 3)], None).unwrap();
         assert_eq!(decode(&b, 0).unwrap().inst.name, "V_ADD_CO_U32");
         assert_eq!(dis(&encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()), "s_endpgm");
+    }
+
+    #[test]
+    fn buffer_address_format_and_flags() {
+        // llvm-mc 21.1.8 (-mcpu=gfx1030) gives these lines for the words
+        for (words, text) in [
+            ([0xe030_ffffu32, 0x0342_0500], "buffer_load_dword v5, v[0:1], s[8:11], s3 idxen offen offset:4095 glc slc dlc"),
+            ([0xe030_0fff, 0x0382_0500], "buffer_load_dword v[5:6], off, s[8:11], s3 offset:4095 tfe"),
+            ([0xe024_0000, 0x0302_0500], "buffer_load_sbyte v5, off, s[8:11], s3"),
+            // format 1 (8_UNORM), what a tbuffer instruction has unless it says otherwise, is not printed
+            ([0xe809_f02a, 0x0362_0507], "tbuffer_load_format_d16_xy v5, v[7:8], s[8:11], s3 idxen offen offset:42 glc slc dlc"),
+            ([0xe870_0000, 0x0020_0000], "tbuffer_load_format_d16_x v0, off, s[0:3], s0 format:[BUF_FMT_8_8_UNORM]"),
+        ] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(dis(&bytes), text);
+        }
+        // not LLVM's: the data register of a load into LDS stays (LLVM: `buffer_load_ushort off, …`)
+        assert_eq!(dis(&[0x00, 0x00, 0x29, 0xe0, 0x00, 0x05, 0x02, 0x03]), "buffer_load_ushort v5, off, s[8:11], s3 lds");
+    }
+
+    /// Every buffer line of LLVM's gfx10 MUBUF / MTBUF tests reads as LLVM writes it: `off` or
+    /// the address registers IDXEN / OFFEN ask for, `format:`, and the flags in LLVM's order.
+    #[test]
+    fn llvm_gfx10_buffer_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut formats, mut wrong) = (0usize, 0usize, Vec::new());
+        for file in ["gfx10_mubuf.txt", "gfx10_mtbuf.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let got = dis(&bytes);
+                total += 1;
+                formats += asm.contains(" format:") as usize;
+                if got != asm {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total > 800 && formats > 30, "the buffer tests are not all there: {total} lines, {formats} with a format");
+        assert!(wrong.is_empty(), "{} of {total} buffer lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
