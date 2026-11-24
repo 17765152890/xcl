@@ -3302,9 +3302,17 @@ impl Em {
             }
             "v_cvt_pkrtz_f16_f32" => format!("f16_rtz({}) | (f16_rtz({}) << 16)", fs(0), fs(1)),
             "v_pack_b32_f16" => {
-                let lo = if m.opsel & 1 == 1 { format!("({a} >> 16)") } else { format!("({a} & 0xFFFFu)") };
-                let hi = if m.opsel & 2 == 2 { format!("({b} >> 16)") } else { format!("({b} & 0xFFFFu)") };
-                format!("{lo} | ({hi} << 16)")
+                let half = |i: usize, s: &str| {
+                    let mut h = if m.opsel >> i & 1 == 1 { format!("({s} >> 16)") } else { format!("({s} & 0xFFFFu)") };
+                    if m.abs[i] {
+                        h = format!("({h} & 0x7FFFu)");
+                    }
+                    if m.neg[i] {
+                        h = format!("({h} ^ 0x8000u)");
+                    }
+                    h
+                };
+                format!("{} | ({} << 16)", half(0, &a), half(1, &b))
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
