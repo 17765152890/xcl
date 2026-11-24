@@ -1,0 +1,239 @@
+diff --git a/README.md b/README.md
+index aae5a3f..38a6aa5 100644
+--- a/README.md
++++ b/README.md
+@@ -88,6 +88,8 @@ A **gamepad is recommended**: console games are made for one, and their menus an
+   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
+   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
+   used together.
++  Set `XCL_KEYBOARD_TAPS=1` to hold mapped menu key presses for at least 125 ms while the XCL
++  window has focus. `XCL_TRACE_KEYBOARD_TAPS=1` logs a limited sample of mapped presses and polls.
+ 
+ ## Building and usage
+ 
+diff --git a/crates/xcl/src/hle/gameinput.rs b/crates/xcl/src/hle/gameinput.rs
+index 402d4c7..25a8d4d 100644
+--- a/crates/xcl/src/hle/gameinput.rs
++++ b/crates/xcl/src/hle/gameinput.rs
+@@ -269,18 +269,119 @@ extern "system" {
+     fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
+ }
+ 
++const KEYBOARD_BUTTONS: [(i32, u32); 10] = [(0x0D, A), (0x20, A), (0x1B, B), (0x08, B), (0x26, DPAD_UP), (0x28, DPAD_DOWN), (0x25, DPAD_LEFT), (0x27, DPAD_RIGHT), (0x09, VIEW), (0x50, MENU)];
++const TAP_DURATION: Duration = Duration::from_millis(125);
++
++struct KeyboardTaps {
++    until: [Option<Instant>; u32::BITS as usize],
++}
++
++impl KeyboardTaps {
++    const fn new() -> Self {
++        Self { until: [None; u32::BITS as usize] }
++    }
++
++    fn remember(&mut self, button: u32, now: Instant) {
++        self.until[button.trailing_zeros() as usize] = Some(now + TAP_DURATION);
++    }
++
++    fn buttons(&mut self, now: Instant, focused: bool) -> u32 {
++        if !focused {
++            self.until.fill(None);
++            return 0;
++        }
++        self.until.iter().enumerate().fold(0, |buttons, (bit, expires)| {
++            if expires.is_some_and(|until| now < until) { buttons | (1 << bit) } else { buttons }
++        })
++    }
++}
++
++static KEYBOARD_TAPS: Mutex<KeyboardTaps> = Mutex::new(KeyboardTaps::new());
++static TRACE_RECEIPTS: AtomicU32 = AtomicU32::new(0);
++
++fn keyboard_tap_options() -> (bool, bool) {
++    static OPTIONS: OnceLock<(bool, bool)> = OnceLock::new();
++    *OPTIONS.get_or_init(|| {
++        let enabled = |name| std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1"));
++        (enabled("XCL_KEYBOARD_TAPS"), enabled("XCL_TRACE_KEYBOARD_TAPS"))
++    })
++}
++
++pub(crate) fn keyboard_tap_messages_enabled() -> bool {
++    let (enabled, trace) = keyboard_tap_options();
++    enabled || trace
++}
++
++fn keyboard_tap_button(key: i32, previous_down: bool) -> Option<u32> {
++    if previous_down {
++        return None;
++    }
++    KEYBOARD_BUTTONS.iter().find(|&&(vk, _)| vk == key).map(|&(_, button)| button)
++}
++
++/// An initial mapped keydown delivered to the owned presenter (not system-key messages).
++pub(crate) fn note_keyboard_tap(key: i32, previous_down: bool, focused: bool) {
++    let Some(button) = keyboard_tap_button(key, previous_down) else { return };
++    let (enabled, trace) = keyboard_tap_options();
++    let latched = enabled && focused;
++    if latched {
++        KEYBOARD_TAPS.lock().unwrap_or_else(|e| e.into_inner()).remember(button, Instant::now());
++    }
++    static LOGGED: AtomicU32 = AtomicU32::new(0);
++    if trace && LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
++        TRACE_RECEIPTS.fetch_or(button, Ordering::Relaxed);
++        crate::xlog_info!("GameInput keyboard: owned WM_KEYDOWN vk={key:#x} button={button:#x} focus={focused} latched={latched}");
++    }
++}
++
++pub(crate) fn clear_keyboard_taps() {
++    if keyboard_tap_options().0 {
++        KEYBOARD_TAPS.lock().unwrap_or_else(|e| e.into_inner()).until.fill(None);
++    }
++}
++
++fn trace_keyboard_poll(foreground: u32, held: u32, latched: u32) {
++    static LAST_FOCUS: AtomicU32 = AtomicU32::new(u32::MAX);
++    static FOCUS_LOGGED: AtomicU32 = AtomicU32::new(0);
++    if LAST_FOCUS.swap(foreground, Ordering::Relaxed) != foreground && FOCUS_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
++        crate::xlog_info!("GameInput keyboard: foreground presenter={} own process={}", foreground == 2, foreground != 0);
++    }
++    static LAST_BUTTONS: AtomicU64 = AtomicU64::new(0);
++    static SAMPLE_LOGGED: AtomicU32 = AtomicU32::new(0);
++    let sample = (u64::from(held) << 32) | u64::from(latched);
++    let last = LAST_BUTTONS.swap(sample, Ordering::Relaxed);
++    let received = TRACE_RECEIPTS.swap(0, Ordering::Relaxed);
++    if (received != 0 || last != sample) && SAMPLE_LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
++        crate::xlog_info!("GameInput keyboard: poll received={received:#x} held={held:#x} latched={latched:#x}");
++    }
++}
++
+ unsafe fn keyboard() -> u32 {
+     let w = GetForegroundWindow();
+-    if w.is_null() {
+-        return 0;
+-    }
+     let mut pid = 0u32;
+-    GetWindowThreadProcessId(w, &mut pid);
+-    if pid != std::process::id() {
+-        return 0;
++    if !w.is_null() {
++        GetWindowThreadProcessId(w, &mut pid);
++    }
++    let own = pid == std::process::id();
++    let held = if own {
++        KEYBOARD_BUTTONS.iter().filter(|(k, _)| GetAsyncKeyState(*k) as u16 & 0x8000 != 0).fold(0, |b, (_, g)| b | g)
++    } else {
++        0
++    };
++    let (enabled, trace) = keyboard_tap_options();
++    if !enabled && !trace {
++        return held;
++    }
++    let presenter = own && super::kbm::owns_window(w);
++    let latched = if enabled {
++        KEYBOARD_TAPS.lock().unwrap_or_else(|e| e.into_inner()).buttons(Instant::now(), presenter)
++    } else {
++        0
++    };
++    if trace {
++        trace_keyboard_poll(u32::from(own) + u32::from(presenter), held, latched);
+     }
+-    const KEYS: [(i32, u32); 10] = [(0x0D, A), (0x20, A), (0x1B, B), (0x08, B), (0x26, DPAD_UP), (0x28, DPAD_DOWN), (0x25, DPAD_LEFT), (0x27, DPAD_RIGHT), (0x09, VIEW), (0x50, MENU)];
+-    KEYS.iter().filter(|(k, _)| GetAsyncKeyState(*k) as u16 & 0x8000 != 0).fold(0, |b, (_, g)| b | g)
++    held | latched
+ }
+ 
+ /// Merge host keyboard/mouse input (only when `keyboard_mouse` is enabled) and scripted
+@@ -1034,6 +1135,33 @@ mod tests {
+         assert!(parse_presses("", "").is_empty());
+     }
+ 
++    #[test]
++    fn short_keyboard_taps_reach_separate_readers_then_expire() {
++        let mut taps = KeyboardTaps::new();
++        let now = Instant::now();
++        let after = |ms| now + Duration::from_millis(ms);
++        taps.remember(keyboard_tap_button(0x0D, false).unwrap(), now);
++        assert_eq!(taps.buttons(after(4), true), A);
++        taps.remember(keyboard_tap_button(0x28, false).unwrap(), after(32));
++        assert_eq!(taps.buttons(after(48), true), A | DPAD_DOWN);
++        assert_eq!(taps.buttons(after(124), true), A | DPAD_DOWN);
++        assert_eq!(taps.buttons(after(125), true), DPAD_DOWN);
++        assert_eq!(taps.buttons(after(157), true), 0);
++    }
++
++    #[test]
++    fn keyboard_taps_ignore_repeats_and_clear_when_focus_is_lost() {
++        let mut taps = KeyboardTaps::new();
++        let now = Instant::now();
++        assert_eq!(keyboard_tap_button(0x0D, true), None);
++        assert_eq!(keyboard_tap_button(0x41, false), None);
++        assert_eq!(keyboard_tap_button(0x20, false), Some(A));
++        taps.remember(keyboard_tap_button(0x20, false).unwrap(), now);
++        assert_eq!(taps.buttons(now, true), A);
++        assert_eq!(taps.buttons(now, false), 0);
++        assert_eq!(taps.buttons(now + Duration::from_millis(1), true), 0);
++    }
++
+     #[test]
+     fn keyboard_mouse_config_gates_keyboard_and_kbm_but_keeps_scripted() {
+         let mut s = GamepadState { buttons: B, left_x: 0.25, ..Default::default() };
+diff --git a/crates/xcl/src/hle/kbm.rs b/crates/xcl/src/hle/kbm.rs
+index 6d18b1c..d272c00 100644
+--- a/crates/xcl/src/hle/kbm.rs
++++ b/crates/xcl/src/hle/kbm.rs
+@@ -127,6 +127,7 @@ impl Wheel {
+ #[link(name = "user32")]
+ extern "system" {
+     fn GetAsyncKeyState(key: i32) -> i16;
++    fn GetFocus() -> *mut c_void;
+     fn GetForegroundWindow() -> *mut c_void;
+     fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+     fn GetKeyboardLayout(id_thread: u32) -> *mut c_void;
+@@ -183,6 +184,8 @@ struct RawMouseInput {
+ 
+ const WM_INPUT: u32 = 0x00FF;
+ const WM_ACTIVATE: u32 = 0x0006;
++const WM_KILLFOCUS: u32 = 0x0008;
++const WM_KEYDOWN: u32 = 0x0100;
+ const WM_SETCURSOR: u32 = 0x0020;
+ const WM_SIZE: u32 = 0x0005;
+ const WM_MOVE: u32 = 0x0003;
+@@ -250,6 +253,10 @@ pub fn enabled() -> bool {
+     crate::state::config().keyboard_mouse
+ }
+ 
++pub(crate) fn owns_window(hwnd: *mut c_void) -> bool {
++    !hwnd.is_null() && WINDOW.load(Ordering::Acquire) == hwnd as isize
++}
++
+ /// The XCL window is up: the mouse reports to it.
+ pub fn attach(hwnd: *mut c_void) {
+     if !enabled() {
+@@ -297,7 +304,7 @@ pub fn release() {
+ 
+ /// The XCL window's messages: true when handled (the window procedure returns 0).
+ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> bool {
+-    if WINDOW.load(Ordering::Acquire) != hwnd as isize {
++    if !owns_window(hwnd) {
+         return false;
+     }
+     match msg {
+@@ -321,9 +328,18 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
+             hold_cursor(hwnd, active);
+             if !active {
+                 reset_mouse_state();
++                super::gameinput::clear_keyboard_taps();
+             }
+             false
+         }
++        WM_KEYDOWN if super::gameinput::keyboard_tap_messages_enabled() => {
++            super::gameinput::note_keyboard_tap(wp as i32, lp & (1 << 30) != 0, GetFocus() == hwnd);
++            false
++        }
++        WM_KILLFOCUS => {
++            super::gameinput::clear_keyboard_taps();
++            false
++        }
+         WM_ENTERSIZEMOVE => {
+             SIZING.store(true, Ordering::Release);
+             hold_cursor(hwnd, false);
