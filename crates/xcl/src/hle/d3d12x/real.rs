@@ -3658,28 +3658,19 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
     m.insert(key, std::sync::Arc::new(bytes));
 }
 
-unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+/// The PC desc of a pipeline with a console VS (and PS) and no GS / HS / DS: the translated
+/// shaders, XCL's ABI root signature, PC formats and topology (`translated_graphics_pso`, apart
+/// from making the pipeline).
+struct GraphicsPrep {
+    desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    rs: *mut c_void,
+    rect_gs: Option<Vec<u8>>,
+    /// the VS / PS DXIL `desc` points at
+    _dxil: (Vec<u8>, Option<Vec<u8>>),
+}
+
+unsafe fn prep_graphics(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8]) -> Option<GraphicsPrep> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
-    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
-        return None;
-    }
-    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
-    let vs = shader_bytes(&d.VS)?;
-    if !is_console(vs) {
-        return None;
-    }
-    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
-        note_translation_error("PSO with HS/DS – not supported yet".into());
-        return None;
-    }
-    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
-        let _ = f;
-        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
-    }
-    // made when first used (`pso_async::lazy`): not even translated now
-    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
-        return None;
-    }
     // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
     // (split_wave64)
@@ -3724,6 +3715,32 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         copy.GS = bytecode(gs);
     }
     pc_topology_type(&mut copy);
+    Some(GraphicsPrep { desc: copy, rs, rect_gs, _dxil: (vs_dxil, ps_dxil) })
+}
+
+unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    let vs = shader_bytes(&d.VS)?;
+    if !is_console(vs) {
+        return None;
+    }
+    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
+        note_translation_error("PSO with HS/DS – not supported yet".into());
+        return None;
+    }
+    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
+        let _ = f;
+        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
+    }
+    // made when first used (`pso_async::lazy`): not even translated now
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
+    let GraphicsPrep { desc: mut copy, rs, rect_gs, _dxil } = prep_graphics(this, d, vs)?;
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
@@ -3996,7 +4013,13 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let key = owned.shaders_key();
+    let lazy_key = super::pso_async::lazy().then(|| owned.shaders_key());
+    // for `xcl pipelines`, which compiles them in its own process (`pso_journal`)
+    let journal = match &owned {
+        OwnedDesc::Graphics(d, ..) => super::pso_journal::graphics(d),
+        OwnedDesc::Compute(d, _) => super::pso_journal::compute(d),
+        OwnedDesc::Stream(..) => 0,
+    };
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -4005,11 +4028,7 @@ unsafe fn go_background(
             0
         }
     });
-    if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
-    } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
-    }
+    super::pso_async::submit_as(*ppv as usize, compute, job, lazy_key, journal);
     Some(hr)
 }
 
@@ -4021,6 +4040,133 @@ unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
+}
+
+#[cfg(test)]
+mod bind_journal_tests {
+    use super::*;
+    use super::super::{pso_async, pso_journal};
+    use std::time::{Duration, Instant};
+
+    // The journal writer and lazy setting live for the process. Give each case its own title data.
+    fn in_child(lazy: bool) -> bool {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap();
+        let case = name.rsplit("::").next().unwrap();
+        let flag = format!("XCL_TEST_{}", case.to_ascii_uppercase());
+        if let Some(dir) = std::env::var_os(&flag) {
+            crate::state::set_boot(crate::config::Boot {
+                title: "journal-test".into(), exe_path: Default::default(), game_root: Default::default(),
+                data_dir: dir.into(), config: Default::default(),
+            });
+            return true;
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl_{case}_{}_{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(flag, &dir).env("XCL_DXIL_CACHE", dir.join("dxil"))
+            .env("XCL_UMA_MB", "1").env("XCL_COHERENT_MB", "1")
+            .env("XCL_ASYNC_PSO", "1").env("XCL_PSO_JOURNAL", "1")
+            .env("XCL_PSO_PRELOAD", "1").env("XCL_LAZY_PSO", if lazy { "1" } else { "0" })
+            .output().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(child.status.success(), "{}{}", String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+        false
+    }
+
+    fn hashes(tag: u8) -> Vec<u64> {
+        let bytes = std::fs::read(pso_journal::path_in(&crate::state::data_dir())).unwrap();
+        let mut ids = Vec::new();
+        pso_journal::for_each_frame(&bytes, |f| if f.tag == tag { ids.push(f.hash) });
+        ids
+    }
+
+    unsafe extern "system" fn fake_pso(dev: *mut c_void, _: *const c_void, _: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        *out = dev;
+        0
+    }
+
+    fn submit(id: usize, build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool) {
+        let shader = [1u8, 2, 3, 4];
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(&shader), NodeMask: id as u32, ..Default::default() };
+        let ptr = &desc as *const _ as *const c_void;
+        let mut out = std::ptr::null_mut();
+        let hr = unsafe {
+            go_background(id as *mut _, fake_pso, ptr, std::ptr::null(), &mut out, true, own_compute(ptr).unwrap(),
+                |dev, f, d, iid, out| f(dev, d, iid, out), build)
+        };
+        assert_eq!((hr, out as usize), (Some(0), id));
+    }
+
+    #[test]
+    fn failed_bind_records_demand_before_building() {
+        if !in_child(true) { return }
+        submit(1, |_, _, _| {
+            assert_eq!(hashes(b'U'), hashes(b'C'), "a bind is visible before its build returns");
+            false
+        });
+        assert_eq!(hashes(b'C').len(), 1);
+        assert!(hashes(b'U').is_empty());
+        assert_eq!(pso_async::resolve_for_bind(1), 1);
+        assert_eq!(pso_async::resolve_for_bind(1), 1);
+        assert_eq!(hashes(b'U'), hashes(b'C'));
+        assert_eq!(pso_async::released(1), 0);
+    }
+
+    #[test]
+    fn compute_bind_records_demand_while_a_worker_is_still_building() {
+        if !in_child(false) { return }
+        static STARTED: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        STARTED.set(tx).unwrap();
+        submit(1, |_, _, out| {
+            STARTED.get().unwrap().send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while hashes(b'U').is_empty() {
+                if Instant::now() >= deadline { return false }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            unsafe { *out = 11 as *mut _ };
+            true
+        });
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(pso_async::resolve_for_bind(1), 11, "the waiting bind must be visible to the worker");
+        assert_eq!(hashes(b'U'), hashes(b'C'));
+        assert_eq!(pso_async::released(1), 11);
+    }
+
+    fn check_background(lazy: bool) {
+        if !in_child(lazy) { return }
+        if lazy {
+            pso_async::earlier_run_used(shaders_key(&[vec![1, 2, 3, 4]]));
+        }
+        for id in [1, 2] {
+            submit(id, |dev, _, out| { unsafe { *out = (dev.0 + 10) as *mut _ }; true });
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for id in [1, 2] {
+            while pso_async::is_pending(id) {
+                assert!(Instant::now() < deadline, "background build timed out");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let ids = hashes(b'C');
+        assert_eq!(ids.len(), 2, "two descriptors with the same shaders");
+        assert!(hashes(b'U').is_empty(), "building an unbound pipeline marked it used");
+        assert_eq!(pso_async::resolve(2), 12);
+        assert_eq!(pso_async::resolve_for_bind(2), 12);
+        assert_eq!(hashes(b'U'), [ids[1]], "only the bound descriptor, recorded once");
+        assert_eq!(pso_async::released(1), 11);
+        assert_eq!(pso_async::released(2), 12);
+    }
+
+    #[test]
+    fn speculative_preload_records_only_the_bound_descriptor() { check_background(true) }
+
+    #[test]
+    fn eager_build_records_only_the_bound_descriptor() { check_background(false) }
 }
 
 unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
