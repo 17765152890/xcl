@@ -3633,7 +3633,18 @@ impl Em {
             "f32" => {
                 let (a, b) = (Self::fsrc(m, 0, &ua), Self::fsrc(m, 1, &ub));
                 match op {
-                    "class" => format!("((({ub}) >> fclass({a})) & 1u) != 0u"),
+                    // abs / neg on the sign bit, as for f16 and f64: `-x` is a float subtract in
+                    // DXIL, which flushes a denormal and may quiet a signalling NaN (#1281)
+                    "class" => {
+                        let mut u = format!("({ua})");
+                        if m.abs[0] {
+                            u = format!("({u} & 0x7FFFFFFFu)");
+                        }
+                        if m.neg[0] {
+                            u = format!("({u} ^ 0x80000000u)");
+                        }
+                        format!("((({ub}) >> fclass(asfloat({u}))) & 1u) != 0u")
+                    }
                     _ => float_compare(op, &a, &b, "isnan").ok_or("VOPC f32")?,
                 }
             }
