@@ -20,9 +20,10 @@
 //!
 //! * `insn_len` – the length of an x86-64 instruction, to walk a function from its start.
 //! * `decode` – the four instructions with any memory operand.
+//! * `helper` – the code a site calls.
 //!
-//! The helpers a site calls, the plan that finds the sites of an image and the loader step that
-//! applies it come next; nothing calls this module yet.
+//! The plan that finds the sites of an image and the loader step that applies it come next;
+//! nothing calls this module yet.
 
 /// Length of the x86-64 instruction at the start of `c`. `None`: the bytes run out, or it is
 /// something this walk does not know and must not guess at – EVEX, XOP, 3DNow!, an opcode
@@ -267,6 +268,127 @@ pub fn decode(c: &[u8]) -> Option<Store> {
     Some(Store { kind, len: i as u8, wide: b2 & 4 != 0, src: ((m >> 3) & 7) | r << 3, mask: (!b2 >> 3) & 15, mem: Mem { base, index, scale, disp, rip } })
 }
 
+/// Largest helper `helper` writes.
+pub const HELPER_MAX: usize = 192;
+
+/// What a helper has between the site's RSP and its own while it stores: the return address,
+/// four saved registers and 64 bytes for the two vectors.
+const FRAME: i64 = 8 + 32 + 64;
+
+/// `push rax; push rcx; push rdx; push r8; lea rsp, [rsp - 64]` – every helper starts with it,
+/// which is what `UNWIND_INFO` describes.
+const PROLOGUE: [u8; 10] = [0x50, 0x51, 0x52, 0x41, 0x50, 0x48, 0x8D, 0x64, 0x24, 0xC0];
+/// `lea rsp, [rsp + 64]; pop r8; pop rdx; pop rcx; pop rax; ret`
+const EPILOGUE: [u8; 11] = [0x48, 0x8D, 0x64, 0x24, 0x40, 0x41, 0x58, 0x5A, 0x59, 0x58, 0xC3];
+
+/// The unwind data all helpers share (UNWIND_INFO, version 1): a ten-byte prologue that
+/// allocates 64 bytes after pushing R8, RDX, RCX and RAX. With it a fault in a helper that no
+/// one repairs is unwound into the title's function like one at the store itself.
+pub const UNWIND_INFO: [u8; 16] = [
+    0x01, PROLOGUE.len() as u8, 5, 0, // version 1, prologue size, five codes, no frame register
+    10, 0x72, // after `lea rsp`: UWOP_ALLOC_SMALL, (7 + 1) * 8 bytes
+    5, 0x80, // after `push r8`: UWOP_PUSH_NONVOL r8
+    3, 0x20, // rdx
+    2, 0x10, // rcx
+    1, 0x00, // rax
+    0, 0,
+];
+
+/// `vmovdqu [rsp + disp], reg` (XMM, or YMM when `wide`).
+fn spill(out: &mut Vec<u8>, reg: u8, wide: bool, disp: u8) {
+    out.extend_from_slice(&[0xC5, (if reg < 8 { 0x80 } else { 0 }) | 0x7A | (wide as u8) << 2, 0x7F]);
+    if disp == 0 {
+        out.extend_from_slice(&[0x04 | (reg & 7) << 3, 0x24]);
+    } else {
+        out.extend_from_slice(&[0x44 | (reg & 7) << 3, 0x24, disp]);
+    }
+}
+
+/// Appends to `out` position-independent code that does what the store `s` does and returns:
+/// the code a `call` written over the store reaches. `next` is the address of the instruction
+/// after the store (what a RIP-relative operand counts from). `false`: nothing was appended –
+/// an RSP-relative displacement that does not fit once the helper's frame is added.
+///
+/// The address is taken first, into R8, while every register still holds the title's value
+/// (RSP is lower by `FRAME`, which the displacement makes up for). The source and the mask go
+/// to the stack with two unaligned vector stores, and each element is then
+/// `mov eax, mask[i]; cdq; mov ecx, edx; jrcxz skip; mov eax, src[i]; mov [r8 + 4 i], eax`
+/// (with RAX / CQO for 8-byte elements): CDQ copies the mask's sign bit into every bit of EDX,
+/// JRCXZ branches on RCX without a flag. Nothing in it writes a flag or a vector register.
+pub fn helper(s: &Store, next: u64, out: &mut Vec<u8>) -> bool {
+    let start = out.len();
+    out.extend_from_slice(&PROLOGUE);
+    let Mem { base, index, scale, disp, rip } = s.mem;
+    if rip {
+        // mov r8, imm64
+        out.extend_from_slice(&[0x49, 0xB8]);
+        out.extend_from_slice(&next.wrapping_add(disp as i64 as u64).to_le_bytes());
+    } else {
+        let disp = disp as i64 + if base == Some(4) { FRAME } else { 0 };
+        let Ok(disp) = i32::try_from(disp) else {
+            out.truncate(start);
+            return false;
+        };
+        // lea r8, [base + index * 2^scale + disp]
+        out.extend_from_slice(&[0x4C | index.map_or(0, |x| x >> 3) << 1 | base.map_or(0, |b| b >> 3), 0x8D]);
+        let sib = scale << 6 | index.map_or(4, |x| x & 7) << 3;
+        match base {
+            None => {
+                out.extend_from_slice(&[0x04, sib | 5]);
+                out.extend_from_slice(&disp.to_le_bytes());
+            }
+            Some(b) => {
+                // RBP / R13 as a base have no form without a displacement
+                let md = if disp == 0 && b & 7 != 5 {
+                    0
+                } else if i8::try_from(disp).is_ok() {
+                    1
+                } else {
+                    2
+                };
+                if index.is_some() || b & 7 == 4 {
+                    out.extend_from_slice(&[md << 6 | 4, sib | (b & 7)]);
+                } else {
+                    out.push(md << 6 | (b & 7));
+                }
+                match md {
+                    1 => out.push(disp as u8),
+                    2 => out.extend_from_slice(&disp.to_le_bytes()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    spill(out, s.src, s.wide, 0);
+    spill(out, s.mask, s.wide, 0x20);
+    for i in 0..s.elements() {
+        let d = (i * s.kind.element()) as u8;
+        if s.kind.element() == 4 {
+            out.extend_from_slice(&[0x8B, 0x44, 0x24, 0x20 + d, 0x99, 0x89, 0xD1, 0xE3, 0x08]);
+            out.extend_from_slice(&[0x8B, 0x44, 0x24, d, 0x41, 0x89, 0x40, d]);
+        } else {
+            out.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20 + d, 0x48, 0x99, 0x89, 0xD1, 0xE3, 0x09]);
+            out.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, d, 0x49, 0x89, 0x40, d]);
+        }
+    }
+    out.extend_from_slice(&EPILOGUE);
+    debug_assert!(out.len() - start <= HELPER_MAX);
+    true
+}
+
+/// The bytes that replace a store of `len` bytes at `site`: `call helper`, then NOPs (the
+/// first `len` of the array). `None`: the helper is out of the call's ±2 GiB reach.
+pub fn call_site(site: u64, len: u8, helper: u64) -> Option<[u8; 10]> {
+    if !(5..=10).contains(&len) {
+        return None;
+    }
+    let rel = i32::try_from(helper.wrapping_sub(site.wrapping_add(5)) as i64).ok()?;
+    let mut b = [0x90u8; 10];
+    b[0] = 0xE8;
+    b[1..5].copy_from_slice(&rel.to_le_bytes());
+    Some(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +506,726 @@ mod tests {
         // the loads (8C, 2C, 2D), a register "destination", VMASKMOVPS with W1, another map: not stores
         for code in [[0xC4, 0xE2, 0x4D, 0x8C, 0x04, 0x90], [0xC4, 0xE2, 0x5D, 0x2C, 0x2C, 0x91], [0xC4, 0xE2, 0x4D, 0x8E, 0xC1, 0x90], [0xC4, 0xE2, 0xDD, 0x2E, 0x2C, 0x91], [0xC4, 0xE3, 0x4D, 0x8E, 0x04, 0x90], [0xC4, 0xE2, 0x4E, 0x8E, 0x04, 0x90]] {
             assert_eq!(decode(&code), None, "{code:02x?}");
+        }
+    }
+
+    /// A helper as bytes: the prologue the unwind data describes, the address into R8 with the
+    /// frame added to an RSP-relative displacement, both vectors to the stack, one guarded
+    /// `mov` per element, the epilogue. And the call that reaches it.
+    #[test]
+    fn a_helper_is_the_address_two_spills_and_a_store_per_element() {
+        // vpmaskmovq [rsp + r8 + 0x40], ymm7, ymm8
+        let s = decode(&[0xC4, 0x22, 0xC5, 0x8E, 0x44, 0x04, 0x40]).unwrap();
+        let mut out = Vec::new();
+        assert!(helper(&s, 0, &mut out));
+        let mut want = PROLOGUE.to_vec();
+        want.extend_from_slice(&[0x4E, 0x8D, 0x84, 0x04, 0xA8, 0x00, 0x00, 0x00]); // lea r8, [rsp + r8 + 0x40 + 104]
+        want.extend_from_slice(&[0xC5, 0x7E, 0x7F, 0x04, 0x24]); // vmovdqu [rsp], ymm8
+        want.extend_from_slice(&[0xC5, 0xFE, 0x7F, 0x7C, 0x24, 0x20]); // vmovdqu [rsp + 0x20], ymm7
+        for d in [0u8, 8, 16, 24] {
+            want.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20 + d, 0x48, 0x99, 0x89, 0xD1, 0xE3, 0x09, 0x48, 0x8B, 0x44, 0x24, d, 0x49, 0x89, 0x40, d]);
+        }
+        want.extend_from_slice(&EPILOGUE);
+        assert_eq!(out, want);
+        // the largest: eight 4-byte elements and a RIP-relative operand (an absolute address)
+        let s = decode(&[0xC4, 0xE2, 0x75, 0x8E, 0x05, 0x00, 0x10, 0x00, 0x00]).unwrap();
+        let mut out = vec![0xCC; 3];
+        assert!(helper(&s, 0x1_4000_2009, &mut out));
+        assert_eq!(out[3 + 10..3 + 20], [0x49, 0xB8, 0x09, 0x30, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00]);
+        assert!(out.len() - 3 <= HELPER_MAX && out.len() - 3 == 10 + 10 + 11 + 8 * 17 + 11);
+        // vpmaskmovd [r13], xmm2, xmm1: R13 keeps its displacement byte, an XMM store has four elements
+        let s = decode(&[0xC4, 0xC2, 0x69, 0x8E, 0x4D, 0x00]).unwrap();
+        let mut out = Vec::new();
+        assert!(helper(&s, 0, &mut out));
+        assert_eq!(out[10..14], [0x4D, 0x8D, 0x45, 0x00]); // lea r8, [r13 + 0]
+        assert_eq!(out[14..18], [0xC5, 0xFA, 0x7F, 0x0C]); // vmovdqu [rsp], xmm1
+        assert_eq!(out.len(), 10 + 4 + 11 + 4 * 17 + 11);
+        // an RSP-relative displacement that no longer fits is declined, and nothing is left behind
+        let s = Store { mem: Mem { base: Some(4), disp: i32::MAX - 50, ..NO_MEM }, ..s };
+        assert!(!helper(&s, 0, &mut out) && out.len() == 10 + 4 + 11 + 4 * 17 + 11);
+        // the prologue the unwind data counts: 4 pushes (5 bytes) and the allocation end at byte 10
+        assert_eq!((UNWIND_INFO[1], UNWIND_INFO[2], UNWIND_INFO[4]), (10, 5, 10));
+        assert_eq!(FRAME, 8 + 4 * 8 + ((UNWIND_INFO[5] >> 4) as i64 + 1) * 8);
+        let call = call_site(0x1_4007_9D67, 6, 0x1_4B07_0000).unwrap();
+        assert_eq!(call[..6], [0xE8, 0x94, 0x62, 0xFF, 0x0A, 0x90]);
+        assert_eq!(call_site(0x1_4007_9D67, 6, 0x2_4B07_0000), None, "out of reach");
+        assert_eq!(call_site(0x1_4007_9D67, 4, 0x1_4B07_0000), None, "too short for a call");
+    }
+}
+
+/// The helpers run against the instructions they stand for, on a CPU (or translator) that has
+/// AVX2: a made-up register file is loaded, the code is called, the register file is taken
+/// back, and the two runs are compared with each other and with what the instruction is
+/// defined to do.
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+pub(crate) mod exec {
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS};
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, ResetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE,
+    };
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Everything a masked store could change but memory: the general registers (the hardware's
+    /// order; RSP's slot is not used), the flags, YMM0–15 and 512 bytes of stack right above
+    /// the call (`[rsp + 0x18]` at the instruction is its first byte).
+    #[repr(C)]
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub(crate) struct State {
+        pub gpr: [u64; 16],
+        pub flags: u64,
+        pub unused: u64,
+        pub ymm: [[u8; 32]; 16],
+        pub stack: [u8; 512],
+    }
+
+    /// `[rsp + STACK_AT]` at the instruction under test is `State::stack[0]`: above the return
+    /// address and the two pointers `xcl_maskmov_test_run` keeps there.
+    pub(crate) const STACK_AT: i32 = 0x18;
+
+    std::arch::global_asm!(
+        r#"
+        .globl xcl_maskmov_test_run
+    xcl_maskmov_test_run:
+        push rbx
+        push rbp
+        push rsi
+        push rdi
+        push r12
+        push r13
+        push r14
+        push r15
+        sub rsp, 0xA8
+        vmovdqu [rsp + 0x00], xmm6
+        vmovdqu [rsp + 0x10], xmm7
+        vmovdqu [rsp + 0x20], xmm8
+        vmovdqu [rsp + 0x30], xmm9
+        vmovdqu [rsp + 0x40], xmm10
+        vmovdqu [rsp + 0x50], xmm11
+        vmovdqu [rsp + 0x60], xmm12
+        vmovdqu [rsp + 0x70], xmm13
+        vmovdqu [rsp + 0x80], xmm14
+        vmovdqu [rsp + 0x90], xmm15
+        sub rsp, 0x200
+        mov r10, rcx
+        mov r11, rdx
+        lea rsi, [r10 + 0x290]
+        mov rdi, rsp
+        mov ecx, 0x200
+        cld
+        rep movsb
+        push r11
+        push r10
+        vmovdqu ymm0, [r10 + 0x090]
+        vmovdqu ymm1, [r10 + 0x0B0]
+        vmovdqu ymm2, [r10 + 0x0D0]
+        vmovdqu ymm3, [r10 + 0x0F0]
+        vmovdqu ymm4, [r10 + 0x110]
+        vmovdqu ymm5, [r10 + 0x130]
+        vmovdqu ymm6, [r10 + 0x150]
+        vmovdqu ymm7, [r10 + 0x170]
+        vmovdqu ymm8, [r10 + 0x190]
+        vmovdqu ymm9, [r10 + 0x1B0]
+        vmovdqu ymm10, [r10 + 0x1D0]
+        vmovdqu ymm11, [r10 + 0x1F0]
+        vmovdqu ymm12, [r10 + 0x210]
+        vmovdqu ymm13, [r10 + 0x230]
+        vmovdqu ymm14, [r10 + 0x250]
+        vmovdqu ymm15, [r10 + 0x270]
+        push qword ptr [r10 + 0x80]
+        popfq
+        mov rax, [r10 + 0x00]
+        mov rcx, [r10 + 0x08]
+        mov rdx, [r10 + 0x10]
+        mov rbx, [r10 + 0x18]
+        mov rbp, [r10 + 0x28]
+        mov rsi, [r10 + 0x30]
+        mov rdi, [r10 + 0x38]
+        mov r8, [r10 + 0x40]
+        mov r9, [r10 + 0x48]
+        mov r11, [r10 + 0x58]
+        mov r12, [r10 + 0x60]
+        mov r13, [r10 + 0x68]
+        mov r14, [r10 + 0x70]
+        mov r15, [r10 + 0x78]
+        mov r10, [r10 + 0x50]
+        call qword ptr [rsp + 8]
+        xchg r10, [rsp]
+        mov [r10 + 0x00], rax
+        mov [r10 + 0x08], rcx
+        mov [r10 + 0x10], rdx
+        mov [r10 + 0x18], rbx
+        mov [r10 + 0x28], rbp
+        mov [r10 + 0x30], rsi
+        mov [r10 + 0x38], rdi
+        mov [r10 + 0x40], r8
+        mov [r10 + 0x48], r9
+        mov [r10 + 0x58], r11
+        mov [r10 + 0x60], r12
+        mov [r10 + 0x68], r13
+        mov [r10 + 0x70], r14
+        mov [r10 + 0x78], r15
+        pop rax
+        mov [r10 + 0x50], rax
+        pushfq
+        pop rax
+        mov [r10 + 0x80], rax
+        vmovdqu [r10 + 0x090], ymm0
+        vmovdqu [r10 + 0x0B0], ymm1
+        vmovdqu [r10 + 0x0D0], ymm2
+        vmovdqu [r10 + 0x0F0], ymm3
+        vmovdqu [r10 + 0x110], ymm4
+        vmovdqu [r10 + 0x130], ymm5
+        vmovdqu [r10 + 0x150], ymm6
+        vmovdqu [r10 + 0x170], ymm7
+        vmovdqu [r10 + 0x190], ymm8
+        vmovdqu [r10 + 0x1B0], ymm9
+        vmovdqu [r10 + 0x1D0], ymm10
+        vmovdqu [r10 + 0x1F0], ymm11
+        vmovdqu [r10 + 0x210], ymm12
+        vmovdqu [r10 + 0x230], ymm13
+        vmovdqu [r10 + 0x250], ymm14
+        vmovdqu [r10 + 0x270], ymm15
+        pop rax
+        lea rdi, [r10 + 0x290]
+        mov rsi, rsp
+        mov ecx, 0x200
+        cld
+        rep movsb
+        add rsp, 0x200
+        vmovdqu xmm6, [rsp + 0x00]
+        vmovdqu xmm7, [rsp + 0x10]
+        vmovdqu xmm8, [rsp + 0x20]
+        vmovdqu xmm9, [rsp + 0x30]
+        vmovdqu xmm10, [rsp + 0x40]
+        vmovdqu xmm11, [rsp + 0x50]
+        vmovdqu xmm12, [rsp + 0x60]
+        vmovdqu xmm13, [rsp + 0x70]
+        vmovdqu xmm14, [rsp + 0x80]
+        vmovdqu xmm15, [rsp + 0x90]
+        vzeroupper
+        add rsp, 0xA8
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rdi
+        pop rsi
+        pop rbp
+        pop rbx
+        ret
+    "#
+    );
+
+    extern "C" {
+        /// Loads `state`, calls `code` (which must return with RSP as it found it), stores
+        /// the registers back.
+        fn xcl_maskmov_test_run(state: *mut State, code: *const u8);
+    }
+
+    /// `code` run on a copy of `state`.
+    pub(crate) unsafe fn run(code: usize, state: &State) -> State {
+        let mut s = state.clone();
+        xcl_maskmov_test_run(&mut s, code as *const u8);
+        s
+    }
+
+    pub(crate) fn has_avx2() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// A small generator (xorshift): the same made-up values on every run.
+    pub(crate) struct Rng(pub u64);
+
+    impl Rng {
+        pub fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        pub fn fill(&mut self, b: &mut [u8]) {
+            for c in b.chunks_mut(8) {
+                let v = self.next().to_le_bytes();
+                c.copy_from_slice(&v[..c.len()]);
+            }
+        }
+
+        /// Registers, vectors and stack bytes from the generator; the arithmetic flags all set
+        /// or all clear.
+        pub fn state(&mut self, flags_set: bool) -> State {
+            let mut s = State { gpr: [0; 16], flags: 0x202 | if flags_set { 0x8D5 } else { 0 }, unused: 0, ymm: [[0; 32]; 16], stack: [0; 512] };
+            for g in &mut s.gpr {
+                *g = self.next();
+            }
+            s.gpr[4] = 0;
+            for y in &mut s.ymm {
+                self.fill(y);
+            }
+            self.fill(&mut s.stack);
+            s
+        }
+    }
+
+    /// Executable memory that is written once and never again (a translator caches what it
+    /// has run), with writable memory behind it for RIP-relative operands.
+    pub(crate) struct Code {
+        base: usize,
+        used: usize,
+    }
+
+    const CODE_SIZE: usize = 0x10_0000;
+    const DATA_AT: usize = 0xF_0000;
+
+    impl Code {
+        pub unsafe fn new() -> Code {
+            let base = VirtualAlloc(std::ptr::null(), CODE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+            assert!(base != 0);
+            let mut old = 0;
+            VirtualProtect((base + DATA_AT) as *const c_void, CODE_SIZE - DATA_AT, PAGE_READWRITE, &mut old);
+            Code { base, used: 0 }
+        }
+
+        /// Writable bytes within a RIP-relative operand's reach of the code.
+        pub fn data(&self) -> usize {
+            self.base + DATA_AT
+        }
+
+        pub unsafe fn put(&mut self, bytes: &[u8]) -> usize {
+            let at = self.base + self.used;
+            assert!(self.used + bytes.len() <= DATA_AT);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+            self.used = (self.used + bytes.len() + 15) & !15;
+            at
+        }
+
+        /// Where the next `put` goes.
+        pub fn next(&self) -> usize {
+            self.base + self.used
+        }
+
+        /// `store; ret` as the CPU runs it, and the same with the store replaced as `plan`'s
+        /// caller does it: `call helper; nop…; ret`. A RIP-relative store is made to point at
+        /// `data() + 0x40` from both places.
+        pub unsafe fn pair(&mut self, s: &Store) -> (usize, usize) {
+            let at = |s: &Store, site: usize, data: usize| {
+                let mut s = *s;
+                if s.mem.rip {
+                    s.mem.disp = (data as i64 - (site as i64 + 9)) as i32;
+                }
+                s
+            };
+            let data = self.data() + 0x40;
+            let mut code = encode(&at(s, self.next(), data));
+            code.push(0xC3);
+            let original = self.put(&code);
+            let site = self.next();
+            let s = at(s, site, data);
+            let mut h = Vec::new();
+            assert!(helper(&s, (site + s.len as usize) as u64, &mut h));
+            let helper_at = site + 16;
+            let mut code = call_site(site as u64, s.len, helper_at as u64).unwrap()[..s.len as usize].to_vec();
+            code.push(0xC3);
+            code.resize(16, 0xCC);
+            code.extend_from_slice(&h);
+            (original, self.put(&code))
+        }
+    }
+
+    impl Drop for Code {
+        fn drop(&mut self) {
+            unsafe { VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// The instruction's bytes (three-byte VEX), the reverse of `decode`.
+    pub(crate) fn encode(s: &Store) -> Vec<u8> {
+        let Mem { base, index, scale, disp, rip } = s.mem;
+        let (r, x, b) = (s.src >> 3, index.map_or(0, |i| i >> 3), base.map_or(0, |b| b >> 3));
+        let (op, w) = match s.kind {
+            Kind::Ps => (0x2E, 0),
+            Kind::Pd => (0x2F, 0),
+            Kind::D => (0x8E, 0),
+            Kind::Q => (0x8E, 1),
+        };
+        let mut v = vec![0xC4, (r ^ 1) << 7 | (x ^ 1) << 6 | (b ^ 1) << 5 | 2, w << 7 | (!s.mask & 15) << 3 | (s.wide as u8) << 2 | 1, op];
+        let reg = (s.src & 7) << 3;
+        let sib = scale << 6 | index.map_or(4, |i| i & 7) << 3;
+        match base {
+            _ if rip => {
+                v.push(reg | 5);
+                v.extend_from_slice(&disp.to_le_bytes());
+            }
+            None => {
+                v.extend_from_slice(&[reg | 4, sib | 5]);
+                v.extend_from_slice(&disp.to_le_bytes());
+            }
+            Some(bb) => {
+                let md = if disp == 0 && bb & 7 != 5 {
+                    0
+                } else if (-128..=127).contains(&disp) {
+                    1
+                } else {
+                    2
+                };
+                if index.is_some() || bb & 7 == 4 {
+                    v.extend_from_slice(&[md << 6 | reg | 4, sib | (bb & 7)]);
+                } else {
+                    v.push(md << 6 | reg | (bb & 7));
+                }
+                match md {
+                    1 => v.push(disp as u8),
+                    2 => v.extend_from_slice(&disp.to_le_bytes()),
+                    _ => {}
+                }
+            }
+        }
+        v
+    }
+
+    /// What the store leaves in memory that held `before`, by the instruction's definition:
+    /// the source's element where the mask's element has its top bit set, nothing else.
+    pub(crate) fn defined(s: &Store, state: &State, before: &[u8]) -> Vec<u8> {
+        let (mut after, n) = (before.to_vec(), s.kind.element());
+        for i in 0..s.elements() {
+            if state.ymm[s.mask as usize][i * n + n - 1] & 0x80 != 0 {
+                after[i * n..i * n + n].copy_from_slice(&state.ymm[s.src as usize][i * n..i * n + n]);
+            }
+        }
+        after
+    }
+
+    /// Sets the mask register of `s` in `state`: element `i` selected when bit `i` of `bits` is
+    /// set; every other bit of the mask stays as it was (they do not count).
+    pub(crate) fn set_mask(s: &Store, state: &mut State, bits: u32) {
+        let n = s.kind.element();
+        for i in 0..s.elements() {
+            let top = &mut state.ymm[s.mask as usize][i * n + n - 1];
+            *top = (*top & 0x7F) | if bits >> i & 1 != 0 { 0x80 } else { 0 };
+        }
+    }
+
+    /// Points the operand of `s` at `target` by its base and index registers (an index is
+    /// given the value `index`). An RSP-relative operand is left alone: it is what it is.
+    pub(crate) fn point(s: &Store, state: &mut State, target: usize, index: i64) {
+        let Mem { base, index: ix, scale, disp, rip } = s.mem;
+        if rip || base == Some(4) {
+            return;
+        }
+        let mut rest = (target as i64).wrapping_sub(disp as i64);
+        match (base, ix) {
+            (Some(b), Some(x)) => {
+                state.gpr[x as usize] = index as u64;
+                state.gpr[b as usize] = rest.wrapping_sub(index << scale) as u64;
+            }
+            (Some(b), None) => state.gpr[b as usize] = rest as u64,
+            (None, Some(x)) => {
+                assert!(rest & ((1 << scale) - 1) == 0);
+                rest >>= scale;
+                state.gpr[x as usize] = rest as u64;
+            }
+            (None, None) => assert_eq!(rest, 0, "an absolute operand has to be the target"),
+        }
+    }
+
+    fn mem(base: Option<u8>, index: Option<u8>, scale: u8, disp: i32) -> Mem {
+        Mem { base, index, scale, disp, rip: false }
+    }
+
+    /// Operand shapes: every one a retail game has (see `decodes_the_masked_stores`), each
+    /// register the helper itself uses (RAX, RCX, RDX, R8) as base and as index, RSP with and
+    /// without an index and with displacements on both sides of a byte, RBP / R13 (which need
+    /// a displacement), R12 (which needs a SIB byte), RIP-relative, an index without a base.
+    fn shapes() -> Vec<Mem> {
+        let mut v = vec![
+            mem(Some(0), None, 0, 0),
+            mem(Some(1), None, 0, 0),
+            mem(Some(0), Some(2), 2, 0),
+            mem(Some(1), Some(2), 2, 0),
+            mem(Some(2), Some(1), 3, 0),
+            mem(Some(8), Some(0), 0, 0x20),
+            mem(Some(2), Some(8), 3, -8),
+            mem(Some(12), Some(8), 2, 0),
+            mem(Some(0), Some(15), 2, 0x20),
+            mem(Some(6), Some(1), 0, 0),
+            mem(Some(10), Some(11), 3, -8),
+            mem(Some(5), None, 0, 0),
+            mem(Some(5), None, 0, 0x10),
+            mem(Some(13), None, 0, 0),
+            mem(Some(13), Some(9), 1, 0x1234),
+            mem(Some(12), None, 0, 0),
+            mem(Some(3), Some(12), 0, -0x80),
+            mem(Some(7), Some(14), 2, 0x7F),
+            mem(Some(14), Some(5), 3, 0x80),
+            mem(None, Some(1), 2, 0x100),
+            mem(None, Some(8), 3, -0x1000),
+            // [rsp + STACK_AT + 0x40] and around it: the store goes to `State::stack[0x40..]`
+            mem(Some(4), None, 0, STACK_AT + 0x40),
+            mem(Some(4), Some(8), 0, 0x40),
+            mem(Some(4), Some(1), 2, 0x20),
+            mem(Some(4), Some(2), 3, 0x70 - 0x100),
+            mem(Some(4), Some(6), 0, 0),
+            mem(Some(4), Some(15), 2, 0x4E0),
+        ];
+        v.push(Mem { rip: true, ..mem(None, None, 0, 0) });
+        v
+    }
+
+    /// The index an RSP-relative shape needs for its store to land on `State::stack[0x40..]`.
+    fn stack_index(m: &Mem) -> u64 {
+        ((STACK_AT + 0x40 - m.disp) as i64 >> m.scale) as u64
+    }
+
+    /// Every kind and width over every operand shape, with the registers taken in turn, for
+    /// every mask (256 for eight elements) and both settings of the flags: the helper leaves
+    /// the registers, the flags, the vectors, the stack and memory exactly as the instruction
+    /// does, and memory is what the instruction is defined to leave.
+    #[test]
+    fn a_helper_does_what_the_instruction_does() {
+        if !has_avx2() {
+            eprintln!("SKIPPED: this CPU has no AVX2");
+            return;
+        }
+        unsafe {
+            let mut code = Code::new();
+            let buf = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let (mut runs, mut k) = (0usize, 0usize);
+            for kind in Kind::ALL {
+                for wide in [true, false] {
+                    for m in shapes() {
+                        // the registers in turn; one shape in seven stores the mask register itself
+                        k += 1;
+                        let src = (k * 5 % 16) as u8;
+                        let s = Store { kind, len: 0, wide, src, mask: if k % 7 == 0 { src } else { (k * 11 % 16) as u8 }, mem: m };
+                        let bytes = encode(&s);
+                        let s = Store { len: bytes.len() as u8, ..s };
+                        assert_eq!(decode(&bytes), Some(s), "{bytes:02x?}");
+                        let (original, replaced) = code.pair(&s);
+                        let on_stack = m.base == Some(4);
+                        let target = if m.rip { code.data() + 0x40 } else { buf + 0x40 };
+                        for bits in 0..1u32 << s.elements() {
+                            let mut st = rng.state(bits & 1 != 0);
+                            set_mask(&s, &mut st, bits);
+                            if on_stack {
+                                if let Some(x) = m.index {
+                                    st.gpr[x as usize] = stack_index(&m);
+                                }
+                            } else {
+                                point(&s, &mut st, target, [3, -2, 0x10][bits as usize % 3]);
+                            }
+                            let mut before = [0u8; 0x80];
+                            rng.fill(&mut before);
+                            let mem_at = (target - 0x40) as *mut [u8; 0x80];
+                            let mut after = [[0u8; 0x80]; 2];
+                            let mut out = Vec::new();
+                            for (which, entry) in [original, replaced].into_iter().enumerate() {
+                                if !on_stack {
+                                    *mem_at = before;
+                                }
+                                out.push(run(entry, &st));
+                                if !on_stack {
+                                    after[which] = *mem_at;
+                                }
+                                runs += 1;
+                            }
+                            let what = format!("{} {bytes:02x?} mask {bits:#x}", kind.name());
+                            assert_eq!(out[0], out[1], "registers, flags, vectors, stack: {what}");
+                            let mut want = st.clone();
+                            if on_stack {
+                                let stored = defined(&s, &st, &st.stack[0x40..0x60]);
+                                want.stack[0x40..0x60].copy_from_slice(&stored);
+                            } else {
+                                assert_eq!(after[0], after[1], "memory: {what}");
+                                let mut m = before;
+                                let stored = defined(&s, &st, &before[0x40..0x60]);
+                                m[0x40..0x60].copy_from_slice(&stored);
+                                assert_eq!(after[1], m, "memory as defined: {what}");
+                            }
+                            assert_eq!(out[1], want, "nothing but the selected elements changes: {what}");
+                        }
+                    }
+                }
+            }
+            VirtualFree(buf as *mut c_void, 0, MEM_RELEASE);
+            eprintln!("{runs} runs, {k} stores");
+        }
+    }
+
+    /// A store whose last elements are masked out ends at the last byte of a mapping: neither
+    /// the instruction nor the helper touches the page behind it, which is not there.
+    #[test]
+    fn a_masked_out_tail_may_end_where_the_mapping_ends() {
+        if !has_avx2() {
+            eprintln!("SKIPPED: this CPU has no AVX2");
+            return;
+        }
+        unsafe {
+            let mut code = Code::new();
+            let pages = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(!VirtualAlloc(pages as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+            for kind in Kind::ALL {
+                for wide in [true, false] {
+                    let s = Store { kind, len: 0, wide, src: 9, mask: 3, mem: mem(Some(1), Some(2), 0, 0x10) };
+                    let s = Store { len: encode(&s).len() as u8, ..s };
+                    let (original, replaced) = code.pair(&s);
+                    // the first `inside` elements are in the mapping, and none, some or all of them selected
+                    for inside in 0..=s.elements() {
+                        for bits in [0, 1, (1u32 << inside) - 1, (1u32 << inside) >> 1] {
+                            let bits = bits & ((1 << inside) - 1);
+                            let target = pages + 0x1000 - inside * kind.element();
+                            let mut st = rng.state(false);
+                            set_mask(&s, &mut st, bits);
+                            point(&s, &mut st, target, 7);
+                            let tail = (pages + 0x1000 - 0x40) as *mut [u8; 0x40];
+                            let mut before = [0u8; 0x40];
+                            rng.fill(&mut before);
+                            let mut after = Vec::new();
+                            for entry in [original, replaced] {
+                                *tail = before;
+                                assert_eq!(run(entry, &st), st);
+                                after.push(*tail);
+                            }
+                            assert_eq!(after[0], after[1], "{} with {inside} elements inside, mask {bits:#x}", kind.name());
+                            let mut want = [0u8; 0x60];
+                            want[..0x40].copy_from_slice(&before);
+                            let at = 0x40 - inside * kind.element();
+                            let stored = defined(&s, &st, &want[at..at + 0x20]);
+                            want[at..at + 0x20].copy_from_slice(&stored);
+                            assert_eq!(after[1][..], want[..0x40]);
+                        }
+                    }
+                }
+            }
+            VirtualFree(pages as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Pages a handler makes writable when they are written: (start, end), how often it did,
+    /// where the last faulting instruction was.
+    static REPAIR: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+    unsafe extern "system" fn repair(info: *mut EXCEPTION_POINTERS) -> i32 {
+        let rec = &*(*info).ExceptionRecord;
+        let at = rec.ExceptionInformation[1];
+        if rec.ExceptionCode as u32 != 0xC000_0005 || rec.ExceptionInformation[0] != 1 || !(REPAIR[0].load(Ordering::Relaxed)..REPAIR[1].load(Ordering::Relaxed)).contains(&at) {
+            return 0;
+        }
+        let mut old = 0;
+        VirtualProtect((at & !0xFFF) as *const c_void, 0x1000, PAGE_READWRITE, &mut old);
+        REPAIR[2].fetch_add(1, Ordering::Relaxed);
+        REPAIR[3].store(rec.ExceptionAddress as usize, Ordering::Relaxed);
+        -1 // EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// The store that ends the process under Rosetta 2 when the instruction makes it: it starts
+    /// on a page that can be written and goes on into one that cannot. The helper's fault is
+    /// on an ordinary `mov`: a handler makes the page writable, the store is resumed and
+    /// completes – with a read-only page and an exception handler of the test's, and with a
+    /// write watch, where (under Wine) the system itself is the handler.
+    #[test]
+    fn a_helper_resumes_after_a_fault_on_a_later_element() {
+        if !has_avx2() {
+            eprintln!("SKIPPED: this CPU has no AVX2");
+            return;
+        }
+        unsafe {
+            let mut code = Code::new();
+            let mut rng = Rng(0xFEED_FACE_CAFE_BEEF);
+            let pages = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let watched = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert!(pages != 0 && watched != 0);
+            REPAIR[0].store(pages, Ordering::Relaxed);
+            REPAIR[1].store(pages + 0x2000, Ordering::Relaxed);
+            let handler = AddVectoredExceptionHandler(1, Some(repair));
+            for kind in Kind::ALL {
+                for wide in [true, false] {
+                    let s = Store { kind, len: 0, wide, src: 2, mask: 14, mem: mem(Some(0), Some(2), 2, 0) };
+                    let s = Store { len: encode(&s).len() as u8, ..s };
+                    let (_, replaced) = code.pair(&s);
+                    let all = (1u32 << s.elements()) - 1;
+                    // the boundary before each element but the first; every element selected, or
+                    // only the ones behind the boundary (the first of them is then the first stored)
+                    for first_behind in 1..s.elements() {
+                        for bits in [all, all & !((1 << first_behind) - 1)] {
+                            let what = format!("{} with element {first_behind} first on the second page, mask {bits:#x}", kind.name());
+                            let offset = 0x1000 - first_behind * kind.element();
+                            let mut st = rng.state(true);
+                            set_mask(&s, &mut st, bits);
+                            // a read-only second page, repaired by `repair`
+                            let window = (pages + 0x1000 - 0x40) as *mut [u8; 0x80];
+                            let mut before = [0u8; 0x80];
+                            rng.fill(&mut before);
+                            *window = before;
+                            let mut old = 0;
+                            VirtualProtect((pages + 0x1000) as *const c_void, 0x1000, PAGE_READONLY, &mut old);
+                            let faults = REPAIR[2].load(Ordering::Relaxed);
+                            point(&s, &mut st, pages + offset, 5);
+                            assert_eq!(run(replaced, &st), st, "{what}");
+                            assert_eq!(REPAIR[2].load(Ordering::Relaxed), faults + 1, "one fault, repaired: {what}");
+                            assert!((replaced + 16..replaced + 16 + HELPER_MAX).contains(&REPAIR[3].load(Ordering::Relaxed)), "the fault is in the helper");
+                            let at = 0x40 - first_behind * kind.element();
+                            let mut want = before;
+                            let stored = defined(&s, &st, &before[at..at + 0x20]);
+                            want[at..at + 0x20].copy_from_slice(&stored);
+                            assert_eq!(*window, want, "{what}");
+                            // a write watch: both pages watched again, the first written (so it is
+                            // writable), then the store across the boundary
+                            let window = (watched + 0x1000 - 0x40) as *mut [u8; 0x80];
+                            *window = before;
+                            assert_eq!(ResetWriteWatch(watched as *const c_void, 0x2000), 0);
+                            (watched as *mut u8).add(0x1000 - 0x40).write_volatile(before[0]);
+                            point(&s, &mut st, watched + offset, 5);
+                            assert_eq!(run(replaced, &st), st, "{what}");
+                            assert_eq!(*window, want, "write-watched: {what}");
+                            let (mut written, mut count, mut grain) = ([std::ptr::null_mut::<c_void>(); 4], 4usize, 0u32);
+                            assert_eq!(GetWriteWatch(0, watched as *const c_void, 0x2000, written.as_mut_ptr(), &mut count, &mut grain), 0);
+                            assert_eq!((count, written[0] as usize, written[1] as usize), (2, watched, watched + 0x1000), "both pages are reported as written: {what}");
+                        }
+                    }
+                }
+            }
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(pages as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(watched as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// What the helpers are for, to be run alone and on purpose (`--ignored`): the instruction
+    /// itself across the boundary of a written and an unwritten page of write-watched memory.
+    /// A CPU completes it. Under Rosetta 2 with a write watch kept by page protection (Wine on
+    /// macOS) the process ends here with "rosetta error: unexpectedly need to EmulateForward
+    /// on a synchronous exception" and the test never reports.
+    #[test]
+    #[ignore = "ends the process under Rosetta 2: that is the finding"]
+    fn the_instruction_itself_across_a_watched_page_boundary() {
+        if !has_avx2() {
+            return;
+        }
+        unsafe {
+            let mut code = Code::new();
+            let watched = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            let s = Store { kind: Kind::D, len: 0, wide: true, src: 0, mask: 6, mem: mem(Some(0), Some(2), 2, 0) };
+            let s = Store { len: encode(&s).len() as u8, ..s };
+            let (original, _) = code.pair(&s);
+            let mut st = Rng(7).state(false);
+            set_mask(&s, &mut st, 0xFF);
+            assert_eq!(ResetWriteWatch(watched as *const c_void, 0x2000), 0);
+            // first with its first element on the unwritten page: resumed on every host
+            point(&s, &mut st, watched + 0x1000, 5);
+            assert_eq!(run(original, &st), st);
+            eprintln!("a fault on the first element was resumed; now one on the fourth");
+            assert_eq!(ResetWriteWatch(watched as *const c_void, 0x2000), 0);
+            (watched as *mut u8).add(0x1000 - 0x40).write_volatile(1);
+            point(&s, &mut st, watched + 0x1000 - 12, 5);
+            assert_eq!(run(original, &st), st);
+            assert_eq!(((watched + 0x1000 - 12) as *const [u8; 32]).read(), st.ymm[0]);
+            eprintln!("a fault on the fourth element was resumed: this host runs the instruction as a CPU does");
         }
     }
 }
