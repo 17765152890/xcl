@@ -917,6 +917,16 @@ mod tests {
         println!("TTPF: textures with mips (R8/RGBA8/RGBA16): {close} of {checked} – every mip close to the previous one downscaled (< 8/255), {unreadable} in unreadable blocks; outliers: {worst:?}");
         println!("TTPF: {tail_levels} levels in the mip tail – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
         println!("TTPF: volumes (index, neighbour difference as thick blocks, as 2D slices): {volumes:?}");
+        // Written for one archive. A size miss, or no volume LUTs, on another one is not a tiling-model bug.
+        let n_tex = a.textures.len();
+        let n_lut = a.textures.iter().filter(|t| t.dim == 3 && matches!(t.dxgi, 10 | 54)).count();
+        let which = format!("expected archive has 912 textures and 3 volume LUTs, this one has {n_tex} textures and {n_lut} volume LUTs");
+        if fit * 100 < sized * 99 {
+            panic!("mip chain model: {fit} / {sized}; {which}");
+        }
+        if volumes.is_empty() {
+            panic!("volumes: none; {which}");
+        }
         assert!(fit * 100 >= sized * 99, "mip chain model: {fit} / {sized}");
         assert!(checked >= 5 && close * 100 >= checked * 90, "mips: {close} / {checked}");
         assert!(tail_levels >= 5 && wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
