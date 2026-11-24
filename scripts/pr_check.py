@@ -91,8 +91,11 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
             for key in ("device removals", "crashes"):
                 if (number(pr.get(key)) or 0) > 0:
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
-            if pr.get("exit", "").startswith("killed"):
+            exit_code = pr.get("exit", "")
+            if exit_code.startswith("killed"):
                 problems.append("the PR's regression run did not end by itself (killed)")
+            elif not re.fullmatch(r"0x0+", exit_code, re.I):
+                problems.append(f"the PR's regression run needs a successful process exit (got {exit_code or 'no exit code'})")
             if main:
                 m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
                 if m is None:
