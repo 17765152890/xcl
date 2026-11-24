@@ -15,6 +15,8 @@ use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use crate::hle::d3d12x::window_mode::Area;
+
 /// How the title's image reaches the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -39,9 +41,10 @@ pub fn route(image: (u32, u32), client: (u32, u32)) -> Route {
 }
 
 const SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)"
+#define RS "RootConstants(num32BitConstants=6, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)"
 Texture2D<float4> src : register(t0);
-cbuffer C : register(b0) { uint2 dst; uint flags; uint pad; };
+// dst: the drawn rectangle's size, org: its top-left in the back buffer
+cbuffer C : register(b0) { uint2 dst; uint flags; uint pad; uint2 org; };
 
 [RootSignature(RS)]
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -58,7 +61,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
     uint sw, sh;
     src.GetDimensions(sw, sh);
     float2 s = float2(sw, sh) / float2(dst);
-    float2 lo = floor(pos.xy) * s;
+    float2 lo = (floor(pos.xy) - float2(org)) * s;
     float2 hi = min(lo + s, float2(sw, sh));
     int2 a = (int2)floor(lo);
     int2 b = (int2)ceil(hi);
@@ -133,9 +136,10 @@ impl Scaler {
     }
 
     /// Record on `list` the draw of `src` (subresource 0, readable as a pixel shader resource)
-    /// over all of `dst` (`w`x`h`, `self.fmt`, in RENDER_TARGET state). The descriptors are
-    /// rewritten: the previous recording must have finished on the GPU.
-    pub unsafe fn record(&self, dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, w: u32, h: u32) {
+    /// into `area` of `dst` (`self.fmt`, in RENDER_TARGET state), the rest of `dst` cleared to
+    /// opaque black (`window_mode::letterbox`). The descriptors are rewritten: the previous
+    /// recording must have finished on the GPU.
+    pub unsafe fn record(&self, dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, area: Area) {
         let view = view_format(src.GetDesc().Format);
         let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: view,
@@ -153,22 +157,25 @@ impl Scaler {
         super::note_rtv(rtv.ptr, std::ptr::null_mut());
         let decode = matches!(view, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM);
         let encode = self.fmt != DXGI_FORMAT_R16G16B16A16_FLOAT;
-        let constants = [w, h, decode as u32 | (encode as u32) << 1, 0];
+        let constants = [area.w, area.h, decode as u32 | (encode as u32) << 1, 0, area.x, area.y];
+        list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
         list.SetGraphicsRootSignature(&self.rs);
         list.SetDescriptorHeaps(&[Some(self.srv.clone())]);
-        list.SetGraphicsRoot32BitConstants(0, 4, constants.as_ptr() as _, 0);
+        list.SetGraphicsRoot32BitConstants(0, 6, constants.as_ptr() as _, 0);
         list.SetGraphicsRootDescriptorTable(1, self.srv.GetGPUDescriptorHandleForHeapStart());
         list.SetPipelineState(&self.pso);
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
-        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
+        let (x, y, w, h) = (area.x as f32, area.y as f32, area.w as f32, area.h as f32);
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: x, TopLeftY: y, Width: w, Height: h, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        let (x, y) = (area.x as i32, area.y as i32);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: x, top: y, right: x + area.w as i32, bottom: y + area.h as i32 }]);
         list.OMSetRenderTargets(1, Some(&rtv as *const _), false, None);
         list.DrawInstanced(3, 1, 0, 0);
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::hle::d3d12x) mod tests {
     use super::*;
     use windows::core::{w, Interface, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -201,7 +208,7 @@ mod tests {
     }
 
     /// 1-pixel lines and a 1-pixel checker, the hard case for a single bilinear tap.
-    fn pattern(w: usize, h: usize) -> Vec<u8> {
+    pub(in crate::hle::d3d12x) fn pattern(w: usize, h: usize) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 4];
         for y in 0..h {
             for x in 0..w {
@@ -216,7 +223,7 @@ mod tests {
     }
 
     /// The area filter on the CPU, in linear light (sRGB curve), as 8-bit sRGB.
-    fn reference(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<[f64; 3]> {
+    pub(in crate::hle::d3d12x) fn reference(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<[f64; 3]> {
         let lut: Vec<f64> = (0..256).map(|v| srgb_to_linear(v as f64 / 255.0)).collect();
         let (sx, sy) = (sw as f64 / dw as f64, sh as f64 / dh as f64);
         let mut out = Vec::with_capacity(dw * dh);
@@ -324,14 +331,20 @@ mod tests {
         out
     }
 
-    /// `src` (sw x sh RGBA8) through the scaler into a dw x dh target, read back as RGBA8.
+    /// `src` (sw x sh RGBA8) through the scaler into all of a dw x dh target, read back as RGBA8.
     unsafe fn downscale(dev: &ID3D12Device, scaler: &Scaler, src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+        draw(dev, scaler, src, sw, sh, dw, dh, Area { x: 0, y: 0, w: dw, h: dh })
+    }
+
+    /// `src` (sw x sh RGBA8) through the scaler into `area` of a dw x dh target, read back as RGBA8.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::hle::d3d12x) unsafe fn draw(dev: &ID3D12Device, scaler: &Scaler, src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, area: Area) -> Vec<u8> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
         let (tex, _up) = upload(dev, &list, src, sw, sh, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         let rt = texture(dev, dw, dh, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        scaler.record(dev, &list, &tex, &rt, dw, dh);
+        scaler.record(dev, &list, &tex, &rt, area);
         list.ResourceBarrier(&[super::super::transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let (rb, fp) = super::super::readback_copy(&list, &rt, &rt.GetDesc()).unwrap();
         run(dev, &queue, &list);
@@ -501,7 +514,7 @@ mod tests {
                 alloc.Reset().unwrap();
                 list.Reset(&alloc, None).unwrap();
                 list.ResourceBarrier(&[super::super::transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
-                p.scaler.as_ref().unwrap().record(&dev, &list, &image, &bb, w, h);
+                p.scaler.as_ref().unwrap().record(&dev, &list, &image, &bb, Area { x: 0, y: 0, w, h });
                 list.ResourceBarrier(&[super::super::transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                 let (rb, fp) = super::super::readback_copy(&list, &bb, &bb.GetDesc()).unwrap();
                 list.ResourceBarrier(&[super::super::transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);

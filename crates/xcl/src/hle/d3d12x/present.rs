@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::gpu::fence::{self, FenceError};
 use crate::stubs::StubInfo;
 
-mod downscale;
+pub(super) mod downscale;
 use downscale::Route;
 
 static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
@@ -314,6 +314,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
     }
+    // Alt+Enter / F11: borderless fullscreen on / off
+    if let Some(k) = super::window_mode::key(msg, wp.0, lp.0) {
+        if k == super::window_mode::Key::Toggle {
+            super::window_mode::toggle(hwnd);
+        }
+        return LRESULT(0);
+    }
     match msg {
         WM_CLOSE => {
             crate::xlog_info!("XCL window closed – ending the game process");
@@ -454,6 +461,9 @@ fn window_thread() {
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
+        if cfg.fullscreen {
+            super::window_mode::toggle(hwnd);
+        }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -765,7 +775,8 @@ unsafe fn present_frame(p: &mut Presenter, hwnd: HWND, src: ID3D12Resource, desc
         (Route::Filter, Some(scaler)) => {
             p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             // the title's image is promoted from COMMON to a shader resource, as for the copy
-            scaler.record(&p.dev, &p.list, &src, &bb, sw, sh);
+            // at the image's aspect, centred, black bars around it
+            scaler.record(&p.dev, &p.list, &src, &bb, super::window_mode::letterbox(image, (sw, sh)));
             D3D12_RESOURCE_STATE_RENDER_TARGET
         }
         _ => {
