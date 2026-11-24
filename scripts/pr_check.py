@@ -41,10 +41,12 @@ def smoke_blocks(body):
 
 def filled(body, section):
     """Whether `body` has a `**section**` heading, on a line of its own, with something written
-    under it before the next heading. Comments are taken out first, so a heading or a result
-    inside one is not there; list markers with nothing after them are not something."""
-    body = re.sub(r"<!--.*?-->", "", body, flags=re.S)
-    end = r"(?=\n[ \t]*\*\*(?:" + "|".join(HEADINGS) + r")\*\*|\Z)"
+    under it before the next heading, which is a line of its own too. Comments are taken out
+    first, so a heading or a result inside one is not there; list markers with nothing after
+    them are not something."""
+    # an unclosed comment hides the rest of the description on GitHub, so it takes it here too
+    body = re.sub(r"<!--.*?(?:-->|\Z)", "", body, flags=re.S)
+    end = r"(?=\n[ \t]*\*\*(?:" + "|".join(HEADINGS) + r")\*\*[ \t]*(?:\n|\Z)|\Z)"
     start = r"(?:^|\n)[ \t]*\*\*" + section + r"\*\*[ \t]*(?=\n)"
     for m in re.finditer(start + r"(.*?)" + end, body, re.S):
         if re.sub(r"^[ \t]*[-*+][ \t]*$", "", m.group(1), flags=re.M).strip():

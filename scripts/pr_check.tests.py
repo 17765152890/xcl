@@ -82,6 +82,17 @@ class Sections(unittest.TestCase):
         body = FILLED.replace("**Tested**\n", "  **Tested**  \n")
         self.assertEqual(problems(body), [])
 
+    def test_heading_name_at_the_start_of_a_sentence_is_text(self):
+        # only a heading on a line of its own ends the section before it
+        body = FILLED.replace("- `python3 scripts/example.py`: ok\n",
+                              "**AI use** below covers the test too; 3 passed\n")
+        self.assertEqual(problems(body), [])
+
+    def test_unclosed_comment_hides_what_follows(self):
+        # GitHub shows nothing after an unclosed comment: the sections after it are not there
+        body = FILLED.replace("- `python3 scripts/example.py`: ok\n", "<!-- results to come\n")
+        self.assertEqual(problems(body), [empty(s) for s in ("Tested", "Not tested", "AI use")])
+
     def test_untouched_template_is_refused(self):
         path = os.path.join(HERE, "..", ".github", "pull_request_template.md")
         with open(path, encoding="utf-8") as f:
