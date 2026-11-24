@@ -2774,6 +2774,124 @@ fn gpu_packed_math_dots_movrel() {
     }
 }
 
+/// GPU checks for `v_dot2_f32_f16` (`ENC_VOP3P`) and `v_dot2c_f32_f16` (`ENC_VOP2`) across
+/// `OP_SEL` / `OP_SEL_HI` half selection, `NEG` / `NEG_HI`, `CLAMP`, SGPR operands, chained
+/// accumulation, and partial `EXEC` masking.
+#[test]
+fn gpu_dot2_f32_f16_and_dot2c() {
+    fn dot2_ref(s0: u32, s1: u32, c: f32, op_sel: u64, op_sel_hi: u64, neg: u64, neg_hi: u64, clamp: bool) -> f32 {
+        let pick = |raw: u32, hi: bool, neg_bit: bool| -> f32 {
+            let h = if hi { (raw >> 16) as u16 } else { raw as u16 };
+            let v = f16_to_f64(h) as f32;
+            if neg_bit { -v } else { v }
+        };
+        let a0 = pick(s0, op_sel & 1 == 1, neg & 1 == 1);
+        let b0 = pick(s1, (op_sel >> 1) & 1 == 1, (neg >> 1) & 1 == 1);
+        let a1 = pick(s0, op_sel_hi & 1 == 1, neg_hi & 1 == 1);
+        let b1 = pick(s1, (op_sel_hi >> 1) & 1 == 1, (neg_hi >> 1) & 1 == 1);
+        let acc = if (neg >> 2) & 1 == 1 { -c } else { c };
+        let res = a1 * b1 + a0 * b0 + acc;
+        if clamp { res.clamp(0.0, 1.0) } else { res }
+    }
+
+    // Exact dyadic multiples of 0.25 so every product and sum is exact in f32 without negative zero.
+    // (a_lo, a_hi, b_lo, b_hi, acc_c)
+    const CASES: [(f32, f32, f32, f32, f32); 16] = [
+        (1.5, -2.0, 2.25, 0.5, 10.0),
+        (0.5, 1.25, -1.0, 2.0, -3.5),
+        (-0.75, 0.25, 2.0, 1.5, 1.0),
+        (2.0, 3.0, 0.25, -0.5, 0.5),
+        (0.25, 0.5, 1.0, 0.5, 0.25),
+        (-1.5, 0.5, 0.5, 2.5, 0.25),
+        (0.0, 2.0, 1.5, -1.0, 2.0),
+        (1.25, 0.0, -2.0, 0.5, 3.0),
+        (0.5, -0.5, 1.0, 1.0, 0.0),
+        (-2.0, -1.5, 1.5, -0.5, -4.0),
+        (3.5, 1.0, 0.5, 1.5, -2.5),
+        (-0.25, 2.5, -2.0, 0.5, -0.5),
+        (1.0, -1.25, 0.5, -2.0, -2.25),
+        (0.75, 0.5, 0.5, 0.25, 0.25),
+        (-1.0, 1.5, -0.5, 1.5, 0.75),
+        (2.5, -0.25, 1.0, -2.0, 1.25),
+    ];
+
+    let pack = |lo: f32, hi: f32| -> u32 { half_bits(lo) | (half_bits(hi) << 16) };
+    let sgpr0 = pack(0.5, -1.5);
+    let sgpr1 = -0.75f32;
+
+    let p = prog(&[
+        // 1. Standard [hi, lo] dot product (OP_SEL_HI=0b11, OP_SEL=0)
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11)], None),
+        // 2. Swapped halves (OP_SEL=0b01, OP_SEL_HI=0b10)
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b01), ("OP_SEL_HI", 0b10)], None),
+        // 3. Broadcast low halves (OP_SEL=0b00, OP_SEL_HI=0b00)
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b00), ("OP_SEL_HI", 0b00)], None),
+        // 4. Broadcast high halves (OP_SEL=0b11, OP_SEL_HI=0b11)
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b11), ("OP_SEL_HI", 0b11)], None),
+        // 5. NEG on src0.lo and src2 (NEG=0b101), NEG_HI on src1.hi (NEG_HI=0b10)
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11), ("NEG", 0b101), ("NEG_HI", 0b10)], None),
+        // 6. NEG on src1.lo (NEG=0b010), NEG_HI on src0.hi (NEG_HI=0b01), CLAMP=1
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 15), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11), ("NEG", 0b010), ("NEG_HI", 0b01), ("CLAMP", 1)], None),
+        // 7. SGPR SRC0 (s0), VGPR SRC1/SRC2
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 16), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11)], None),
+        // 8. VGPR SRC0/SRC1, SGPR SRC2 (s1) with NEG=0b100 (-s1)
+        ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 17), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 1), ("OP_SEL_HI", 0b11), ("NEG", 0b100)], None),
+        // 9. V_DOT2C_F32_F16 single accumulate (v18 += v0 . v1)
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 18), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        // 10. V_DOT2C_F32_F16 chained accumulate (v19 += v0 . v1, then v19 += s0 . v1)
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 19), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 19), ("SRC0", 0), ("VSRC1", 1)], None),
+        // 11. V_DOT2C_F32_F16 under partial EXEC mask (odd lanes only; even lanes preserve 42.5)
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 3)], None),
+        ("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 4)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 106)], None),
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        st.sgpr[0] = sgpr0;
+        st.sgpr[1] = f(sgpr1);
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (alo, ahi, blo, bhi, acc_c) = CASES[l % CASES.len()];
+            r[0] = pack(alo, ahi);
+            r[1] = pack(blo, bhi);
+            r[2] = f(acc_c);
+            r[3] = l as u32;
+            r[18] = f(acc_c);
+            r[19] = f(acc_c);
+            r[20] = if l & 1 == 1 { f(acc_c) } else { f(42.5) };
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let (s0, s1) = (st.vgpr[l][0], st.vgpr[l][1]);
+            let (_, _, _, _, acc_c) = CASES[l % CASES.len()];
+            let assert_f32 = |got: u32, want: f32, tag: &str| {
+                assert_eq!(got, want.to_bits(), "wave{lanes} lane {l} {tag}: got {} ({got:#010x}), want {want} ({:#010x})", f32::from_bits(got), want.to_bits());
+            };
+
+            assert_f32(v[10], dot2_ref(s0, s1, acc_c, 0b00, 0b11, 0, 0, false), "v_dot2 standard");
+            assert_f32(v[11], dot2_ref(s0, s1, acc_c, 0b01, 0b10, 0, 0, false), "v_dot2 swapped");
+            assert_f32(v[12], dot2_ref(s0, s1, acc_c, 0b00, 0b00, 0, 0, false), "v_dot2 broadcast lo");
+            assert_f32(v[13], dot2_ref(s0, s1, acc_c, 0b11, 0b11, 0, 0, false), "v_dot2 broadcast hi");
+            assert_f32(v[14], dot2_ref(s0, s1, acc_c, 0b00, 0b11, 0b101, 0b10, false), "v_dot2 neg/neg_hi");
+            assert_f32(v[15], dot2_ref(s0, s1, acc_c, 0b00, 0b11, 0b010, 0b01, true), "v_dot2 neg/clamp");
+            assert_f32(v[16], dot2_ref(sgpr0, s1, acc_c, 0b00, 0b11, 0, 0, false), "v_dot2 sgpr src0");
+            assert_f32(v[17], dot2_ref(s0, s1, sgpr1, 0b00, 0b11, 0b100, 0, false), "v_dot2 sgpr src2 neg");
+
+            let step1 = dot2_ref(s0, s1, acc_c, 0b00, 0b11, 0, 0, false);
+            assert_f32(v[18], step1, "v_dot2c single");
+            let step2 = dot2_ref(sgpr0, s1, step1, 0b00, 0b11, 0, 0, false);
+            assert_f32(v[19], step2, "v_dot2c chained");
+            let masked_want = if l & 1 == 1 { step1 } else { 42.5 };
+            assert_f32(v[20], masked_want, "v_dot2c masked");
+        }
+    }
+}
+
 #[test]
 fn dxc_mesh_shader_probe() {
     use super::dxc;
