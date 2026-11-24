@@ -5099,6 +5099,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+        super::list_x::cpu_writes_before(chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
