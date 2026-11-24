@@ -36,5 +36,30 @@ class TestOnlyApprovalTests(unittest.TestCase):
         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
 
 
+class BannedModelTests(unittest.TestCase):
+    def body_for(self, model):
+        return f"**Tested**\nSynthetic fixtures\n**Not tested**\nRetail titles\n**AI use**\n{model}\n"
+
+    def test_phi_family_is_rejected_in_common_spellings(self):
+        for model in ("Phi", "Phi 4", "Phi-4", "Phi4", "PHI 3.5"):
+            with self.subTest(model=model):
+                problems = check(self.body_for(model), HEAD, [], lambda _: False)
+                self.assertTrue(any("does not accept" in problem for problem in problems), problems)
+
+    def test_compact_banned_family_names_remain_rejected(self):
+        for model in ("Qwen3", "Llama3", "Gemma2"):
+            with self.subTest(model=model):
+                problems = check(self.body_for(model), HEAD, [], lambda _: False)
+                self.assertTrue(any("does not accept" in problem for problem in problems), problems)
+
+    def test_words_starting_with_phi_are_not_rejected(self):
+        self.assertEqual([], check(self.body_for("Philip"), HEAD, [], lambda _: False))
+
+    def test_allowed_models_are_accepted(self):
+        for model in ("None", "Claude Code", "GPT", "Gemini"):
+            with self.subTest(model=model):
+                self.assertEqual([], check(self.body_for(model), HEAD, [], lambda _: False))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ import argparse, os, re, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
 # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
-BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)"
+BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d|phi(?=\b|\d))"
 # game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance")
 GAME_DATA = re.compile(
     r"\.(rpf|xvd|xvc|msixvc|appx|msix|appxbundle|xex|xbe|pak|bk2|bik|ttpf|dds|ktx2?|wem|bnk|"
