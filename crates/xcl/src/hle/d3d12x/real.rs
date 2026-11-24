@@ -533,6 +533,7 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        super::pipeline_library::init(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -1800,7 +1801,7 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
 /// Copy `n` console slots from `src` to `dst` (both in console heaps of one kind): the PC
 /// descriptors (2 per view slot) and the slots. False: not two console ranges.
 unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) -> bool {
-    use super::console_heap::{copy_words, slot, SAMPLER_SLOT, SLOT};
+    use super::console_heap::slot;
     let (Some(d0), Some(s0)) = (slot(dst), slot(src)) else { return false };
     if d0.sampler != s0.sampler {
         return false;
@@ -1811,12 +1812,7 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
     if !d0.sampler {
         super::console_heap::publish_range(&d0, n);
     }
-    let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
-    for k in 0..n as u64 {
-        if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
-            copy_words(&s, &d);
-        }
-    }
+    super::console_heap::copy_range(&s0, &d0, n);
     true
 }
 
@@ -3414,6 +3410,24 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+
+    let pso_name = super::pipeline_library::compute_pso_name(&copy, &dxil);
+    if let Some(cached_pso) = super::pipeline_library::load_compute(&pso_name, &copy) {
+        let raw = cached_pso.into_raw() as *mut c_void;
+        adopt(raw, Kind::PipelineState);
+        *ppv = raw;
+        let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+        note_pso_rs(*ppv, rs);
+        if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+            PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+        }
+        note_translated_compute(S_OK, ppv);
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: loaded compute PSO from pipeline library ({pso_name})");
+        }
+        return Some(Ok(S_OK));
+    }
+
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
@@ -3452,6 +3466,11 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(pso_ref) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
+            super::pipeline_library::store_compute(&pso_name, &pso_ref);
+        }
     }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
@@ -3731,7 +3750,31 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    let pso_name = super::pipeline_library::graphics_pso_name(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref());
+    if let Some(cached_pso) = super::pipeline_library::load_graphics(&pso_name, &copy) {
+        let raw = cached_pso.into_raw() as *mut c_void;
+        adopt(raw, Kind::PipelineState);
+        *ppv = raw;
+        let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+        note_pso_rs(*ppv, rs);
+        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: loaded graphics PSO from pipeline library ({pso_name})");
+        }
+        return Some(S_OK);
+    }
     let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(pso_ref) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
+            let actual_name = if copy.GS.pShaderBytecode.is_null() && rect_gs.is_some() {
+                super::pipeline_library::graphics_pso_name(&copy, &vs_dxil, ps_dxil.as_deref(), None)
+            } else {
+                pso_name
+            };
+            super::pipeline_library::store_graphics(&actual_name, &pso_ref);
+        }
+    }
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",

@@ -412,6 +412,34 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     }
 }
 
+/// Copy `n` contiguous console descriptors from `src` to `dst`. Renumbers destination
+/// indices without per-slot mutex acquisitions.
+pub fn copy_range(src: &Slot, dst: &Slot, n: u32) {
+    let step = if src.sampler { SAMPLER_SLOT } else { SLOT } as usize;
+    let index_step = if src.sampler { 1 } else { 2 };
+    let words = if src.sampler { 4 } else { 8 };
+    for k in 0..n as usize {
+        let src_at = src.at + k * step;
+        let dst_at = dst.at + k * step;
+        let dst_index = dst.index + (k as u32 * index_step);
+        let mut w = [0u32; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_at as *const u32, w.as_mut_ptr(), words);
+        }
+        if src.sampler {
+            w[3] = (w[3] & !0xFFF) | (dst_index & 0xFFF);
+        } else if w[3] >> 28 >= 8 {
+            w[0] = dst_index;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr(), dst_at as *mut u32, words);
+        }
+        if !src.sampler && super::present::trace_frame() {
+            note_resource(&Slot { at: dst_at, index: dst_index, ..*dst }, resource_at(src_at).unwrap_or(0));
+        }
+    }
+}
+
 /// `XCL_TRACE_FRAME`: what the slots of each shader-visible view heap hold – images whose
 /// PC index is the slot's own (made or copied through the device) or another (copied by the
 /// title itself, as memory), buffers, empty.
@@ -538,6 +566,16 @@ mod tests {
         copy_words(&q0, &q1);
         assert_eq!(words_at(rel(sm + 16)).unwrap()[..4], [1, 2, 3, 0xABC0_0001]);
         assert!(slot(sm + 32).is_none(), "past the last sampler slot");
+
+        // copy_range copies multiple slots sequentially without per-slot mutex acquisitions
+        let s0 = slot(v).unwrap();
+        let s2 = slot(v + 64).unwrap();
+        write(&s0, &[0, 0x0100_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        write(&s1, &[2, 0x0200_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        copy_range(&s0, &s2, 2);
+        assert_eq!(words_at(rel(v + 64)).unwrap()[..4], [4, 0x0100_0000, 0, 9 << 28]);
+        assert_eq!(words_at(rel(v + 96)).unwrap()[..4], [6, 0x0200_0000, 0, 9 << 28]);
+
         unregister(0xA1);
         unregister(0xA2);
         assert!(start(0xA1).is_none() && slot(v).is_none() && slot(sm).is_none());
