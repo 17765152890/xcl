@@ -42,11 +42,13 @@ impl Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
-/// The build is done (`real`: its pipeline, 0 = failed). The first build to finish is the
-/// pipeline (a bind's second copy and the worker's may both end: the later one is released).
+/// The build is done (`real`: its pipeline, 0 = failed). The first build that *succeeds* is the
+/// pipeline: a bind's second copy and the worker's may both end, and a failure does not take
+/// the place of a success that is still coming (the later pipeline is released).
 fn complete(p: &Pending, real: usize) {
     let mut done = p.done.lock().unwrap();
-    if *done {
+    // a failure after any result, or a result after a successful one: not this pipeline
+    if *done && (real == 0 || p.real.load(Ordering::Acquire) != 0) {
         drop(done);
         release(real);
         return;
@@ -63,6 +65,10 @@ fn complete(p: &Pending, real: usize) {
     *done = true;
     p.cv.notify_all();
     drop(done);
+    // the copy is not wanted any more: it holds the descriptor the build reads
+    if real != 0 {
+        let _ = p.second.lock().unwrap().take();
+    }
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
     if orphan {
         release(real);
@@ -400,6 +406,41 @@ mod help_tests {
         assert_eq!(resolve_wait(pso), 0x7777, "the worker's build, not the copy's failure");
         assert_eq!(resolve(pso), 0x7777);
         released(pso);
+    }
+
+    /// A pipeline with a second copy is still lazy: it waits for its first use, as
+    /// `submit_lazy` does. `go_background` passed the wrong `send` once and every pipeline a
+    /// title made went to the workers at creation, which is what `lazy` exists to avoid
+    /// (~51 000 of them, ~400 KB each in the driver).
+    #[test]
+    fn a_lazy_pipeline_with_a_second_copy_waits_for_its_first_use() {
+        let (lazy_pso, eager) = (0x7E57_7013usize, 0x7E57_7014usize);
+        let built = std::sync::Arc::new(AtomicBool::new(false));
+        let b = built.clone();
+        submit_second(lazy_pso, false, Box::new(move || {
+            b.store(true, Ordering::Release);
+            0x8881
+        }), false, 0, Some(Box::new(|| 0x8882)));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!built.load(Ordering::Acquire), "nothing built it before its first use");
+        assert!(is_pending(lazy_pso));
+        // its first use sends it to the workers
+        assert_eq!(resolve_wait(lazy_pso), 0x8881);
+        assert!(built.load(Ordering::Acquire));
+        // and `send` builds one straight away, with no use at all
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        submit_second(eager, false, Box::new(move || {
+            d.store(true, Ordering::Release);
+            0x8883
+        }), true, 0, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(done.load(Ordering::Acquire), "an eager one is built by a worker without a use");
+        released(lazy_pso);
+        released(eager);
     }
 }
 

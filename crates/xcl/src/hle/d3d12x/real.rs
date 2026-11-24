@@ -4004,8 +4004,9 @@ unsafe fn go_background(
         })
     };
     let (job, second) = (once(owned.clone()), Some(once(owned)));
+    // `send`: a lazy pipeline goes to the workers on its first `resolve`, an eager one now
     let lazy = super::pso_async::lazy();
-    super::pso_async::submit_second(*ppv as usize, compute, job, lazy, if lazy { key } else { 0 }, second);
+    super::pso_async::submit_second(*ppv as usize, compute, job, !lazy, if lazy { key } else { 0 }, second);
     Some(hr)
 }
 
