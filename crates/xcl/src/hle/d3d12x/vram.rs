@@ -260,6 +260,7 @@ impl Pages {
         }
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        VRAM_QUEUES.lock().unwrap().push(SendQueue(queue.clone()));
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
@@ -618,6 +619,18 @@ fn forget_pages(resource: usize) {
         }
         return;
     }
+}
+
+struct SendQueue(ID3D12CommandQueue);
+unsafe impl Send for SendQueue {}
+
+/// Tile-mapping queues of every active `Pages` instance, kept outside `PAGES` so
+/// `late_release::drain_known` can snapshot them without taking the `PAGES` mutex.
+static VRAM_QUEUES: Mutex<Vec<SendQueue>> = Mutex::new(Vec::new());
+
+/// The tile-mapping queues of tiled title textures (`late_release`).
+pub(super) fn queues() -> Vec<ID3D12CommandQueue> {
+    VRAM_QUEUES.lock().unwrap().iter().map(|q| q.0.clone()).collect()
 }
 
 /// Before GPU work on `queue`: it waits for the pages mapped since its last work on that device.
