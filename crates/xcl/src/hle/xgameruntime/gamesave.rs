@@ -17,7 +17,6 @@ static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
 pub const E_GS_BLOB_NOT_FOUND: HRESULT = 0x8083_0008u32 as i32;
-pub const E_GS_CONTAINER_NOT_FOUND: HRESULT = 0x8083_0010u32 as i32;
 /// quota reported to the title (the GDK default)
 pub const QUOTA: i64 = 256 << 20;
 
@@ -362,9 +361,11 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
 
 pub unsafe extern "system" fn XGameSaveGetContainerInfo(p: *mut Provider, name: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(n), Some(cb)) = (provider(p), from_cstr_ptr(name), cb) else { return E_INVALIDARG };
-    if each_container(pr, &n, true, ctx, cb) == 0 {
-        return E_GS_CONTAINER_NOT_FOUND;
+    if !valid_container_name_length(&n) {
+        return E_GS_INVALID_CONTAINER_NAME;
     }
+    // A container that is not stored yet is not an error: the callback is just not called.
+    each_container(pr, &n, true, ctx, cb);
     S_OK
 }
 
@@ -919,7 +920,9 @@ mod tests {
             assert_eq!(q, QUOTA - 5);
             XGameSaveCloseContainer(c);
             assert_eq!(XGameSaveDeleteContainer(p, b"slot/1\0".as_ptr()), S_OK);
-            assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), std::ptr::null_mut(), Some(count_containers)), E_GS_CONTAINER_NOT_FOUND);
+            let mut gone: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), &mut gone as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(gone.is_empty(), "{gone:?}");
             let root = (*p).root.clone();
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
@@ -1129,6 +1132,43 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(b0.data, 6), b"keepme");
 
             XGameSaveCloseContainer(c);
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// A container with no saved data is not an error: the call succeeds and the callback
+    /// is not called, as on the console (first launch).
+    #[test]
+    fn get_container_info_of_a_container_without_saved_data_succeeds_without_a_result() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-info-missing-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut info: Vec<(String, String, u32, u64)> = Vec::new();
+            let ctx = &mut info as *mut _ as *mut c_void;
+
+            // Never created.
+            assert_eq!(XGameSaveGetContainerInfo(p, b"missing\0".as_ptr(), ctx, Some(count_containers)), S_OK);
+            let longest = format!("{}\0", "a".repeat(256));
+            assert_eq!(XGameSaveGetContainerInfo(p, longest.as_ptr(), ctx, Some(count_containers)), S_OK);
+            assert!(info.is_empty(), "{info:?}");
+
+            // Created, but no update was ever submitted.
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"fresh\0".as_ptr(), &mut c), S_OK);
+            assert_eq!(XGameSaveGetContainerInfo(p, b"fresh\0".as_ptr(), ctx, Some(count_containers)), S_OK);
+            assert!(info.is_empty(), "{info:?}");
+            XGameSaveCloseContainer(c);
+
+            // A name XGameSaveCreateContainer rejects is rejected here with the same error.
+            let overlong = format!("{}\0", "a".repeat(257));
+            assert_eq!(XGameSaveGetContainerInfo(p, b"\0".as_ptr(), ctx, Some(count_containers)), E_GS_INVALID_CONTAINER_NAME);
+            assert_eq!(XGameSaveGetContainerInfo(p, overlong.as_ptr(), ctx, Some(count_containers)), E_GS_INVALID_CONTAINER_NAME);
+            assert!(info.is_empty(), "{info:?}");
+
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
