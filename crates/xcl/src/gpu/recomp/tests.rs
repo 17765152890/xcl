@@ -6599,6 +6599,46 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
 }
 
+/// f16 add / sub / subrev / pk_add round to nearest even in the default mode, not toward zero
+/// (`f32tof16`), and overflow to ±inf (#685).
+#[test]
+fn gpu_f16_add_sub_round_to_nearest_even() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_ADD_F16", "ENC_VOP2", &[("VDST", 4), ("SRC0", V), ("VSRC1", 1)], None),
+            ("V_SUB_F16", "ENC_VOP2", &[("VDST", 5), ("SRC0", V), ("VSRC1", 1)], None),
+            ("V_SUBREV_F16", "ENC_VOP2", &[("VDST", 6), ("SRC0", V), ("VSRC1", 1)], None),
+            ("V_PK_ADD_F16", "ENC_VOP3P", &[("VDST", 7), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL_HI", 3)], None),
+        ]);
+        // (a, b, a + b, a - b, b - a)
+        const CASES: [(u16, u16, u16, u16, u16); 5] = [
+            (0x3C00, 0x1200, 0x3C01, 0x3BFE, 0xBBFE), // 1 ± 1.5·2^-11: +0.75 ulp rounds up, the difference is a tie
+            (0x3C00, 0x0800, 0x3C00, 0x3C00, 0xBC00), // 1 - 2^-13 rounds up to 1 (toward zero gave 0x3bff)
+            (0xBC00, 0x9200, 0xBC01, 0xBBFE, 0x3BFE), // negative
+            (0x3C00, 0x1000, 0x3C00, 0x3BFF, 0xBBFF), // 1 + 2^-11: tie to even
+            (0x7BFF, 0x5000, 0x7C00, 0x7BFE, 0xFBFE), // 65504 + 32 overflows to +inf
+        ];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, ..) = CASES[l % CASES.len()];
+            let (c, d, ..) = CASES[(l + 1) % CASES.len()];
+            (r[0], r[1]) = (a as u32, b as u32);
+            (r[2], r[3]) = (a as u32 | (c as u32) << 16, b as u32 | (d as u32) << 16);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, add, sub, subrev) = CASES[l % CASES.len()];
+            let hi_add = CASES[(l + 1) % CASES.len()].2;
+            let got = (v[4] as u16, v[5] as u16, v[6] as u16, v[7]);
+            assert_eq!(
+                got,
+                (add, sub, subrev, add as u32 | (hi_add as u32) << 16),
+                "wave{lanes} lane {l}: a {a:#06x}, b {b:#06x} (add, sub, subrev, pk_add)"
+            );
+        }
+    }
+}
+
 #[test]
 fn gpu_f16_defaults_to_round_to_nearest_even() {
     if !gpu_ready() {

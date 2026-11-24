@@ -2606,8 +2606,9 @@ impl Em {
         let dyn_rm = self.dynamic_f16_rm;
         let fr = |e: String| {
             let s = if clamp { format!("saturate({e})") } else { e };
-            // The product of two binary16 operands fits exactly in binary32.
-            if name == "v_pk_mul_f16" {
+            // The product of two binary16 operands fits exactly in binary32; their sum rounded
+            // to binary32 and then to binary16 is the correctly rounded binary16 sum (24 >= 2·11+2).
+            if matches!(name, "v_pk_mul_f16" | "v_pk_add_f16") {
                 to_f16_rounded_expr(dyn_rm, &s)
             } else {
                 to_f16_expr(dyn_rm, &s)
@@ -2842,7 +2843,7 @@ impl Em {
             if m.clamp {
                 s = format!("saturate({s})");
             }
-            if name == "v_mul_f16" {
+            if matches!(name, "v_mul_f16" | "v_add_f16" | "v_sub_f16" | "v_subrev_f16") {
                 to_f16_rounded_expr(dyn_rm, &s)
             } else {
                 to_f16_expr(dyn_rm, &s)
