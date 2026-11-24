@@ -851,6 +851,150 @@ impl Em {
 
     // ---------------------------------------------------------------- one instruction
 
+    /// Emit one basic block's instructions in order; stops at the first non-fallthrough flow.
+    /// In split-wave64 mode, consecutive independent `v_readfirstlane_b32` / `v_readlane_b32`
+    /// instructions share a single multi-word `xcl_x_meet()` exchange instead of one per read.
+    pub fn emit_insts(&mut self, block: &[Decoded], end: u64) -> Flow {
+        let mut flow = Flow::Next;
+        let mut i = 0;
+        while i < block.len() {
+            if self.x64() {
+                let n = self.x64_readlane_batch_len(&block[i..]);
+                if n >= 2 && self.emit_x64_readlane_batch(&block[i..i + n]) {
+                    i += n;
+                    continue;
+                }
+            }
+            let next = block.get(i + 1).map(|n| n.pc).unwrap_or(end);
+            flow = self.inst(&block[i], next);
+            if !matches!(flow, Flow::Next) {
+                break;
+            }
+            i += 1;
+        }
+        flow
+    }
+
+    /// SGPRs read by a plain `v_readfirstlane_b32` / `v_readlane_b32` source code.
+    fn x64_readlane_src_sgprs(code: u64) -> u128 {
+        match code {
+            0..=124 | 126..=127 => 1u128 << code,
+            251 => 3u128 << 106, // VCCZ
+            252 => 3u128 << 126, // EXECZ
+            _ => 0,
+        }
+    }
+
+    /// If `d` is a split-wave64 `v_readfirstlane_b32` / `v_readlane_b32` that will emit an
+    /// exchange, returns `(sgprs_read, sgprs_written)`.
+    fn x64_batchable_readlane(&self, d: &Decoded) -> Option<(u128, u128)> {
+        if d.variant != Variant::Plain {
+            return None;
+        }
+        let name = d.inst.name;
+        if !matches!(name, "V_READFIRSTLANE_B32" | "V_READLANE_B32") {
+            return None;
+        }
+        if !(d.enc.name.starts_with("ENC_VOP") || d.enc.name.starts_with("VOP")) {
+            return None;
+        }
+        if name == "V_READLANE_B32" && self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).is_some() {
+            return None;
+        }
+        let (outs, _) = Self::ops(d);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let written = match dst {
+            Dst::S(n) if n < 128 => 1u128 << n,
+            Dst::Null => 0,
+            _ => return None,
+        };
+        let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+        let mut reads = Self::x64_readlane_src_sgprs(fv("SRC0"));
+        if name == "V_READFIRSTLANE_B32" {
+            reads |= 3u128 << 126; // EXEC_LO | EXEC_HI
+        } else {
+            reads |= Self::x64_readlane_src_sgprs(fv("SRC1"));
+        }
+        Some((reads, written))
+    }
+
+    /// Length of a dependency-free split-wave64 `v_readfirstlane_b32` / `v_readlane_b32` batch
+    /// starting at `rest[0]`. Bounded so the per-wave exchange slots stay <= 256 dwords (1 KB).
+    fn x64_readlane_batch_len(&self, rest: &[Decoded]) -> usize {
+        let waves = self.x64_threads().div_ceil(64).max(1) as usize;
+        let cap = (64 / waves).clamp(2, 8);
+        let mut written = 0u128;
+        let mut n = 0;
+        for d in rest.iter().take(cap) {
+            let Some((r, w)) = self.x64_batchable_readlane(d) else { break };
+            if (r & written) != 0 {
+                break;
+            }
+            written |= w;
+            n += 1;
+        }
+        n
+    }
+
+    /// Emit `batch` (`len >= 2`) of consecutive split-wave64 `v_readfirstlane_b32` /
+    /// `v_readlane_b32` instructions using a single multi-word `xcl_x_meet()` exchange.
+    fn emit_x64_readlane_batch(&mut self, batch: &[Decoded]) -> bool {
+        struct Item {
+            pc: u64,
+            text: String,
+            src: String,
+            lane: Option<String>,
+            dst: Dst,
+        }
+        let mut items = Vec::with_capacity(batch.len());
+        let mut need_first = false;
+        for d in batch {
+            let (outs, ins) = Self::ops(d);
+            let Ok(u) = self.sources(d, &ins, false) else { return false };
+            let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+            let src = u.first().cloned().unwrap_or_default();
+            let lane = if d.inst.name == "V_READFIRSTLANE_B32" {
+                need_first = true;
+                None
+            } else {
+                Some(u.get(1).cloned().unwrap_or_default())
+            };
+            items.push(Item { pc: d.pc, text: rdna2::format(d), src, lane, dst });
+        }
+        self.x64_words = self.x64_words.max(items.len());
+        for it in &items {
+            self.line(&format!("// {:04x}: {}", it.pc, it.text));
+            self.cur_pc = it.pc;
+        }
+        let t = self.t();
+        if need_first {
+            let (el, eh) = (self.sreg(126), self.sreg(127));
+            self.line(&format!("uint {t}_fl = first_lane({el}, {eh});"));
+        }
+        let mut lanes = Vec::with_capacity(items.len());
+        for (i, it) in items.iter().enumerate() {
+            let l = match &it.lane {
+                None => format!("{t}_fl"),
+                Some(b) => {
+                    let lv = format!("{t}_l{i}");
+                    self.line(&format!("uint {lv} = ({b}) & 63u;"));
+                    lv
+                }
+            };
+            self.line(&format!("uint {t}_m{i} = WaveReadLaneAt({}, {l} & 31u);", it.src));
+            self.line(&format!("xcl_x_put({i}u, {t}_m{i});"));
+            lanes.push(l);
+        }
+        self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+        for (i, (it, l)) in items.iter().zip(lanes.iter()).enumerate() {
+            self.line(&format!(
+                "uint {t}_r{i} = ({l} >> 5) == xcl_half ? {t}_m{i} : ({t}_ok ? xcl_x_get({i}u) : 0u);"
+            ));
+            self.write32(&it.dst, &format!("{t}_r{i}"));
+        }
+        true
+    }
+
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
