@@ -859,6 +859,9 @@ fn xnetworking() -> Vec<(&'static str, usize)> {
         XNetworkingGetConnectivityHint,
         XNetworkingRegisterConnectivityHintChanged,
         XNetworkingUnregisterConnectivityHintChanged,
+        XNetworkingQueryConfigurationSetting,
+        XNetworkingSetConfigurationSetting,
+        XNetworkingQueryStatistics,
     ]
 }
 
