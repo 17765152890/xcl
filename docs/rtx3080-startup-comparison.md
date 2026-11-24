@@ -41,3 +41,7 @@ Each of the final ten two-second activity windows counted 60 accepted host prese
 ### Clean upstream follow-up
 
 The clean `d208e14` build reproduced the 4,095 MiB result and reached the 90-second launcher limit without a reported exception. All final 16 retained two-second intervals counted 60 accepted presents, with zero frame-event timeouts and DirectStorage failures. XCL logged an initial title-requested frame interval of 33,333 µs. This establishes the startup cadence. A visible menu, controller response and any later cadence change remain to be measured. [Upstream revision](https://github.com/ivall/xcl/commit/d208e14b765f469f4b56301b78afa8dac5378339)
+
+### Visible-window follow-up
+
+An isolated 109-file test using a local windowed build based on `d208e14` displayed the Player1, Account Picker, and Screen Narration prompts. The rest of the image stayed dark in two window observations. XCL reported about 30 FPS, and the final ten two-second activity windows each counted 60 accepted presents. The job reached its 180-second cutoff without a reported exception. This verifies visible startup UI. Physical controller response and world rendering are still unverified.
