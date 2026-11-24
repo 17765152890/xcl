@@ -21,6 +21,7 @@ pub mod kernelx;
 pub mod mfplat;
 pub mod netoff;
 pub mod opus;
+mod spatial_audio;
 pub mod user;
 pub mod xaudio2;
 pub mod xma2;
@@ -94,6 +95,7 @@ pub const MINUSERX: &str = "minuserx.dll";
 pub const ACPHAL: &str = "acphal.dll";
 /// controllers (`GameInputCreate`)
 pub const GAMEINPUT: &str = "gameinput.dll";
+const SPATIAL_AUDIO: &str = "xcl-spatial-audio.dll";
 
 fn build(config: &Config) -> Registry {
     let mut modules = vec![
@@ -108,6 +110,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XG, xg::exports(), &[]),
         HleModule::new(ACPHAL, acphal::exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
+        HleModule::new(SPATIAL_AUDIO, spatial_audio::exports(), &[SELF]),
     ];
     let offline = netoff::enabled();
     if offline {
@@ -150,6 +153,10 @@ fn build(config: &Config) -> Registry {
         "ext-ms-win-core-*",
     ] {
         routes.push((p.into(), Route::Hle(k)));
+    }
+    let audio = idx(SPATIAL_AUDIO);
+    for p in ["ole32.dll", "combase.dll"] {
+        routes.push((p.into(), Route::Hle(audio)));
     }
     let x = idx(XGAMERUNTIME);
     for p in ["xgameruntime.dll", "xgameruntime*.dll", "xgameplatform.dll"] {
