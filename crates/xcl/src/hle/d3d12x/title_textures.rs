@@ -973,19 +973,23 @@ unsafe fn copy_readable_range(start: usize, end: usize, dst: *mut u8) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const PAGE: usize = 0x1000;
+    if end <= start {
+        return;
+    }
     let proc = GetCurrentProcess();
-    let mut cur = start;
+    let mut read = 0usize;
+    if ReadProcessMemory(proc, start as *const c_void, dst as *mut c_void, end - start, &mut read) != 0 {
+        return;
+    }
+    // A page inside `[start, end)` became unreadable between VirtualQuery and ReadProcessMemory
+    // (e.g. a streaming thread unmapped physical pages). On Windows, ReadProcessMemory may report
+    // ERROR_PARTIAL_COPY with `read == 0` even when leading pages are readable, so retry the
+    // uncopied remainder one page at a time to preserve every readable page.
+    let mut cur = start.saturating_add(read).min(end);
     while cur < end {
-        let mut read = 0usize;
-        let want = end - cur;
-        let ok = ReadProcessMemory(proc, cur as *const c_void, dst.add(cur - start) as *mut c_void, want, &mut read);
-        if ok != 0 {
-            break;
-        }
-        // A page at `cur + read` became unreadable between VirtualQuery and ReadProcessMemory
-        // (e.g. a streaming thread unmapped physical pages): skip that page (stays zero) and
-        // continue with the remainder of the range.
-        let next = ((cur.saturating_add(read)) & !(PAGE - 1)).saturating_add(PAGE);
+        let next = (cur & !(PAGE - 1)).saturating_add(PAGE).min(end);
+        let mut page_read = 0usize;
+        let _ = ReadProcessMemory(proc, cur as *const c_void, dst.add(cur - start) as *mut c_void, next - cur, &mut page_read);
         if next <= cur {
             break;
         }
@@ -1685,6 +1689,20 @@ mod tests {
             assert!(got[4 * PAGE - 123..(PAGES - 4) * PAGE - 123].iter().all(|&b| b == 0));
             assert!(got[(PAGES - 4) * PAGE - 123..].iter().all(|&b| b == 0xA5));
 
+            // Direct copy_readable_range across a fixed hole (simulating a decommit after
+            // VirtualQuery): leading and trailing readable pages must both be preserved even when
+            // ReadProcessMemory returns ERROR_PARTIAL_COPY with read == 0.
+            for off in [0usize, 0x7b, 0x104d] {
+                let len = SIZE - off - 0x33;
+                let mut direct = vec![0u8; len];
+                copy_readable_range(base + off, base + off + len, direct.as_mut_ptr());
+                let lead = 4 * PAGE - off;
+                let tail_start = (PAGES - 4) * PAGE - off;
+                assert!(direct[..lead].iter().all(|&b| b == 0x5A), "leading pages zeroed at off={off:#x}");
+                assert!(direct[lead..tail_start].iter().all(|&b| b == 0), "hole not zero at off={off:#x}");
+                assert!(direct[tail_start..].iter().all(|&b| b == 0xA5), "trailing pages mismatch at off={off:#x}");
+            }
+
             // Stress the TOCTOU window: one thread toggles commit/decommit on middle pages while
             // read_committed reads the whole span. Previously this faulted with 0xC0000005.
             let stop = Arc::new(AtomicBool::new(false));
@@ -1699,7 +1717,7 @@ mod tests {
                     }
                 }
             });
-            for _ in 0..400 {
+            for _ in 0..1000 {
                 let buf = read_committed(base, SIZE);
                 assert_eq!(buf.len(), SIZE);
                 assert!(buf[..4 * PAGE].iter().all(|&b| b == 0x5A));
