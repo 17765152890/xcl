@@ -1030,6 +1030,58 @@ mod cache_tests {
     }
 
     #[test]
+    fn cached_compiler_arguments_reach_dxc_with_warm_caches() {
+        const TEST: &str = "gpu::recomp::dxc::cache_tests::cached_compiler_arguments_reach_dxc_with_warm_caches";
+        const SRC: &str = "#ifndef XCL_TEST_VALUE\n#define XCL_TEST_VALUE 1\n#endif\nRWByteAddressBuffer dst : register(u0); [numthreads(1, 1, 1)] void main() { dst.Store(0, XCL_TEST_VALUE); }";
+        if let Ok(dir) = std::env::var("XCL_TEST_DXC_CACHE") {
+            use crate::gpu::xbox::tests::{fssm, sample, CODE};
+            let dir = PathBuf::from(dir);
+            let mut f = fssm(&CODE, &[(6, 0)]);
+            for offset in [0x13C, 0x140, 0x144] {
+                f[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            let blob = sample(5, &[f]);
+            let shader = || super::super::pso::console_to_dxil_in(&blob, super::super::pso::Stage::Compute, 0, false, 1);
+            if std::env::var("XCL_TEST_DXC_MODE").unwrap() == "invalid" {
+                assert!(compile_cached_in(&dir, SRC, "main", "cs_6_6").is_err(), "invalid arguments reused cached DXIL");
+                assert!(shader().is_err(), "invalid arguments reused a cached translation");
+            } else {
+                let (first, hit) = compile_cached_in(&dir, SRC, "main", "cs_6_6").unwrap();
+                assert!(!hit, "different compiler arguments reused cached DXIL");
+                let (second, hit) = compile_cached_in(&dir, SRC, "main", "cs_6_6").unwrap();
+                assert!(hit);
+                assert_eq!(first, second);
+                let control = dir.join("default.bin");
+                if std::env::var("XCL_TEST_DXC_MODE").unwrap() == "default" {
+                    std::fs::write(control, first).unwrap();
+                } else {
+                    assert_ne!(first, std::fs::read(control).unwrap(), "DXC did not receive the macro definition");
+                }
+                shader().unwrap();
+            }
+            return;
+        }
+        if location().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-dxc-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (mode, args) in [("default", ""), ("defined", "-D XCL_TEST_VALUE=7 -O1"), ("unoptimized", "-D XCL_TEST_VALUE=7 -O0"), ("invalid", "-xcl-invalid-compiler-option")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("XCL_TEST_DXC_CACHE", &dir)
+                .env("XCL_TEST_DXC_MODE", mode)
+                .env("XCL_DXIL_CACHE", &dir)
+                .env_remove("XCL_TRANSLATED_CACHE")
+                .env_remove("XCL_DXC_ARGS")
+                .envs((!args.is_empty()).then_some(("XCL_DXC_ARGS", args)))
+                .output().unwrap();
+            assert!(output.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_key_tracks_the_dxc_toolchain() {
         let a = cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-a");
         assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-a"));
@@ -1080,42 +1132,6 @@ mod cache_tests {
         assert_eq!(counter.load(Ordering::Relaxed), 2);
         assert_eq!(c, synthetic);
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn compile_cached_in_honors_xcl_dxc_args_env() {
-        let dir = std::env::temp_dir().join(format!("xcl-dxil-env-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let src = "[numthreads(1, 1, 1)] void main() {}";
-
-        // Without XCL_DXC_ARGS
-        std::env::remove_var("XCL_DXC_ARGS");
-        let (a, hit_a) = compile_cached_in_with(&dir, src, "main", "cs_6_6", &env_dxc_args().iter().map(|s| s.as_str()).collect::<Vec<_>>(), || {
-            Ok(synthetic_dxil(15))
-        })
-        .unwrap();
-        assert!(!hit_a);
-
-        // With XCL_DXC_ARGS="-O1": key differs, re-compiles
-        std::env::set_var("XCL_DXC_ARGS", "-O1");
-        let args = env_dxc_args();
-        let (b, hit_b) = compile_cached_in_with(&dir, src, "main", "cs_6_6", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), || {
-            Ok(synthetic_dxil(15))
-        })
-        .unwrap();
-        assert!(!hit_b);
-        assert_eq!(a, b);
-
-        // Same XCL_DXC_ARGS="-O1": hit
-        let args = env_dxc_args();
-        let (_, hit_c) = compile_cached_in_with(&dir, src, "main", "cs_6_6", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), || {
-            panic!("expected cache hit")
-        })
-        .unwrap();
-        assert!(hit_c);
-
-        std::env::remove_var("XCL_DXC_ARGS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
