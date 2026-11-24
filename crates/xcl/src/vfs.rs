@@ -507,9 +507,20 @@ impl Vfs {
         self.record_write(rel);
     }
 
+    fn check_parent_types(&self, rel: &str) -> Result<(), u32> {
+        for (end, _) in rel.match_indices('\\') {
+            let parent = &rel[..end];
+            if self.exists(parent) && !self.is_dir(parent) {
+                return Err(ERROR_PATH_NOT_FOUND);
+            }
+        }
+        Ok(())
+    }
+
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
     /// and return the overlay path.
     pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        self.check_parent_types(rel)?;
         let ov = self.overlay_path(rel);
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
@@ -623,6 +634,7 @@ impl Vfs {
     }
 
     pub fn create_dir(&self, rel: &str) -> Result<(), u32> {
+        self.check_parent_types(rel)?;
         if self.visible_in_overlay(rel) || self.visible_in_original(rel) {
             return Err(ERROR_ALREADY_EXISTS);
         }
@@ -839,6 +851,85 @@ mod tests {
         let Decision::Use(p) = v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
         assert!(p.contains("overlay"));
         assert!(!v.is_whiteout("data\\gone.txt"));
+    }
+
+    #[test]
+    fn creating_files_below_virtual_files_is_rejected() {
+        use windows_sys::Win32::{Foundation::*, Storage::FileSystem::CreateFileW};
+        for overlaid in [false, true] {
+            let f = Fixture::new(if overlaid { "file_parent_ov" } else { "file_parent_orig" });
+            let v = &f.vfs;
+            if overlaid {
+                let ov = v.prepare_write("data\\hello.txt", true).unwrap();
+                std::fs::write(ov, b"overlay").unwrap();
+            }
+            for suffix in ["child.bin", "missing\\child.bin"] {
+                let rel = format!("data\\hello.txt\\{suffix}");
+                let native = crate::util::wide(&f.game().join(&rel).to_string_lossy());
+                for disposition in [CREATE_NEW, CREATE_ALWAYS, OPEN_ALWAYS] {
+                    let h = unsafe {
+                        CreateFileW(native.as_ptr(), GENERIC_WRITE, 7, std::ptr::null(),
+                            disposition, 0, std::ptr::null_mut())
+                    };
+                    let error = unsafe { GetLastError() };
+                    if h != INVALID_HANDLE_VALUE { unsafe { CloseHandle(h); } }
+                    assert_eq!(h, INVALID_HANDLE_VALUE);
+                    assert_eq!(error, ERROR_PATH_NOT_FOUND);
+                    assert_eq!(v.open_decision(&format!("G:\\{rel}"), GENERIC_WRITE, disposition, 0),
+                        Decision::Fail(error), "overlaid={overlaid}, disposition={disposition}, {rel}");
+                }
+            }
+            assert!(!v.is_dir("data\\hello.txt"));
+            assert_eq!(v.visible_in_overlay("data\\hello.txt"), overlaid);
+            assert_eq!(std::fs::read(v.read_path_rel("data\\hello.txt").unwrap()).unwrap(),
+                if overlaid { b"overlay".as_slice() } else { b"original".as_slice() });
+            assert_eq!(std::fs::read(f.game().join("data\\hello.txt")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn creating_directories_below_virtual_files_is_rejected() {
+        use windows_sys::Win32::{Foundation::GetLastError, Storage::FileSystem::CreateDirectoryW};
+        for overlaid in [false, true] {
+            let f = Fixture::new(if overlaid { "dir_parent_ov" } else { "dir_parent_orig" });
+            let v = &f.vfs;
+            if overlaid { v.prepare_write("data\\hello.txt", true).unwrap(); }
+            for suffix in ["child", "missing\\child"] {
+                let rel = format!("data\\hello.txt\\{suffix}");
+                let native = crate::util::wide(&f.game().join(&rel).to_string_lossy());
+                let result = unsafe { CreateDirectoryW(native.as_ptr(), std::ptr::null()) };
+                let error = unsafe { GetLastError() };
+                assert_eq!(result, 0);
+                assert_eq!(error, ERROR_PATH_NOT_FOUND);
+                assert_eq!(v.create_dir(&rel), Err(error), "overlaid={overlaid}, {rel}");
+            }
+            assert!(!v.is_dir("data\\hello.txt"));
+            assert_eq!(v.visible_in_overlay("data\\hello.txt"), overlaid);
+            assert_eq!(std::fs::read(v.read_path_rel("data\\hello.txt").unwrap()).unwrap(), b"original");
+            assert_eq!(std::fs::read(f.game().join("data\\hello.txt")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn missing_or_hidden_file_parents_can_be_recreated() {
+        let f = Fixture::new("missing_parent");
+        let v = &f.vfs;
+        assert_eq!(v.create_dir("saves\\slot1"), Ok(()));
+        let Decision::Use(p) = v.open_decision("G:\\new\\nested\\save.bin", GENERIC_WRITE, CREATE_ALWAYS, 0)
+            else { panic!("missing parents should still be created") };
+        std::fs::write(p, b"save").unwrap();
+        assert!(v.visible_in_overlay("new\\nested\\save.bin"));
+        // A deleted original file is no longer a visible parent and may be replaced by a directory.
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(v.create_dir("data\\gone.txt\\child"), Ok(()));
+        assert!(v.is_dir("data\\gone.txt"));
+        assert_eq!(std::fs::read(f.game().join("data\\gone.txt")).unwrap(), b"bye");
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        let Decision::Use(p) = v.open_decision("G:\\data\\hello.txt\\child.bin", GENERIC_WRITE, CREATE_ALWAYS, 0)
+            else { panic!("a hidden file should not block a new parent") };
+        std::fs::write(p, b"child").unwrap();
+        assert!(v.is_dir("data\\hello.txt"));
+        assert_eq!(std::fs::read(f.game().join("data\\hello.txt")).unwrap(), b"original");
     }
 
     #[test]
