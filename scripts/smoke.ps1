@@ -2,14 +2,17 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title label]
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
+# `title:` is a hash of the folder name (scripts/smoke_title.ps1), not the name itself.
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe')
+    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [string]$Title = ''
 )
+. (Join-Path $PSScriptRoot 'smoke_title.ps1')
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
@@ -73,7 +76,7 @@ $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 xcl-smoke v1
 commit: $commit$(if ($dirty) { ' (uncommitted changes)' })
 gpu: $gpu
-title: $(Split-Path $Game -Leaf)
+title: $(Get-XclSmokeTitle -Game $Game -Title $Title)
 seconds: $Seconds
 exit: $code
 frames shown: $frames
