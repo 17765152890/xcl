@@ -21,6 +21,7 @@ pub mod guard;
 pub mod layout;
 pub mod list_x;
 pub mod null;
+pub mod pipeline_library;
 pub mod present;
 pub mod pso_async;
 pub mod real;
