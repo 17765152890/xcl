@@ -1138,9 +1138,11 @@ mod tests {
             let pop: unsafe extern "system" fn(*mut Hal, *mut Message) -> u32 =
                 std::mem::transmute(vt.add(3).read());
             let release: unsafe extern "system" fn(*mut Hal) = std::mem::transmute(vt.add(5).read());
-            assert_eq!(connect(hal, 4, 4), S_OK);
             let mut m = Message::default();
+            // Before connect there is no frame clock, so the empty channel is a
+            // deterministic FALSE; after connect a queued message wins over any tick.
             assert_eq!(pop(hal, &mut m), 0, "empty channel");
+            assert_eq!(connect(hal, 4, 4), S_OK);
             assert_eq!(submit(hal, 0, 42, 0, std::ptr::null(), 0), S_OK);
             assert_eq!(pop(hal, &mut m), 1);
             assert_eq!((m.kind, m.id), (MSG_COMMAND_DONE, 42));
