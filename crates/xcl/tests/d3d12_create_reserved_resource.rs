@@ -196,6 +196,30 @@ unsafe fn query_tiling(
     (total, packed, shape, sub0)
 }
 
+unsafe fn query_tiling_range(
+    dev: &ID3D12Device,
+    res: &ID3D12Resource,
+    start_sub: u32,
+    count: u32,
+) -> (u32, D3D12_PACKED_MIP_INFO, D3D12_TILE_SHAPE, Vec<D3D12_SUBRESOURCE_TILING>) {
+    let mut total = 0u32;
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut shape = D3D12_TILE_SHAPE::default();
+    let mut actual_count = count;
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); count as usize];
+    dev.GetResourceTiling(
+        res,
+        Some(&mut total),
+        Some(&mut packed),
+        Some(&mut shape),
+        Some(&mut actual_count),
+        start_sub,
+        tilings.as_mut_ptr(),
+    );
+    tilings.truncate(actual_count as usize);
+    (total, packed, shape, tilings)
+}
+
 #[test]
 fn pc_reserved_resources_match_host_driver() {
     unsafe {
@@ -310,6 +334,15 @@ fn pc_reserved_resources_match_host_driver() {
                 assert_eq!(xt.1, ht.1, "{label}: packed_mip_info");
                 assert_eq!(xt.2, ht.2, "{label}: tile_shape");
                 assert_eq!(xt.3, ht.3, "{label}: subresource_tiling[0]");
+
+                if desc.MipLevels > 1 {
+                    let ht_range = query_tiling_range(&dev_for_tiling, &host_res, 1, 2);
+                    let xt_range = query_tiling_range(&dev_for_tiling, &xcl_res, 1, 2);
+                    assert_eq!(xt_range.0, ht_range.0, "{label}: total_tiles (range)");
+                    assert_eq!(xt_range.1, ht_range.1, "{label}: packed_mip_info (range)");
+                    assert_eq!(xt_range.2, ht_range.2, "{label}: tile_shape (range)");
+                    assert_eq!(xt_range.3, ht_range.3, "{label}: subresource_tiling range");
+                }
             } else {
                 assert!(xcl_res_raw.is_null(), "{label}: failed call left non-null output");
             }
