@@ -64,6 +64,24 @@ class Sections(unittest.TestCase):
         body = FILLED.replace("- Windows\n", "<!-- what you could\n     not check -->\n")
         self.assertEqual(problems(body), [empty("Not tested")])
 
+    def test_section_inside_a_comment_is_not_there(self):
+        # the heading and its only result, both commented out
+        body = FILLED.replace("**Tested**\n- `python3 scripts/example.py`: ok\n",
+                              "<!--\n**Tested**\n- `python3 scripts/example.py`: ok\n-->\n")
+        self.assertEqual(problems(body), [empty("Tested")])
+        # the heading is there, its only result is commented out across lines
+        body = FILLED.replace("- Windows\n", "<!--\n- Windows\n-->\n")
+        self.assertEqual(problems(body), [empty("Not tested")])
+
+    def test_heading_is_a_line_of_its_own(self):
+        # a section name in bold at the end of a sentence is not the section's heading
+        body = FILLED.replace("**Tested**\n- `python3 scripts/example.py`: ok\n",
+                              "Nothing here was **Tested**\nas far as I know.\n")
+        self.assertEqual(problems(body), [empty("Tested")])
+        # indented, or with spaces after it, it still is
+        body = FILLED.replace("**Tested**\n", "  **Tested**  \n")
+        self.assertEqual(problems(body), [])
+
     def test_untouched_template_is_refused(self):
         path = os.path.join(HERE, "..", ".github", "pull_request_template.md")
         with open(path, encoding="utf-8") as f:
