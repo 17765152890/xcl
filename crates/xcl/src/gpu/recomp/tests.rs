@@ -7168,6 +7168,45 @@ fn gpu_cmp_class_f16_preserves_snan() {
     }
 }
 
+/// `v_cmp_class_f32` applies VOP3 `abs`/`neg` bitwise on bit 31 and passes raw bits to
+/// `fclass(uint)` so f32 subnormals are not flushed to ±0 (FTZ) and sNaNs are not quieted (#1281).
+#[test]
+fn gpu_cmp_class_f32_bitwise_modifiers_preserve_denorm_and_snan() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // v0 = 0x80000001 (-subnormal) with ABS -> +subnormal (bit 7), NOT +0 (bit 6)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 255), ("ABS", 1)], Some(1 << 7)),
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", 255), ("ABS", 1)], Some(1 << 6)),
+            // v1 = 0x00000001 (+subnormal) with NEG -> -subnormal (bit 4), NOT -0 (bit 5)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 255), ("NEG", 1)], Some(1 << 4)),
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 1), ("SRC1", 255), ("NEG", 1)], Some(1 << 5)),
+            // v2 = 0x7F800001 (sNaN) with NEG -> still sNaN (bit 0), NOT qNaN (bit 1)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 129), ("NEG", 1)], None),
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 2), ("SRC1", 130), ("NEG", 1)], None),
+            // v2 = 0x7F800001 (sNaN) with ABS -> still sNaN (bit 0)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 129), ("ABS", 1)], None),
+            // v1 = 0x00000001 (+subnormal) with ABS+NEG -> -subnormal (bit 4)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", 255), ("ABS", 1), ("NEG", 1)], Some(1 << 4)),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x8000_0001; // -subnormal
+            r[1] = 0x0000_0001; // +subnormal
+            r[2] = 0x7F80_0001; // +sNaN
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} abs(-subnormal) matches +subnormal");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (0, 0), "wave{lanes} abs(-subnormal) not flushed to +0");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), all, "wave{lanes} neg(+subnormal) matches -subnormal");
+        assert_eq!((r.sgpr[6], r.sgpr[7]), (0, 0), "wave{lanes} neg(+subnormal) not flushed to -0");
+        assert_eq!((r.sgpr[8], r.sgpr[9]), all, "wave{lanes} neg(sNaN) matches sNaN");
+        assert_eq!((r.sgpr[10], r.sgpr[11]), (0, 0), "wave{lanes} neg(sNaN) not quieted to qNaN");
+        assert_eq!((r.sgpr[12], r.sgpr[13]), all, "wave{lanes} abs(sNaN) matches sNaN");
+        assert_eq!((r.sgpr[14], r.sgpr[15]), all, "wave{lanes} -abs(+subnormal) matches -subnormal");
+    }
+}
+
 #[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[
