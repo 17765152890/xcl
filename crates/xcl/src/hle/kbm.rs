@@ -190,6 +190,7 @@ const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_ENTERSIZEMOVE: u32 = 0x0231;
 const WM_EXITSIZEMOVE: u32 = 0x0232;
 const WA_INACTIVE: usize = 0;
+const WA_ACTIVE: usize = 1;
 const WA_CLICKACTIVE: usize = 2;
 const RID_INPUT: u32 = 0x1000_0003;
 const RIM_TYPEMOUSE: u32 = 0;
@@ -265,6 +266,19 @@ pub fn attach(hwnd: *mut c_void) {
         "keyboard and mouse play as the gamepad (WASD left stick, mouse right stick, mouse buttons triggers, wheel bumpers){}",
         if ok { "" } else { " – raw mouse input unavailable, the mouse is not read" }
     );
+    // CreateWindowExW (WS_VISIBLE) shows and activates the window before it is attached here:
+    // `on_message` passed over that WM_ACTIVATE (another window's, as far as it knew), and the
+    // mouse went unread until the window was activated again (another window clicked and
+    // back). A window that has the focus already takes the cursor now, as that message would.
+    let wa = attach_activation(unsafe { GetForegroundWindow() } == hwnd);
+    if cursor_hold(WM_ACTIVATE, wa, false) == Some(true) {
+        unsafe { hold_cursor(hwnd, true) };
+    }
+}
+
+/// The WM_ACTIVATE state `attach` stands in for: the window has the focus or it has not.
+fn attach_activation(foreground: bool) -> usize {
+    if foreground { WA_ACTIVE } else { WA_INACTIVE }
 }
 
 unsafe fn hold_cursor(hwnd: *mut c_void, on: bool) {
@@ -560,9 +574,16 @@ mod tests {
         assert_eq!(scancode_to_vk(0xFFFF, SC_Q.1, layout), SC_Q.1);
     }
 
+    /// The window is activated inside CreateWindowExW, before `attach`: `attach` takes the
+    /// cursor of a window that has the focus by then, and leaves it free otherwise.
+    #[test]
+    fn a_window_attached_with_the_focus_takes_the_cursor() {
+        assert_eq!(cursor_hold(WM_ACTIVATE, attach_activation(true), false), Some(true));
+        assert_ne!(cursor_hold(WM_ACTIVATE, attach_activation(false), false), Some(true));
+    }
+
     #[test]
     fn title_bar_clicks_leave_the_cursor_free() {
-        const WA_ACTIVE: usize = 1;
         // clicking the title bar of an inactive window: activation by click, then a move loop
         assert_eq!(cursor_hold(WM_ACTIVATE, WA_CLICKACTIVE, false), None);
         assert_eq!(cursor_hold(WM_ENTERSIZEMOVE, 0, false), Some(false));
