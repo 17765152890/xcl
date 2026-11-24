@@ -92,8 +92,6 @@ unsafe impl Send for Global {}
 static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
 static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
-const GLOBAL_MAX: u32 = 1 << 21;
 
 /// view slots per page of a heap's place in the shared heap (2 PC descriptors each)
 pub const PAGE_SLOTS: u32 = 256;
@@ -133,35 +131,83 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         if GLOBAL_FAILED.load(Relaxed) {
             return false;
         }
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        let max = if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.MaxViewDescriptorHeapSize > 0 {
-            o.MaxViewDescriptorHeapSize
-        } else {
-            1_000_000
-        };
-        let cap = max.min(GLOBAL_MAX);
-        let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
+        let size = crate::gpu::desc::VIEW_HEAP_SIZE;
+        let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: size, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
         let heap: ID3D12DescriptorHeap = match dev.CreateDescriptorHeap(&d) {
             Ok(h) => h,
             Err(e) => {
                 GLOBAL_FAILED.store(true, Relaxed);
-                crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap of {cap} ({e}) – each keeps its own");
+                crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap of {size} ({e}) – each keeps its own");
                 return false;
             }
         };
-        crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
+        crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {size} view descriptors for all of them");
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        write_null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr, inc as usize);
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
-            cap,
+            // the null views at the end are no one's
+            cap: crate::gpu::desc::NULL_VIEWS,
             next: 0,
             free: Vec::new(),
         });
     }
     true
+}
+
+/// The null SRVs and UAVs (`desc::null_srv` / `null_uav`, one of each texture type) of the
+/// shader-visible heap whose first descriptor is at `cpu`: recompiled shaders read and write
+/// there through a T# whose word 0 is no heap index.
+pub(crate) unsafe fn write_null_views(dev: &ID3D12Device, cpu: usize, inc: usize) {
+    use crate::gpu::desc::{null_srv, null_uav, NULL_SRV_TYPES, NULL_UAV_TYPES};
+    use std::mem::{offset_of, size_of, transmute};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UNORM};
+    let srv = |ty: &str| {
+        let (dim, view) = match ty {
+            "1D" => (D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1D: D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() } }),
+            "2D" => (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } }),
+            "3D" => (D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture3D: D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() } }),
+            "CubeArray" => (D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: 1, ..Default::default() } }),
+            "1DArray" => (D3D12_SRV_DIMENSION_TEXTURE1DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture1DArray: D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() } }),
+            "2DArray" => (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() } }),
+            _ => (D3D12_SRV_DIMENSION_TEXTURE2DMS, D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DMS: D3D12_TEX2DMS_SRV::default() }),
+        };
+        D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ViewDimension: dim, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, Anonymous: view }
+    };
+    let uav = |ty: &str| {
+        let (dim, view) = match ty {
+            "1D" => (D3D12_UAV_DIMENSION_TEXTURE1D, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture1D: D3D12_TEX1D_UAV::default() }),
+            "2D" => (D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV::default() }),
+            "3D" => (D3D12_UAV_DIMENSION_TEXTURE3D, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture3D: D3D12_TEX3D_UAV { WSize: 1, ..Default::default() } }),
+            "1DArray" => (D3D12_UAV_DIMENSION_TEXTURE1DARRAY, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture1DArray: D3D12_TEX1D_ARRAY_UAV { ArraySize: 1, ..Default::default() } }),
+            _ => (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_UAV { ArraySize: 1, ..Default::default() } }),
+        };
+        D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT_R32_UINT, ViewDimension: dim, Anonymous: view }
+    };
+    let at = |k: u32| cpu + k as usize * inc;
+    // an adopted device's own methods: XCL's take handles into console heaps
+    use std::ffi::c_void;
+    use windows::core::Interface;
+    type Srv = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, usize);
+    type Uav = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, usize);
+    let raw = dev.as_raw();
+    let (create_srv, create_uav): (Srv, Uav) = if super::real::is_adopted(raw) {
+        const SRV: usize = offset_of!(ID3D12Device_Vtbl, CreateShaderResourceView) / size_of::<usize>();
+        const UAV: usize = offset_of!(ID3D12Device_Vtbl, CreateUnorderedAccessView) / size_of::<usize>();
+        (transmute(super::real::orig_fn(raw, SRV)), transmute(super::real::orig_fn(raw, UAV)))
+    } else {
+        (transmute(dev.vtable().CreateShaderResourceView), transmute(dev.vtable().CreateUnorderedAccessView))
+    };
+    for ty in NULL_SRV_TYPES {
+        create_srv(raw, std::ptr::null_mut(), &srv(ty), at(null_srv(ty)));
+    }
+    for ty in NULL_UAV_TYPES {
+        create_uav(raw, std::ptr::null_mut(), std::ptr::null_mut(), &uav(ty), at(null_uav(ty)));
+    }
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or

@@ -166,7 +166,8 @@ struct Bound {
 /// Create the descriptor heaps (always, so the directly indexed root signature is valid),
 /// the test textures and samplers; record the uploads into `list`.
 unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler]) -> Result<Bound, String> {
-    let n = (2 * textures.len()).max(2) as u32;
+    // with textures: the heap translated shaders get in a title, with its null views at the end
+    let n = if textures.is_empty() { 2 } else { crate::gpu::desc::VIEW_HEAP_SIZE };
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -186,6 +187,9 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
     let sinc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
     let at = |h: &ID3D12DescriptorHeap, k: usize, step: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + k * step };
+    if !textures.is_empty() {
+        crate::hle::d3d12x::console_heap::write_null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr, inc);
+    }
     for (j, sm) in samplers.iter().enumerate() {
         let mut sd = D3D12_SAMPLER_DESC {
             Filter: sm.filter,

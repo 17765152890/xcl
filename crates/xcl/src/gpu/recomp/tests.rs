@@ -7452,3 +7452,100 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+/// A T# whose word 0 is no heap index (a console address the title wrote without a view) must
+/// not index past the shader-visible heap: RADV faulted on the GPU (SQC page fault at heap start
+/// + word 0 · 32, device removed) while a retail game streamed its world. Such a T# reads the
+/// null SRV at the heap's end (0) and its stores and atomics go to the null UAV (dropped), while
+/// a real view next to it still works.
+#[test]
+fn gpu_image_with_no_heap_index_reads_zero_and_drops_writes() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // garbage T# in s[16:23] (SRSRC = 4), S# in s[24:27] (SSAMP = 6); real UAV T# in s[32:39] (8)
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 14), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_UMAX", &[("VDATA", 7), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    // the other texture types, each through its own null view
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 2)]));
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 3)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 24), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 5), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 2), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 3), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    // a null view's T# (all zero, s[40:47]) does not read the view at index 0; a real T# of it does
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 25), ("VADDR", 3), ("SRSRC", 10), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 26), ("VADDR", 3), ("SRSRC", 12), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    let mut garbage = tsharp(0, 77, 9);
+    garbage[0] = 0x9e55_ff68; // a console address, far past the heap
+    st.sgpr[16..24].copy_from_slice(&garbage);
+    st.sgpr[24..28].copy_from_slice(&[0, 0, 0, 0]);
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 20, 9));
+    st.sgpr[40..48].copy_from_slice(&[0; 8]);
+    st.sgpr[48..56].copy_from_slice(&tsharp(0, 77, 9));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(0.5);
+        r[1] = f(0.5);
+        r[3] = (l % 4) as u32;
+        r[4] = l as u32 / 4; // lanes 16.. land outside the 4x4 texture: their stores are dropped
+        r[5] = 0;
+        r[6] = 10 * l as u32 + 1;
+        r[7] = 0xFFFF_FFFF;
+        for v in 10..27 {
+            r[v] = 0xDEAD_BEEF;
+        }
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: vec![0x3F; 256], uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
+    ];
+    let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    for l in 0..64 {
+        assert_eq!(&r.vgpr[l][10..14], &[0, 0, 0, 0], "lane {l}: sample through the null SRV");
+        assert_eq!(r.vgpr[l][14], 0, "lane {l}: load through the null SRV");
+        assert_eq!(&r.vgpr[l][16..24], &[0; 8], "lane {l}: 3D and cube samples through their null SRVs");
+        assert_eq!(r.vgpr[l][24], 0, "lane {l}: 2D array load through its null SRV");
+        assert_eq!(r.vgpr[l][25], 0, "lane {l}: load through an all-zero T#");
+        // (lanes 16.. load outside the texture: 0)
+        assert_eq!(r.vgpr[l][26], if l < 16 { 0x3F3F_3F3F } else { 0 }, "lane {l}: load through a real T# of view 0");
+    }
+    // the real UAV got only its own stores: none of the garbage T#'s writes landed in it
+    let t1: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for (i, &v) in t1.iter().enumerate() {
+        assert_eq!(v, 10 * i as u32 + 1, "real UAV texel {i}");
+    }
+}
+
+/// Each image declaration falls back to the null view of its own texture type, in 12 slots past
+/// every view: D3D12 needs a null view's dimension to match the declaration (a Texture2D null
+/// view for a Texture3D read is undefined on Windows drivers; RADV does not mind).
+#[test]
+fn image_declarations_fall_back_to_the_null_view_of_their_type() {
+    use crate::gpu::desc::{null_srv, null_uav, NULL_SRV_TYPES, NULL_UAV_TYPES, NULL_VIEWS, VIEW_HEAP_SIZE};
+    let mut slots: Vec<u32> = NULL_SRV_TYPES.iter().map(|t| null_srv(t)).chain(NULL_UAV_TYPES.iter().map(|t| null_uav(t))).collect();
+    slots.sort();
+    slots.dedup();
+    assert_eq!(slots, (NULL_VIEWS..VIEW_HEAP_SIZE).collect::<Vec<_>>());
+    let code = prog(&[
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 2)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 3)], None),
+        ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 14), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 5), ("UNORM", 1)], None),
+        ("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 6), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 2), ("UNORM", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    for (decl, null) in [(" Texture3D<", null_srv("3D")), (" TextureCubeArray<", null_srv("CubeArray")), (" Texture2DArray<", null_srv("2DArray")), (" RWTexture3D<", null_uav("3D"))] {
+        let line = t.hlsl.lines().find(|l| l.contains(decl) && l.contains("ResourceDescriptorHeap")).unwrap_or_else(|| panic!("no{decl}: {}", t.hlsl));
+        assert!(line.contains(&format!(" : {null}u)")), "{line}");
+    }
+}
