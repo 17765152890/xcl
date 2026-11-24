@@ -91,14 +91,20 @@ fn enc(name: &str) -> String {
     out
 }
 
+/// Inverse of `enc`. Reads the escape's digits as bytes, not as a slice of `file`: a name put in
+/// the save folder by hand may have a multi-byte character after '%', and slicing into it would
+/// panic in the `extern "system"` callers.
 fn dec(file: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
     let b = file.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&file[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -815,6 +821,23 @@ mod tests {
     unsafe extern "system" fn blob_names(i: *const BlobInfo, ctx: *mut c_void) -> bool {
         (*(ctx as *mut Vec<(String, u32)>)).push((from_cstr_ptr((*i).name).unwrap(), (*i).size));
         true
+    }
+
+    /// A name placed in the save folder by hand: '%' before a multi-byte character or a sign is
+    /// kept as written instead of panicking or being read as an escape (#325).
+    #[test]
+    fn dec_keeps_percent_not_followed_by_two_hex_digits() {
+        assert_eq!(dec("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(dec("%\u{e9}"), "%\u{e9}");
+        assert_eq!(dec("x%4\u{20ac}y"), "x%4\u{20ac}y");
+        assert_eq!(dec("%+1"), "%+1");
+        assert_eq!(dec("%-1"), "%-1");
+        assert_eq!(dec("%2F%2f%"), "//%");
+        assert_eq!(dec("%4"), "%4");
+        assert_eq!(dec("%41%C3%A9"), "A\u{e9}");
+        for name in ["slot/1", "a%b", "\u{e9}t\u{e9}.sav", "CON.dat", "save."] {
+            assert_eq!(dec(&enc(name)), name);
+        }
     }
 
     /// Names Windows does not keep as file names (device names, a trailing dot or space,
