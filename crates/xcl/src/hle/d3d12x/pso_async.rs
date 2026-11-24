@@ -14,6 +14,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
+    /// a second copy of the build, for a bind that waits too long on the worker building `job`
+    second: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
@@ -40,28 +42,38 @@ impl Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
-/// The build is done (`real`: its pipeline, 0 = failed).
+/// The build is done (`real`: its pipeline, 0 = failed). The first build to finish is the
+/// pipeline (a bind's second copy and the worker's may both end: the later one is released).
 fn complete(p: &Pending, real: usize) {
+    let mut done = p.done.lock().unwrap();
+    if *done {
+        drop(done);
+        release(real);
+        return;
+    }
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
-    let orphan = {
-        let mut done = p.done.lock().unwrap();
-        let orphan = p.orphan.load(Ordering::Acquire);
-        if !orphan {
-            p.real.store(real, Ordering::Release);
-        }
-        *done = true;
-        p.cv.notify_all();
-        orphan
-    };
+    let orphan = p.orphan.load(Ordering::Acquire);
+    if !orphan {
+        p.real.store(real, Ordering::Release);
+    }
+    *done = true;
+    p.cv.notify_all();
+    drop(done);
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
     if orphan {
         release(real);
     }
 }
+
+/// How long a bind waits for the worker that is building its pipeline before it builds a
+/// second copy itself (`XCL_PSO_HELP_MS`; 0: never).
+static HELP_AFTER: std::sync::LazyLock<std::time::Duration> = std::sync::LazyLock::new(|| {
+    std::time::Duration::from_millis(std::env::var("XCL_PSO_HELP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(250))
+});
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 
@@ -124,8 +136,15 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 }
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+    submit_second(standin, compute, job, send, key, None)
+}
+
+/// `submit_as` with a build of a second copy: a bind that waits longer than `HELP_AFTER` on
+/// the worker building `job` builds it itself (`resolve_wait`).
+pub fn submit_second(standin: usize, compute: bool, job: Job, send: bool, key: u64, second: Option<Job>) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
+        second: Mutex::new(second),
         sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
@@ -319,6 +338,47 @@ mod used_tests {
     }
 }
 
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// A bind that waits on a worker whose build is slow makes a second copy after the grace
+    /// period and is done long before the worker; the worker's late result is not the pipeline.
+    #[test]
+    fn a_bind_waiting_on_a_slow_worker_builds_a_second_copy() {
+        let slow = 0x7E57_7011usize;
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let (s, e) = (started.clone(), finished.clone());
+        // the worker's build takes 3 s and then has failed (0: nothing to release)
+        let worker = Box::new(move || {
+            s.store(true, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            e.store(true, Ordering::Release);
+            0usize
+        });
+        submit_second(slow, true, worker, true, 0, Some(Box::new(|| 0x5556)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(started.load(Ordering::Acquire), "a worker is building it");
+        let start = std::time::Instant::now();
+        let real = resolve_wait(slow);
+        let waited = start.elapsed();
+        assert_eq!(real, 0x5556, "the second copy's build is the pipeline");
+        assert!(waited < std::time::Duration::from_millis(1500), "not held up by the worker: {waited:?}");
+        // the worker's build ends afterwards and does not replace it
+        while !finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(resolve(slow), 0x5556);
+        released(slow);
+    }
+}
+
 fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
@@ -341,16 +401,30 @@ pub fn resolve(pso: usize) -> usize {
 
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// When a worker is building it and that takes long, the thread builds a second copy after
+/// `HELP_AFTER` and the first of the two to finish is the pipeline: a retail title's world
+/// loading waited on one slow build at a time with the rest of the machine idle.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
+    if let Some(job) = p.job.lock().unwrap().take() {
         complete(&p, job());
-    }
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
+    } else {
+        let start = std::time::Instant::now();
+        let mut done = p.done.lock().unwrap();
+        while !*done && start.elapsed() < *HELP_AFTER {
+            (done, _) = p.cv.wait_timeout(done, *HELP_AFTER - start.elapsed()).unwrap();
+        }
+        let second = if *done { None } else { p.second.lock().unwrap().take() };
+        drop(done);
+        // (None: another bind took it, or there is none: wait for the worker as before)
+        if let Some(job) = second {
+            complete(&p, job());
+        }
+        let mut done = p.done.lock().unwrap();
+        while !*done {
+            done = p.cv.wait(done).unwrap();
+        }
     }
     match p.real.load(Ordering::Acquire) {
         0 => pso,

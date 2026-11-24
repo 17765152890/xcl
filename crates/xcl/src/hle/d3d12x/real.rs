@@ -3956,6 +3956,18 @@ unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid:
     finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
 }
 
+/// `OwnedDesc` shared by a worker's build and the second copy a bind may make of it: both
+/// only read it.
+#[derive(Clone)]
+struct SharedDesc(std::sync::Arc<OwnedDesc>);
+unsafe impl Send for SharedDesc {}
+unsafe impl Sync for SharedDesc {}
+impl SharedDesc {
+    fn get(&self) -> &OwnedDesc {
+        &self.0
+    }
+}
+
 /// Hand the title `standin`'s result now and build the real pipeline with `build` on a worker.
 unsafe fn go_background(
     this: *mut c_void,
@@ -3976,21 +3988,24 @@ unsafe fn go_background(
         }
         return None;
     }
-    let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
-    let job: super::pso_async::Job = Box::new(move || {
-        let mut out: *mut c_void = std::ptr::null_mut();
-        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-            out as usize
-        } else {
-            0
-        }
-    });
-    if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
-    } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
-    }
+    // the worker's build, and one of a second copy a bind makes when it waits too long on
+    // that worker (`pso_async::resolve_wait`)
+    let owned = SharedDesc(std::sync::Arc::new(owned));
+    let dev = Dev(this as usize, f as usize);
+    let once = |owned: SharedDesc| -> super::pso_async::Job {
+        Box::new(move || {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            if unsafe { build(dev, owned.get(), &mut out) } && !out.is_null() {
+                out as usize
+            } else {
+                0
+            }
+        })
+    };
+    let (job, second) = (once(owned.clone()), Some(once(owned)));
+    let lazy = super::pso_async::lazy();
+    super::pso_async::submit_second(*ppv as usize, compute, job, lazy, if lazy { key } else { 0 }, second);
     Some(hr)
 }
 
