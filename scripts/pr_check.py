@@ -46,7 +46,7 @@ def number(s):
 def runtime(path):
     """Whether `path` is runtime code (built into xcl.exe), not one of its test files: a `tests.rs`
     or `*_tests.rs` module, or a file under a `tests/` directory. Only whole names count, so a
-    runtime module such as `requests.rs` or `hle/testsupport/mod.rs` still needs a regression run."""
+    runtime module such as `contests.rs` or `hle/testsupport/mod.rs` still needs a regression run."""
     if not path.startswith("crates/xcl/src/"):
         return False
     *dirs, name = path[len("crates/xcl/src/"):].split("/")

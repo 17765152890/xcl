@@ -32,7 +32,7 @@ class RuntimePaths(unittest.TestCase):
                 self.assertFalse(pr_check.runtime(path))
 
     def test_a_runtime_file_named_like_a_test_still_needs_a_regression_run(self):
-        problems = pr_check.check(BODY, "0123456789ab", files("crates/xcl/src/net/requests.rs"), lambda sha: True)
+        problems = pr_check.check(BODY, "0123456789ab", files("crates/xcl/src/hle/contests.rs"), lambda sha: True)
         self.assertTrue(any("Regression run" in p for p in problems), problems)
 
     def test_a_test_only_pr_needs_no_regression_run(self):
