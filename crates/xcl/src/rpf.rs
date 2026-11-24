@@ -37,11 +37,19 @@ fn extraction_path(out: &Path, name: &str, offset: usize, used: &mut BTreeSet<Pa
 
     let mut n = 0usize;
     loop {
-        let suffix = if n == 0 {
+        let mut suffix = if n == 0 {
             format!("{safe}.{offset:08x}")
         } else {
             format!("{safe}.{offset:08x}.{n}")
         };
+        if suffix.len() > 255 {
+            // Keep the collision suffix while shortening the original name.
+            let mut end = safe.len() - (suffix.len() - 255);
+            while !safe.is_char_boundary(end) {
+                end -= 1;
+            }
+            suffix.replace_range(end..safe.len(), "");
+        }
         let path = out.join(suffix);
         if !path.exists() && used.insert(path.clone()) {
             return path;
@@ -66,10 +74,11 @@ fn atomic_write_with(
     before_commit: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no parent"))?;
-    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no file name"))?;
+    path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no file name"))?;
     let (temporary, mut file) = loop {
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{}.tmp.{}.{id}", name.to_string_lossy(), std::process::id()));
+        // Scanned record names start with a letter or underscore, never this dot prefix.
+        let candidate = parent.join(format!(".xcl-rpf.tmp.{}.{id}", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
             Ok(file) => break (TempPath(candidate), file),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
