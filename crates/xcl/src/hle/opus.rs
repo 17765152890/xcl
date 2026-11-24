@@ -1086,6 +1086,16 @@ struct MftDecoder {
     timestamp_100ns: i64,
 }
 
+/// Index of the output type to use: the first PCM16 one, else the first Float32 one, among the
+/// types with the channel count the decoder interleaves for (another count would read out of bounds).
+fn choose_output_type(offered: &[(OutputSampleFormat, u16)], channels: u16) -> Option<usize> {
+    let of = |f: OutputSampleFormat| offered.iter().position(|&(k, c)| k == f && c == channels);
+    of(OutputSampleFormat::Pcm16).or_else(|| of(OutputSampleFormat::Float32))
+}
+
+/// `MF_E_TRANSFORM_STREAM_CHANGE` answers in a row `drain_output` accepts before giving up.
+const MAX_STREAM_CHANGES: u32 = 4;
+
 impl MftDecoder {
     fn new(channels: u16, sample_rate: u32, head_bytes: Option<&[u8]>) -> Result<Self, String> {
         let rt = mf_runtime()?;
@@ -1142,7 +1152,7 @@ impl MftDecoder {
     }
 
     unsafe fn configure_output(&mut self) -> Result<(), String> {
-        let mut chosen: Option<(IMFMediaType, OutputSampleFormat, u32, u16)> = None;
+        let mut offered: Vec<(IMFMediaType, OutputSampleFormat, u32, u16)> = Vec::new();
         for idx in 0..32u32 {
             let Ok(mt) = self.mft.GetOutputAvailableType(0, idx) else {
                 break;
@@ -1154,15 +1164,16 @@ impl MftDecoder {
             let rate = mt.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000);
             let ch = mt.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(self.channels as u32) as u16;
             if sub == MFAudioFormat_PCM && bits == 16 {
-                chosen = Some((mt, OutputSampleFormat::Pcm16, rate, ch));
-                break;
-            }
-            if sub == MFAudioFormat_Float && bits == 32 && chosen.is_none() {
-                chosen = Some((mt, OutputSampleFormat::Float32, rate, ch));
+                offered.push((mt, OutputSampleFormat::Pcm16, rate, ch));
+            } else if sub == MFAudioFormat_Float && bits == 32 {
+                offered.push((mt, OutputSampleFormat::Float32, rate, ch));
             }
         }
-        let (mt, fmt, rate, ch) =
-            chosen.ok_or_else(|| "MSOpusDecoder offered no PCM16 or Float32 output type".to_string())?;
+        let kinds: Vec<(OutputSampleFormat, u16)> = offered.iter().map(|o| (o.1, o.3)).collect();
+        let pick = choose_output_type(&kinds, self.channels).ok_or_else(|| {
+            format!("MSOpusDecoder offered no PCM16 or Float32 output type with {} channel(s)", self.channels)
+        })?;
+        let (mt, fmt, rate, ch) = offered.swap_remove(pick);
         self.mft
             .SetOutputType(0, &mt, 0)
             .map_err(|e| format!("SetOutputType: {e}"))?;
@@ -1238,6 +1249,7 @@ impl MftDecoder {
     }
 
     unsafe fn drain_output(&mut self, rt: &MfRuntime, out: &mut Vec<i16>) -> Result<(), String> {
+        let mut stream_changes = 0u32;
         loop {
             let alloc_sample = if self.mft_provides_samples {
                 None
@@ -1269,6 +1281,10 @@ impl MftDecoder {
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    stream_changes += 1;
+                    if stream_changes > MAX_STREAM_CHANGES {
+                        return Err("MSOpusDecoder kept changing its output type".to_string());
+                    }
                     self.configure_output()?;
                     continue;
                 }
@@ -1615,6 +1631,16 @@ pub(crate) mod tests {
     /// count and the mapping table, for 3 to 8 channels. 6.1 is 5 streams, 2 of them coupled
     /// (L/R and SL/SR; C, BC and LFE are single) – streams + coupled = channels holds for a
     /// wrong table as well, so the values are listed.
+    #[test]
+    fn output_type_choice_needs_the_decoders_channel_count() {
+        use OutputSampleFormat::{Float32, Pcm16};
+        assert_eq!(choose_output_type(&[(Pcm16, 2), (Pcm16, 1)], 1), Some(1));
+        assert_eq!(choose_output_type(&[(Float32, 1), (Pcm16, 1)], 1), Some(1), "PCM16 wins over Float32");
+        assert_eq!(choose_output_type(&[(Float32, 2), (Float32, 1)], 1), Some(1));
+        assert_eq!(choose_output_type(&[(Pcm16, 2), (Float32, 6)], 1), None, "no type with the wanted channels");
+        assert_eq!(choose_output_type(&[], 2), None);
+    }
+
     #[test]
     fn opus_head_vorbis_channel_mappings_match_rfc7845() {
         let table: [(u8, u8, u8, &[u8]); 6] = [
