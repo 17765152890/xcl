@@ -309,16 +309,23 @@ pub fn activity() -> [u64; 4] {
     ACTIVITY.each_ref().map(|a| a.load(Ordering::Relaxed))
 }
 
-/// device #80 WaitFrameEventX(type, timeout ms, ancillary, flags, token in/out)
-/// `XCL_TRACE_FRAME_EVENTS`: the title's frame-event calls (the first 40)
-fn trace_calls(what: std::fmt::Arguments) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    static N: AtomicU64 = AtomicU64::new(0);
-    if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FRAME_EVENTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 40 {
-        crate::xlog_info!("frame events: {what}");
+/// `XCL_TRACE_FRAME_EVENTS`: up to 40 lines for each call group.
+fn trace_frame_events(counter: &AtomicU64, what: std::fmt::Arguments) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let enabled = *ON.get_or_init(|| {
+        crate::hle::kernelx::keep_last_error(|| std::env::var_os("XCL_TRACE_FRAME_EVENTS").is_some())
+    });
+    if enabled && counter.fetch_add(1, Ordering::Relaxed) < 40 {
+        crate::hle::kernelx::keep_last_error(|| crate::xlog_info!("frame events: {what}"));
     }
 }
 
+fn trace_calls(what: std::fmt::Arguments) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    trace_frame_events(&N, what);
+}
+
+/// device #80 WaitFrameEventX(type, timeout ms, ancillary, flags, token in/out)
 pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, timeout_ms: u32, block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
     trace_calls(format_args!("WaitFrameEventX(type {ty}, timeout {timeout_ms} ms, block {block:p}, flags {flags:#x}, token in {:#x})", if token.is_null() { 0 } else { *token }));
     let internal = with(|c| ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled).then(|| c.kinds[ty as usize].internal as usize));
@@ -389,29 +396,41 @@ pub fn mark_flipped(token: u64) {
         let n = f.len() - FLIPPED_KEEP;
         f.drain(..n);
     }
+    drop(f);
+    static N: AtomicU64 = AtomicU64::new(0);
+    trace_frame_events(&N, format_args!("PresentX recorded flip token={token:#x}"));
 }
 
 /// device #81 GetFrameStatisticsX(token, type, count in/out, statistics): one record
 /// `{ u32 type; …; i64 origin qpc @0x10; i64 flip qpc @0x18 }` once the frame was flipped.
 pub unsafe extern "system" fn frame_statistics_x(_this: *mut std::ffi::c_void, token: u64, ty: u32, count: *mut u32, stats: *mut u8) -> HRESULT {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let trace_result = |capacity: Option<u32>, exact_match: Option<bool>, count_out: Option<u32>, hr: HRESULT| {
+        trace_frame_events(&N, format_args!(
+            "GetFrameStatisticsX #81 token={token:#x} type={ty} capacity={capacity:?} exact_match={exact_match:?} count_out={count_out:?} hr={:#010x}",
+            hr as u32,
+        ));
+        hr
+    };
     if count.is_null() || stats.is_null() {
-        return E_INVALIDARG;
+        return trace_result(None, None, None, E_INVALIDARG);
     }
     let flipped = FLIPPED.lock().unwrap().iter().rev().find(|f| f.0 == token).map(|f| (f.1, f.2));
     ACTIVITY[2].fetch_add(1, Ordering::Relaxed);
     let Some((origin, flip)) = flipped else {
         ACTIVITY[3].fetch_add(1, Ordering::Relaxed);
         *count = 0;
-        return E_FAIL;
+        return trace_result(None, Some(false), Some(0), E_FAIL);
     };
-    if *count < 1 {
-        return E_INVALIDARG;
+    let capacity = *count;
+    if capacity < 1 {
+        return trace_result(Some(capacity), Some(true), Some(capacity), E_INVALIDARG);
     }
     *count = 1;
     (stats as *mut u32).write_unaligned(ty);
     (stats.add(0x10) as *mut i64).write_unaligned(if origin != 0 && origin <= flip { origin } else { flip });
     (stats.add(0x18) as *mut i64).write_unaligned(flip);
-    S_OK
+    trace_result(Some(capacity), Some(true), Some(1), S_OK)
 }
 
 /// sleep until `deadline` (qpc); false: woken by a change of the schedule
@@ -567,6 +586,12 @@ mod tests {
             let (origin, flip) = (i64::from_le_bytes(st[0x10..0x18].try_into().unwrap()), i64::from_le_bytes(st[0x18..0x20].try_into().unwrap()));
             assert!(n == 1 && origin > 0 && origin <= flip);
             assert_eq!(frame_statistics_x(dev, 0xDEAD, 0, &mut n, st.as_mut_ptr()), E_FAIL);
+            assert_eq!(n, 0);
+            let before = st;
+            assert_eq!(frame_statistics_x(dev, tokens[2], 2, &mut n, st.as_mut_ptr()), E_INVALIDARG);
+            assert_eq!((n, st), (0, before));
+            assert_eq!(frame_statistics_x(dev, tokens[2], 2, std::ptr::null_mut(), st.as_mut_ptr()), E_INVALIDARG);
+            assert_eq!(st, before);
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 16000, 1, 0), E_INVALIDARG);
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
         }
