@@ -692,7 +692,9 @@ fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, 
         // a jump into the loop that starts right after: the rotated form (the jump itself is
         // the loop entry, emitted as nothing)
         Term::Jump(u) if rotated_loop(c, start, end, u, lo, hi).is_some() => Item::Block { start, end, raise: None },
-        Term::Cond(t) if nest < MAX_NEST && t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) && !inside(start, t) => {
+        // (in the if branch of an if / else, `hi` is the start of the else branch: a jump to it is no
+        // skip to the end of the branch – the branch ends with the jump over the else – but a jump into the else)
+        Term::Cond(t) if nest < MAX_NEST && t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) && !inside(start, t) && !(t == hi && exit.is_some()) => {
             // if / else only when both branches are structured on their own, the if branch
             // does not jump into the else branch and no earlier jump lands in it; otherwise a
             // plain if (the else branch then runs under the skip flag of the jump over it)

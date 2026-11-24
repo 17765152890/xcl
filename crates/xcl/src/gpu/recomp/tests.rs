@@ -7187,3 +7187,49 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+/// Run a scalar-only program with the given options (wave64 where the GPU has it) and return
+/// the scalar registers 0..16 after it.
+fn run_scalar_program(code: &[u8], structured: bool, inputs: &[(usize, u32)]) -> Vec<u32> {
+    let wave64 = runner::wave64_supported() == Ok(true);
+    let t = translate(code, &Options { wave64, structured, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut st = KernelState::default();
+    for &(r, v) in inputs {
+        st.sgpr[r] = v;
+    }
+    runner::run(&dxil, &st, &mem).unwrap().sgpr[..16].to_vec()
+}
+
+/// `if (s10 != 0) { s0 = 1; if (s11 != 0) { s1 = 1; goto end } else-start }`: a conditional jump
+/// from the if branch to the first block of the else branch must run the else branch.
+#[test]
+fn gpu_a_jump_from_the_if_branch_to_the_else_branch_runs_it() {
+    if !gpu_ready() {
+        return;
+    }
+    let one = |r: u64| ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 129)], None::<u32>);
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_CMP_EQ_U32", "ENC_SOPC", vec![("SSRC0", 10), ("SSRC1", 128)], None), //  0
+        ("S_CBRANCH_SCC1", "ENC_SOPP", vec![("SIMM16", 5)], None),               //  4: → else (28)
+        one(0),                                                                  //  8: if branch
+        ("S_CMP_EQ_U32", "ENC_SOPC", vec![("SSRC0", 11), ("SSRC1", 128)], None), // 12
+        ("S_CBRANCH_SCC1", "ENC_SOPP", vec![("SIMM16", 2)], None),               // 16: → else (28)
+        one(1),                                                                  // 20
+        ("S_BRANCH", "ENC_SOPP", vec![("SIMM16", 1)], None),                     // 24: → end (32)
+        one(2),                                                                  // 28: else
+        one(3),                                                                  // 32: end
+    ];
+    let borrowed: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let code = prog(&borrowed);
+    // (s10, s11) → s0..s3
+    let cases = [((0, 0), [0, 0, 1, 1]), ((0, 1), [0, 0, 1, 1]), ((1, 0), [1, 0, 1, 1]), ((1, 1), [1, 1, 0, 1])];
+    for structured in [true, false] {
+        for ((a, b), want) in cases {
+            let s = run_scalar_program(&code, structured, &[(10, a), (11, b)]);
+            assert_eq!(&s[..4], &want, "structured: {structured}, s10 = {a}, s11 = {b}");
+        }
+    }
+}
