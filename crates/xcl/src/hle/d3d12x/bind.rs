@@ -17,6 +17,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
+use super::indirect;
 
 #[derive(Default)]
 struct State {
@@ -222,22 +223,15 @@ fn note_address(va: u64) {
     }
 }
 
-/// command signatures that change root arguments (they need the title's root signature)
-static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-
-pub(super) fn note_root_changing_signature(sig: usize) {
-    ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
-}
-
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
-/// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
-/// arguments themselves cannot be – skipped, logged)
+/// translated pipeline, on XCL's ABI with the kept root arguments and any per-command updates.
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    let args_pc_off = args_off + super::real::buffer_delta(args);
+    let count_off = count_off + super::real::buffer_delta(count_buf);
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
         // the list may hold XCL's ABI root signature from a translated draw before it – the PC
@@ -257,20 +251,32 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
-    }
-    if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
-        }
-        return;
+        return pc(this, sig, max, args, args_pc_off, count_buf, count_off);
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx) {
+    let result = match indirect::lookup(sig) {
+        Some(Some(signature)) => {
+            let repack = indirect::Repack { signature: &signature, resource: args, offset: args_off, max, gfx };
+            bind_abi_before(this, list, pso, gfx, |layout, inline, shadow, io, root| {
+                let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+                repack.record(list, root, layout.ok_or("no bound console root layout")?, inline, shadow, io, |size| {
+                    with(this, |s| s.arena.take(u, size, 16, &mut s.uma)).map(|p| p as usize)
+                })
+            }).map(|packed| {
+                pc(this, packed.signature.as_raw() as usize, max, packed.arguments.as_raw() as usize, 0, count_buf, count_off);
+                packed.finish_gpu(list);
+                with(this, |s| {
+                    let shadow = if gfx { &mut s.args_gfx } else { &mut s.args };
+                    packed.retain_and_clear(s.allocator, shadow);
+                });
+            })
+        }
+        Some(None) => Err("unsupported root-changing command signature".into()),
+        None => bind_abi(this, list, pso, gfx).map(|()| pc(this, sig, max, args, args_pc_off, count_buf, count_off)),
+    };
+    match result {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -854,6 +860,13 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    bind_abi_before(this, list, pso, gfx, |_, _, _, _, _| Ok(()))
+}
+
+unsafe fn bind_abi_before<T>(
+    this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool,
+    before: impl FnOnce(Option<&Layout>, usize, &[u8], &[u32], &ID3D12RootSignature) -> Result<T, String>,
+) -> Result<T, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -883,6 +896,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
+    let pc = real as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&pc).ok_or("pipeline")?;
+    let value = before(layout.as_deref(), inline, &args, &io, rs)?;
     let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
@@ -895,10 +911,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
-    let real = real as *mut c_void;
-    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
-    Ok(())
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1124,7 +1138,7 @@ mod tests {
         let standin_ok = 0x7200_0001usize;
         let real_ok = 0x7200_0002usize;
         let sig_root_changing = 0x7200_00F0usize;
-        note_root_changing_signature(sig_root_changing);
+        indirect::register(sig_root_changing, 0, &[]);
 
         pso_async::submit(
             standin_ok,
@@ -1140,8 +1154,8 @@ mod tests {
 
         reset(list_ptr, 0x7200_0100, standin_ok);
         unsafe {
-            // With `sig_root_changing`, a translated compute PSO is caught by the root-changing
-            // guard instead of falling through to `pc` (which happened when `R` wasn't registered).
+            // A translated compute PSO rejects this unsupported signature. Missing the
+            // resolved translation would send it through the PC path.
             execute_indirect(list_ptr, sig_root_changing, 1, 0, 0, 0, 0);
         }
         assert_eq!(
@@ -1184,6 +1198,7 @@ mod tests {
         );
 
         forget(list_ptr);
+        indirect::forget(sig_root_changing);
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);

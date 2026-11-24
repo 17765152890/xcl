@@ -18,6 +18,7 @@ mod cpu_writes;
 mod fence_x;
 pub mod frame;
 pub mod guard;
+mod indirect;
 mod late_release;
 pub mod layout;
 pub mod list_x;
