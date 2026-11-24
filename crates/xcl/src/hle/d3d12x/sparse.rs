@@ -389,6 +389,14 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Put `v` in `m` and drop what it held after the guard is gone: dropping an old `State`
+/// releases its resources, and `real::res_release` locks `STATE` again (`forget_buffer`), so
+/// dropping it under the guard waits for itself forever (#344).
+fn replace_unlocked<T>(m: &Mutex<Option<T>>, v: T) {
+    let old = m.lock().unwrap().replace(v);
+    drop(old);
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
@@ -546,7 +554,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
-            *STATE.lock().unwrap() = Some(s);
+            replace_unlocked(&STATE, s);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
@@ -1487,6 +1495,26 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value whose drop locks the mutex it was in (an old `State` whose resources reach
+    /// `forget_buffer`) is replaced without the thread waiting for itself (#344).
+    #[test]
+    fn replacing_drops_the_old_value_after_the_guard() {
+        static M: Mutex<Option<Relocks>> = Mutex::new(None);
+        struct Relocks;
+        impl Drop for Relocks {
+            fn drop(&mut self) {
+                drop(M.lock().unwrap());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            replace_unlocked(&M, Relocks);
+            replace_unlocked(&M, Relocks);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "replacing the value deadlocked");
+    }
 
     #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {
