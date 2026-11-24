@@ -11,6 +11,8 @@ asks git instead of the GitHub API (whether a commit is on main, a blob's size).
 import argparse, os, re, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
+# the template's hint lines are instructions, not answers (#965)
+PLACEHOLDER = re.compile(r"hardware \(GPU \+ driver|cargo test\b.*\bN passed\b|none / tool and model", re.I)
 # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
 BANNED_MODELS = r"\b(qwen|deepseek|llama|mistral|mixtral|gemma|phi-?\d)"
 # game data never goes into the repository (CONTRIBUTING.md, "Licence and provenance")
@@ -58,6 +60,23 @@ def builds_runtime(path):
     return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
 
 
+def section_text(body, section):
+    """The text under a `**Section**` heading, up to the next heading or the end."""
+    m = re.search(r"\*\*" + section + r"\*\*(.*?)(?=\n\*\*[A-Z]|\Z)", body, re.S)
+    return m.group(1) if m else ""
+
+
+def filled(text):
+    """Whether a section has an answer: comments, blank lines, lone `-` bullets and the
+    template's placeholder hints do not count."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    for line in text.splitlines():
+        line = line.strip().lstrip("-").strip()
+        if line and not PLACEHOLDER.search(line):
+            return True
+    return False
+
+
 def check(body, head, files, is_main_ancestor, *, test_only=False):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
@@ -65,7 +84,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
-        if not re.search(r"\*\*" + section + r"\*\*\s*\n\s*\S", body):
+        if not filled(section_text(body, section)):
             problems.append(f"the **{section}** section is missing or empty")
 
     ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)

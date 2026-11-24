@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from pr_check import check, smoke_blocks
@@ -61,6 +62,44 @@ class SmokeBlockTests(unittest.TestCase):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\n```\ntext\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
+
+
+class TemplateSectionTests(unittest.TestCase):
+    TEMPLATE = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                 ".github", "pull_request_template.md"), encoding="utf-8").read()
+
+    def problems(self, body):
+        return check(body, HEAD, [], lambda _: True)
+
+    def test_the_untouched_template_has_empty_sections(self):
+        problems = self.problems(self.TEMPLATE)
+        for section in ("Tested", "Not tested", "AI use"):
+            self.assertIn(f"the **{section}** section is missing or empty", problems)
+
+    def test_a_filled_template_passes(self):
+        body = self.TEMPLATE.replace(
+            "- hardware (GPU + driver, CPU), Rust version, debug / release:",
+            "- RTX 3060 Ti, driver 581.xx, i7-13700K, release")
+        body = body.replace(
+            "- `cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)",
+            "- `cargo test --workspace -- --test-threads=4`: 676 passed, 0 failed, 41 ignored")
+        body = body.replace("**Not tested**\n-\n", "**Not tested**\n- on a retail title\n")
+        body = body.replace("- none / tool and model, and what it did",
+                            "- Devin (Cognition), SWE-2: wrote the change and ran the tests")
+        self.assertEqual([], self.problems(body))
+
+    def test_comments_and_lone_bullets_do_not_count(self):
+        body = ("**Tested**\n<!-- - hardware (GPU + driver, CPU), Rust version, debug / release: -->\n"
+                "**Not tested**\n-\n**AI use**\n- none / tool and model, and what it did\n")
+        problems = self.problems(body)
+        self.assertIn("the **Tested** section is missing or empty", problems)
+        self.assertIn("the **Not tested** section is missing or empty", problems)
+        self.assertIn("the **AI use** section is missing or empty", problems)
+
+    def test_ai_use_none_is_an_answer(self):
+        body = ("**Tested**\nRTX 3060 Ti, release\n**Not tested**\n- nothing: docs only\n"
+                "**AI use**\n- none\n")
+        self.assertEqual([], self.problems(body))
 
 
 if __name__ == "__main__":
