@@ -323,6 +323,30 @@ pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {
     }
 }
 
+/// Views in the shader-visible heap recompiled shaders index (`ResourceDescriptorHeap` with T#
+/// word 0), on every device: the least a resource binding tier 3 GPU has, which SM 6.6
+/// dynamic resources need. A constant, so translated shaders do not depend on the device.
+pub const VIEW_HEAP_SIZE: u32 = 1_000_000;
+/// The texture types recompiled shaders declare (`Texture<type>` / `RWTexture<type>`), in the
+/// order of their null views.
+pub const NULL_SRV_TYPES: [&str; 7] = ["1D", "2D", "3D", "CubeArray", "1DArray", "2DArray", "2DMS"];
+pub const NULL_UAV_TYPES: [&str; 5] = ["1D", "2D", "3D", "1DArray", "2DArray"];
+/// The heap's last 12 slots, which no view heap gets: a null SRV of each type in
+/// `NULL_SRV_TYPES`, then a null UAV of each in `NULL_UAV_TYPES`. A T# whose word 0 is no heap
+/// index reads 0 through the one of the type the shader declares and its writes are dropped
+/// (D3D12 needs a null view's dimension to match the declaration).
+pub const NULL_VIEWS: u32 = VIEW_HEAP_SIZE - (NULL_SRV_TYPES.len() + NULL_UAV_TYPES.len()) as u32;
+
+/// The null SRV for a texture type of `NULL_SRV_TYPES` ("2D", "CubeArray", …).
+pub fn null_srv(ty: &str) -> u32 {
+    NULL_VIEWS + NULL_SRV_TYPES.iter().position(|&t| t == ty).expect("a texture type with a null SRV") as u32
+}
+
+/// The null UAV for a texture type of `NULL_UAV_TYPES`.
+pub fn null_uav(ty: &str) -> u32 {
+    NULL_VIEWS + (NULL_SRV_TYPES.len() + NULL_UAV_TYPES.iter().position(|&t| t == ty).expect("a texture type with a null UAV")) as u32
+}
+
 /// The T# as recompiled shaders read it (XCL shader ABI): BASE_ADDRESS – word 0 and the
 /// high byte of word 1 – replaced by the descriptor heap index of the SRV (UAV at index + 1);
 /// every other field (format, size, swizzle …) stays as the console wrote it.

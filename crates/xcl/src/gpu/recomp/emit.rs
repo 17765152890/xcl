@@ -2085,6 +2085,18 @@ impl Em {
         };
         let t = self.t();
         let tw0 = self.sreg(srsrc);
+        // a T# whose word 0 is no heap index (a console address the title wrote without a view)
+        // must not read past the heap: RADV faults on the GPU (SQC page fault, device removed).
+        // Views sit below the null ones in pairs (SRV, UAV at + 1): anything else gets the null
+        // view of the texture type the declaration names ("2D", "CubeArray", …). So does a T#
+        // with no image TYPE (word 3 [31:28] < 8): a null view's T# is all zero, and its word 0
+        // would be the view at index 0.
+        use crate::gpu::desc::{null_srv, null_uav, NULL_VIEWS};
+        let views = NULL_VIEWS - 1;
+        let tw3 = self.sreg(srsrc + 3);
+        let view = format!("({tw0} < {views}u && {tw3} >= 0x80000000u)");
+        let srv_i = |ty: &str| format!("({view} ? {tw0} : {}u)", null_srv(ty));
+        let uav_i = |ty: &str| format!("({view} ? {tw0} + 1u : {}u)", null_uav(ty));
         let tw1 = self.sreg(srsrc + 1);
         let act = self.act();
         let ps = matches!(self.opt.mode, Mode::Pixel(_));
@@ -2171,7 +2183,7 @@ impl Em {
                 return Err("MIMG unorm");
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({})];", srv_i(ty.trim_start_matches("Texture").trim_end_matches("<float4>"))));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
@@ -2275,7 +2287,7 @@ impl Em {
                 _ => return Err("MIMG dim"),
             };
             let s3 = self.sreg(ssamp + 3);
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({})];", srv_i(ty.trim_start_matches("Texture").trim_end_matches("<float4>"))));
             let sampler = self.sampler_ref(d.pc, false, &s3);
             self.line(&format!("SamplerState {t}_S = {sampler};"));
             self.line(&format!(
@@ -2298,7 +2310,7 @@ impl Em {
                 5 => ("Texture2DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 _ => return Err("get_resinfo dim"),
             };
-            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({})];", srv_i(ty.trim_start_matches("Texture"))));
             self.line(&format!("uint {t}_w, {t}_h, {t}_d, {t}_n; {call}"));
             self.line(&format!("uint4 {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n);"));
             let comps2 = comps.clone();
@@ -2321,12 +2333,19 @@ impl Em {
         if dim == 3 && base.starts_with("load") {
             return Err("image_load cube");
         }
+        // (SM 6.6 has no RWTexture2DMS)
+        if dim == 6 && !base.starts_with("load") {
+            return Err("MIMG 2DMS store");
+        }
+        // (a 2DMS T# is only loaded from)
+        let uav_i = if dim == 6 { String::new() } else { uav_i(rty) };
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
         match base {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r;"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
-                let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
+                let srv_i = srv_i(rty);
+                let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({srv_i})];");
                 self.line(&format!(
                     "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
@@ -2355,7 +2374,7 @@ impl Em {
                     });
                 }
                 let v4 = format!("uint4({})", vals.join(", "));
-                let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({uav_i})];");
                 self.line(&format!(
                     "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
@@ -2366,7 +2385,7 @@ impl Em {
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
-                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({uav_i})];"));
                 self.line(&format!("uint {t}_old = 0u;"));
                 let body = rmw32(&base[7..], &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
                 self.line(&format!("if ({act}) {{ {body} }}"));
@@ -2389,7 +2408,7 @@ impl Em {
                 let v = self.vreg(vdata);
                 let vt = if signed { "int" } else { "uint" };
                 let val = if signed { format!("(int){v}") } else { v.clone() };
-                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({uav_i})];"));
                 self.line(&format!("{vt} {t}_old = 0;"));
                 self.line(&format!("if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
                 if f("GLC") == 1 {
