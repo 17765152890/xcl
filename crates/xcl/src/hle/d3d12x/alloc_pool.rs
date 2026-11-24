@@ -171,6 +171,59 @@ pub unsafe fn forget(alloc: usize) {
     }
 }
 
+impl State {
+    unsafe fn reset_title(
+        &mut self,
+        a: usize,
+        mut reset_pc: impl FnMut(usize) -> HRESULT,
+        mut make_pc: impl FnMut(i32) -> Option<usize>,
+    ) -> Option<HRESULT> {
+        let c = self.cur.get(&a).copied().unwrap_or(a);
+        if self.backings.get(&c).is_none_or(|b| b.free()) {
+            if let Some(b) = self.backings.get_mut(&c) {
+                b.marks.clear();
+            }
+            if c == a {
+                return None;
+            }
+            return Some(reset_pc(c));
+        }
+        let ty = *self.types.get(&a)?;
+        // one put aside earlier that nothing uses any more, or a new one
+        let reuse = self.aside.get(&a).and_then(|v| v.iter().copied().find(|f| self.backings.get(f).is_none_or(|b| b.free())));
+        let next = match reuse {
+            Some(f) => {
+                let hr = reset_pc(f);
+                if hr < 0 {
+                    return Some(hr);
+                }
+                self.aside.get_mut(&a).unwrap().retain(|&x| x != f);
+                if let Some(b) = self.backings.get_mut(&f) {
+                    b.marks.clear();
+                }
+                f
+            }
+            None => {
+                let raw = make_pc(ty)?;
+                self.made += 1;
+                raw
+            }
+        };
+        self.aside.entry(a).or_default().push(c);
+        self.cur.insert(a, next);
+        self.swaps += 1;
+        if self.swaps.is_power_of_two() {
+            let aside: usize = self.aside.values().map(|v| v.len()).sum();
+            crate::xlog_info!(
+                "D3D12.X: {} allocator resets so far with recordings still held or on the GPU – another PC allocator took its place ({} made, {aside} put aside now)",
+                self.swaps,
+                self.made
+            );
+        }
+        Some(0)
+    }
+}
+
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
@@ -181,32 +234,10 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     let a = alloc as usize;
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    let c = s.cur.get(&a).copied().unwrap_or(a);
-    if s.backings.get(&c).is_none_or(|b| b.free()) {
-        if let Some(b) = s.backings.get_mut(&c) {
-            b.marks.clear();
-        }
-        if c == a {
-            return None;
-        }
-        return Some(super::real::reset_pc_allocator(c as *mut c_void));
-    }
-    let ty = *s.types.get(&a)?;
-    // one put aside earlier that nothing uses any more, or a new one
-    let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
-    let next = match reuse {
-        Some(f) => {
-            s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
-            if let Some(b) = s.backings.get_mut(&f) {
-                b.marks.clear();
-            }
-            let hr = super::real::reset_pc_allocator(f as *mut c_void);
-            if hr < 0 {
-                return Some(hr);
-            }
-            f
-        }
-        None => {
+    s.reset_title(
+        a,
+        |b| super::real::reset_pc_allocator(b as *mut c_void),
+        |ty| {
             let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
             let mut dev: Option<ID3D12Device> = None;
             this.GetDevice(&mut dev).ok()?;
@@ -216,22 +247,9 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             if !super::real::is_adopted(raw) {
                 super::real::adopt(raw, super::real::Kind::CommandAllocator);
             }
-            s.made += 1;
-            raw as usize
-        }
-    };
-    s.aside.entry(a).or_default().push(c);
-    s.cur.insert(a, next);
-    s.swaps += 1;
-    if s.swaps.is_power_of_two() {
-        let aside: usize = s.aside.values().map(|v| v.len()).sum();
-        crate::xlog_info!(
-            "D3D12.X: {} allocator resets so far with recordings still held or on the GPU – another PC allocator took its place ({} made, {aside} put aside now)",
-            s.swaps,
-            s.made
-        );
-    }
-    Some(0)
+            Some(raw as usize)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -310,5 +328,57 @@ mod tests {
             assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
             assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
         }
+    }
+
+    #[test]
+    fn failed_reset_keeps_reusable_allocator_in_aside_for_retry() {
+        const E_FAIL: HRESULT = -2147467259; // 0x80004005
+        let (title_alloc, busy, spare, list) = (0x1000, 0x2000, 0x3000, 0x4000);
+        let mut s = State::default();
+        s.types.insert(title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.cur.insert(title_alloc, busy);
+        s.aside.insert(title_alloc, vec![spare]);
+        s.backings.entry(busy).or_default().users.insert(list);
+
+        let mut made_calls = 0usize;
+        let mut reset_calls = Vec::new();
+        let hr = unsafe {
+            s.reset_title(
+                title_alloc,
+                |b| {
+                    reset_calls.push(b);
+                    E_FAIL
+                },
+                |_| {
+                    made_calls += 1;
+                    Some(0x9000)
+                },
+            )
+        };
+        assert_eq!(hr, Some(E_FAIL));
+        assert_eq!(reset_calls, vec![spare]);
+        assert_eq!(made_calls, 0);
+        assert_eq!(s.cur.get(&title_alloc).copied(), Some(busy), "active backing stays unchanged on failed Reset");
+        assert_eq!(s.aside.get(&title_alloc).map(Vec::as_slice), Some(&[spare][..]), "spare stays in aside after failed Reset");
+
+        // Retry succeeds: reuses the same spare without allocating a new backing
+        let hr = unsafe {
+            s.reset_title(
+                title_alloc,
+                |b| {
+                    reset_calls.push(b);
+                    0
+                },
+                |_| {
+                    made_calls += 1;
+                    Some(0x9000)
+                },
+            )
+        };
+        assert_eq!(hr, Some(0));
+        assert_eq!(reset_calls, vec![spare, spare]);
+        assert_eq!(made_calls, 0);
+        assert_eq!(s.cur.get(&title_alloc).copied(), Some(spare), "spare is published as current on retry");
+        assert_eq!(s.aside.get(&title_alloc).map(Vec::as_slice), Some(&[busy][..]), "previous active backing moves to aside");
     }
 }
