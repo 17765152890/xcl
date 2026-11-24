@@ -50,6 +50,12 @@ next steps:
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
 
+For a DirectStorage access-failure investigation, `XCL_DSTORAGE_FAILURE_DETAILS=1` adds
+bounded failure records (up to 8 per queue, 64 per process): the failing stage, whether
+the batch came from half-full auto-submission or the title's `Submit`, and counts of
+zero page-array entries. Added records contain no addresses or file contents and do
+not retry, replace, or reschedule requests. Off by default.
+
 ### System services
 
 | Feature | State | What it does | Verified by |
