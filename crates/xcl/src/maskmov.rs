@@ -16,14 +16,17 @@
 //! such an element is not touched at all, so a store whose tail is masked out may end at the
 //! last byte of a mapping as before.
 //!
-//! This module holds the parts that do not depend on Windows. So far:
+//! This module holds the parts that do not depend on Windows:
 //!
 //! * `insn_len` – the length of an x86-64 instruction, to walk a function from its start.
 //! * `decode` – the four instructions with any memory operand.
 //! * `helper` – the code a site calls.
+//! * `plan` – the sites of an image: byte pattern, then the walk from the start of the function
+//!   the unwind data names (or from the end of the one before, for a leaf function that has no
+//!   unwind data), which must arrive exactly at the site.
 //!
-//! The plan that finds the sites of an image and the loader step that applies it come next;
-//! nothing calls this module yet.
+//! A later change applies a plan in `loader` (after relocation, before the sections are
+//! protected); nothing calls this module yet.
 
 /// Length of the x86-64 instruction at the start of `c`. `None`: the bytes run out, or it is
 /// something this walk does not know and must not guess at – EVEX, XOP, 3DNow!, an opcode
@@ -389,6 +392,138 @@ pub fn call_site(site: u64, len: u8, helper: u64) -> Option<[u8; 10]> {
     Some(b)
 }
 
+/// Why a byte pattern was left as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// In no function of the unwind data, and further than `GAP_MAX` from the end of one.
+    NoFunction,
+    /// An instruction on the way there (at this RVA) is not one `insn_len` knows.
+    Undecodable(u32),
+    /// The walk passes over it: the bytes are part of another instruction (or follow a prefix).
+    NotAtBoundary,
+    /// At a boundary but not a store `decode` and `helper` take.
+    Form,
+}
+
+/// How far behind the end of a function with unwind data a leaf function's store may be.
+pub const GAP_MAX: u32 = 0x1_0000;
+
+/// A store to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Site {
+    pub rva: u32,
+    pub store: Store,
+    /// Offset of its helper in `Plan::code`.
+    pub helper: u32,
+    /// Not in a function of the unwind data: found by the walk from the end of the one before.
+    pub leaf: bool,
+}
+
+/// What to do to an image.
+#[derive(Default, Debug)]
+pub struct Plan {
+    pub sites: Vec<Site>,
+    pub skipped: Vec<(u32, Skip)>,
+    /// The helpers, each at a multiple of 16; stores with the same bytes share one.
+    pub code: Vec<u8>,
+    /// (start, end) of each helper in `code`, ascending.
+    pub helpers: Vec<(u32, u32)>,
+}
+
+/// Finds the masked stores in the executable sections of a mapped image and writes their
+/// helpers. `image` is the image as mapped (relocated), `base` its address, `sections` the
+/// (RVA, length) of each executable section and `functions` the (start, end) RVAs of the
+/// unwind data's entries.
+///
+/// A byte pattern alone is not taken: the instructions are walked from the start of the
+/// function that contains it, and the walk has to arrive exactly at it. A pattern outside
+/// every function is walked to from the end of the function before it (a leaf function has no
+/// unwind data; the padding between functions is one-byte instructions).
+pub fn plan(image: &[u8], base: u64, sections: &[(u32, u32)], functions: &[(u32, u32)]) -> Plan {
+    let mut p = Plan::default();
+    let mut funcs: Vec<(u32, u32)> = functions.iter().copied().filter(|f| f.0 < f.1).collect();
+    funcs.sort_unstable();
+    // helpers by the store's bytes (and, for a RIP-relative operand, its place)
+    let mut shared: std::collections::HashMap<([u8; 10], u32), u32> = std::collections::HashMap::new();
+    for &(s_rva, s_len) in sections {
+        let (s_start, s_end) = (s_rva as usize, (s_rva as usize).saturating_add(s_len as usize).min(image.len()));
+        let Some(code) = image.get(s_start..s_end) else { continue };
+        // where the last walk started and how far it got
+        let (mut anchor, mut cursor) = (usize::MAX, 0usize);
+        let mut at = 0;
+        while let Some(k) = code[at..].iter().position(|&b| b == 0xC4) {
+            let site = at + k;
+            at = site + 1;
+            if !is_candidate(&code[site..]) {
+                continue;
+            }
+            let rva = (s_start + site) as u32;
+            let before = funcs.partition_point(|f| f.0 <= rva);
+            let (from, leaf) = match before.checked_sub(1).map(|i| funcs[i]) {
+                Some((start, end)) if rva < end => (start as usize, false),
+                Some((_, end)) if end as usize >= s_start && rva - end <= GAP_MAX => (end as usize, true),
+                _ => {
+                    p.skipped.push((rva, Skip::NoFunction));
+                    continue;
+                }
+            };
+            if from < s_start {
+                p.skipped.push((rva, Skip::NoFunction));
+                continue;
+            }
+            let from = from - s_start;
+            if anchor != from || cursor > site {
+                (anchor, cursor) = (from, from);
+            }
+            let mut bad = None;
+            while cursor < site {
+                match insn_len(&code[cursor..]) {
+                    Some(n) => cursor += n,
+                    None => {
+                        bad = Some(Skip::Undecodable((s_start + cursor) as u32));
+                        anchor = usize::MAX;
+                        break;
+                    }
+                }
+            }
+            if bad.is_none() && cursor != site {
+                bad = Some(Skip::NotAtBoundary);
+            }
+            if let Some(why) = bad {
+                p.skipped.push((rva, why));
+                continue;
+            }
+            let Some(store) = decode(&code[site..]).filter(|s| insn_len(&code[site..]) == Some(s.len as usize)) else {
+                p.skipped.push((rva, Skip::Form));
+                continue;
+            };
+            let mut key = ([0u8; 10], 0);
+            key.0[..store.len as usize].copy_from_slice(&code[site..site + store.len as usize]);
+            if store.mem.rip {
+                key.1 = rva;
+            }
+            let helper_at = match shared.get(&key) {
+                Some(&h) => h,
+                None => {
+                    while p.code.len() % 16 != 0 {
+                        p.code.push(0xCC);
+                    }
+                    let h = p.code.len() as u32;
+                    if !helper(&store, base + rva as u64 + store.len as u64, &mut p.code) {
+                        p.skipped.push((rva, Skip::Form));
+                        continue;
+                    }
+                    p.helpers.push((h, p.code.len() as u32));
+                    shared.insert(key, h);
+                    h
+                }
+            };
+            p.sites.push(Site { rva, store, helper: helper_at, leaf });
+        }
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +685,48 @@ mod tests {
         assert_eq!(call[..6], [0xE8, 0x94, 0x62, 0xFF, 0x0A, 0x90]);
         assert_eq!(call_site(0x1_4007_9D67, 6, 0x2_4B07_0000), None, "out of reach");
         assert_eq!(call_site(0x1_4007_9D67, 4, 0x1_4B07_0000), None, "too short for a call");
+    }
+
+    /// The sites of a made-up image: a store in a function, one in a leaf function behind it,
+    /// the same bytes inside another instruction, behind bytes that are no instruction, and
+    /// far from any function.
+    #[test]
+    fn a_site_is_a_pattern_the_walk_from_its_function_arrives_at() {
+        const STORE: [u8; 6] = [0xC4, 0xE2, 0x4D, 0x8E, 0x04, 0x90]; // vpmaskmovd [rax + 4 * rdx], ymm6, ymm0
+        const OTHER: [u8; 5] = [0xC4, 0xE2, 0x45, 0x8E, 0x31]; // vpmaskmovd [rcx], ymm7, ymm6
+        let mut image = vec![0xCCu8; 0x4_0000];
+        let mut put = |at: usize, bytes: &[u8]| image[at..at + bytes.len()].copy_from_slice(bytes);
+        // function 0x1000..0x1020: push rbx; sub rsp, 0x20; STORE; STORE; add rsp, 0x20; pop rbx; ret
+        put(0x1000, &[0x53, 0x48, 0x83, 0xEC, 0x20]);
+        put(0x1005, &STORE);
+        put(0x100B, &STORE);
+        put(0x1011, &[0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3]);
+        // a leaf function behind its padding: xor eax, eax; OTHER; ret
+        put(0x1030, &[0x31, 0xC0]);
+        put(0x1032, &OTHER);
+        put(0x1037, &[0xC3]);
+        // function 0x2000..0x2040: mov rax, imm64 whose immediate is the pattern; then a real one
+        put(0x2000, &[0x48, 0xB8]);
+        put(0x2002, &STORE);
+        put(0x2008, &[0x90, 0x90]);
+        put(0x200A, &OTHER);
+        put(0x200F, &[0xC3]);
+        // function 0x3000..0x3040: an EVEX instruction before the pattern
+        put(0x3000, &[0x62, 0xF1, 0x7C, 0x48, 0x10, 0x00]);
+        put(0x3006, &STORE);
+        // far behind the last function
+        put(0x2_8000, &STORE);
+        let functions = [(0x3000, 0x3040), (0x1000, 0x1017), (0x2000, 0x2040)];
+        let p = plan(&image, 0x1_4000_0000, &[(0x1000, 0x3_F000)], &functions);
+        let sites: Vec<(u32, bool, u32)> = p.sites.iter().map(|s| (s.rva, s.leaf, s.helper)).collect();
+        let second = p.helpers[1].0;
+        assert_eq!(sites, [(0x1005, false, 0), (0x100B, false, 0), (0x1032, true, second), (0x200A, false, second)]);
+        assert_eq!(p.skipped, [(0x2002, Skip::NotAtBoundary), (0x3006, Skip::Undecodable(0x3000)), (0x2_8000, Skip::NoFunction)]);
+        assert_eq!(p.helpers.len(), 2, "stores with the same bytes share a helper");
+        assert!(second % 16 == 0 && p.helpers[0] == (0, 10 + 4 + 11 + 8 * 17 + 11) && p.helpers[1].1 as usize == p.code.len());
+        // a section that ends inside the pattern, and one with no function before it
+        assert!(plan(&image, 0, &[(0x1000, 8)], &functions).sites.is_empty());
+        assert_eq!(plan(&image, 0, &[(0x1000, 0x100)], &[]).skipped.len(), 3);
     }
 }
 
