@@ -91,6 +91,29 @@ fn enc(name: &str) -> String {
     out
 }
 
+/// A container folder name longer than this is shortened. Windows allows 255 characters per path
+/// component, a container name has up to 256, and `enc` turns each "/" into `%2F` (#326).
+const MAX_FOLDER_NAME: usize = 200;
+/// File in a shortened container folder with the container's exact name.
+const NAME_FILE: &str = "name";
+
+/// The folder of a container: `enc(name)`, or for a long name its first 100 characters, `~` and a
+/// hash of the whole name (case folded: the folder is found whatever the case, as the others are).
+/// `enc` never makes a `~`, so a shortened name is nobody's encoded name; the exact name is in the
+/// folder's `NAME_FILE`.
+fn container_folder(name: &str) -> String {
+    let e = enc(name);
+    if e.len() <= MAX_FOLDER_NAME {
+        return e;
+    }
+    // FNV-1a: the same on every Rust version, as the name is stored on disk
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.to_ascii_lowercase().bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{}~{h:016x}", &e[..100])
+}
+
 fn dec(file: &str) -> String {
     let b = file.as_bytes();
     let mut out = Vec::new();
@@ -263,7 +286,7 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
     if !valid_container_name_length(&name) {
         return Err(E_GS_INVALID_CONTAINER_NAME);
     }
-    std::path::absolute(pr.root.join(enc(&name))).map_err(|_| E_FAIL)
+    std::path::absolute(pr.root.join(container_folder(&name))).map_err(|_| E_FAIL)
 }
 
 // A queued delete must not remove a container partway through a blob update.
@@ -309,7 +332,14 @@ pub unsafe extern "system" fn XGameSaveCreateContainer(p: *mut Provider, name: *
     if !valid_container_name_length(&n) {
         return E_GS_INVALID_CONTAINER_NAME;
     }
-    *out = Box::into_raw(Box::new(Container { magic: MAGIC_CONTAINER, dir: pr.root.join(enc(&n)), name: n }));
+    let dir = pr.root.join(container_folder(&n));
+    if dir.file_name().is_some_and(|f| f.to_string_lossy().contains('~')) && !dir.join(NAME_FILE).exists() {
+        // a shortened folder: keep the exact name where `each_container` reads it
+        if std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(NAME_FILE), n.as_bytes())).is_err() {
+            return E_FAIL;
+        }
+    }
+    *out = Box::into_raw(Box::new(Container { magic: MAGIC_CONTAINER, dir, name: n }));
     S_OK
 }
 
@@ -326,7 +356,13 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
     dirs.sort();
     let mut n = 0;
     for d in dirs {
-        let name = dec(&d.file_name().unwrap_or_default().to_string_lossy());
+        let folder = d.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        // a shortened folder (it has a `~`, which `enc` never makes) keeps the exact name in a file
+        let name = if folder.contains('~') {
+            std::fs::read_to_string(d.join(NAME_FILE)).unwrap_or_else(|_| dec(&folder))
+        } else {
+            dec(&folder)
+        };
         if exact {
             if !name.eq_ignore_ascii_case(prefix) {
                 continue;
@@ -913,6 +949,78 @@ mod tests {
         let i = &*i;
         v.push((from_cstr_ptr(i.name).unwrap(), from_cstr_ptr(i.display_name).unwrap(), i.blob_count, i.total_size));
         true
+    }
+
+    /// Container names go up to 256 characters and `enc` turns "/" into three, while a Windows path
+    /// component holds 255: a long name gets a shorter folder (#326).
+    #[test]
+    fn container_folder_shortens_only_what_a_folder_cannot_hold() {
+        assert_eq!(container_folder("slot/1"), enc("slot/1"));
+        assert_eq!(container_folder(&"a".repeat(200)), "a".repeat(200), "up to the limit it is the encoded name");
+        for name in ["a".repeat(256), "a/".repeat(85) + "x", "é".repeat(120)] {
+            let folder = container_folder(&name);
+            assert!(folder.len() <= 255, "{folder}");
+            assert!(folder.contains('~'), "a shortened folder is told by its `~`");
+            assert_eq!(folder, container_folder(&name), "the same name, the same folder");
+            assert!(!enc(&name).contains('~'), "no encoded name can be taken for a shortened one");
+        }
+        // names that differ anywhere give different folders, names that differ in case give one
+        let long = "a".repeat(256);
+        assert_ne!(container_folder(&long), container_folder(&format!("{}b", "a".repeat(255))));
+        assert_ne!(container_folder(&long), container_folder(&format!("b{}", "a".repeat(255))));
+        assert_eq!(container_folder(&long).to_ascii_lowercase(), container_folder(&long.to_ascii_uppercase()).to_ascii_lowercase());
+    }
+
+    #[test]
+    fn long_container_names_save_and_come_back_exact() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-longname-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let names = ["a".repeat(256), "a/".repeat(85) + "x"];
+            for name in &names {
+                let cname = CString::new(name.as_str()).unwrap();
+                let mut c = std::ptr::null_mut();
+                assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr().cast(), &mut c), S_OK);
+                let mut u = std::ptr::null_mut();
+                assert_eq!(XGameSaveCreateUpdate(c, b"Long\0".as_ptr(), &mut u), S_OK);
+                assert_eq!(XGameSaveSubmitBlobWrite(u, b"data\0".as_ptr(), b"hello".as_ptr(), 5), S_OK);
+                assert_eq!(XGameSaveSubmitUpdate(u), S_OK, "a {}-character name must save", name.len());
+                XGameSaveCloseUpdate(u);
+                XGameSaveCloseContainer(c);
+            }
+            // listed with the exact names, nothing else in the root is taken for a container
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            let mut listed: Vec<&str> = list.iter().map(|l| l.0.as_str()).collect();
+            listed.sort();
+            let mut expected: Vec<&str> = names.iter().map(String::as_str).collect();
+            expected.sort();
+            assert_eq!(listed, expected);
+            assert!(list.iter().all(|l| l.1 == "Long" && l.2 == 1));
+            // read back through a container opened under another case spelling of the same name
+            let upper = CString::new(names[0].to_ascii_uppercase()).unwrap();
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, upper.as_ptr().cast(), &mut c), S_OK);
+            let wanted = [b"data\0".as_ptr()];
+            let (mut count, mut buf) = (1u32, vec![0u64; 64]);
+            assert_eq!(XGameSaveReadBlobData(c, wanted.as_ptr(), &mut count, 512, buf.as_mut_ptr() as *mut Blob), S_OK);
+            let blob = &*(buf.as_ptr() as *const Blob);
+            assert_eq!(std::slice::from_raw_parts(blob.data, blob.info.size as usize), b"hello");
+            XGameSaveCloseContainer(c);
+            // deleted by name
+            for name in &names {
+                let cname = CString::new(name.as_str()).unwrap();
+                assert_eq!(XGameSaveDeleteContainer(p, cname.as_ptr().cast()), S_OK);
+            }
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(list.is_empty(), "{list:?}");
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
