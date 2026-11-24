@@ -18,30 +18,85 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 /// How the title's image reaches the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// copied into a swap chain of the image's size, DWM stretches it (the window is as large)
+    /// copied into a swap chain of the image's size (the client area is exactly as large; and
+    /// without the filter, where DWM stretches it)
     Copy,
-    /// drawn into a swap chain of the client size through the area filter
+    /// copied 1:1 into a swap chain of the client size at its place, black around it (a 16:9
+    /// image on a 21:9 screen of the same height)
+    Place,
+    /// drawn into a swap chain of the client size through the area filter, at its place
     Filter,
     /// not shown: the client area is empty (minimized), the swap chain keeps its size
     Skip,
 }
 
-/// `Skip` when the client area is empty (minimized); `Filter` when it is smaller than the image
-/// on either side; `Copy` when it is as large or larger.
-pub fn route(image: (u32, u32), client: (u32, u32)) -> Route {
+/// How the image fills the client area (`scaling` in xcl.toml, `XCL_SCALING` overrides).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scaling {
+    /// as large as fits with its aspect ratio kept, centred, black bars around it
+    Fit,
+    /// the largest whole multiple of the image that fits (1:1 pixels at 1x), else as `Fit`
+    Integer,
+    /// the whole client area, aspect ratio not kept
+    Stretch,
+}
+
+impl Scaling {
+    pub fn parse(s: &str) -> Option<Scaling> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fit" | "aspect" | "auto" | "" => Some(Scaling::Fit),
+            "integer" | "pixel" => Some(Scaling::Integer),
+            "stretch" | "fill" => Some(Scaling::Stretch),
+            _ => None,
+        }
+    }
+}
+
+/// Where the image goes in the client area: (x, y, width, height).
+pub fn place(image: (u32, u32), client: (u32, u32), scaling: Scaling) -> (u32, u32, u32, u32) {
+    let ((iw, ih), (cw, ch)) = (image, client);
+    if iw == 0 || ih == 0 || cw == 0 || ch == 0 {
+        return (0, 0, cw, ch);
+    }
+    let (w, h) = match scaling {
+        Scaling::Stretch => (cw, ch),
+        Scaling::Integer if (cw / iw).min(ch / ih) >= 1 => {
+            let k = (cw / iw).min(ch / ih);
+            (iw * k, ih * k)
+        }
+        _ => {
+            let (iw, ih, cw, ch) = (iw as u64, ih as u64, cw as u64, ch as u64);
+            if cw * ih > ch * iw {
+                // wider than the image: bars left and right
+                (((ch * iw + ih / 2) / ih).clamp(1, cw) as u32, ch as u32)
+            } else {
+                (cw as u32, ((cw * ih + iw / 2) / iw).clamp(1, ch) as u32)
+            }
+        }
+    };
+    ((cw - w) / 2, (ch - h) / 2, w, h)
+}
+
+/// `Skip` when the client area is empty (minimized); `Copy` when the image fills it 1:1;
+/// `Place` when it goes there 1:1 with bars around it; else `Filter`.
+pub fn route(image: (u32, u32), client: (u32, u32), scaling: Scaling) -> Route {
     if client.0 == 0 || client.1 == 0 {
-        Route::Skip
-    } else if client.0 >= image.0 && client.1 >= image.1 {
+        return Route::Skip;
+    }
+    let (_, _, w, h) = place(image, client, scaling);
+    if (w, h) != image {
+        Route::Filter
+    } else if client == image {
         Route::Copy
     } else {
-        Route::Filter
+        Route::Place
     }
 }
 
 const SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)"
+#define RS "RootConstants(num32BitConstants=6, b0), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)"
 Texture2D<float4> src : register(t0);
-cbuffer C : register(b0) { uint2 dst; uint flags; uint pad; };
+cbuffer C : register(b0) { uint2 dst; uint flags; uint pad; uint2 origin; };
 
 [RootSignature(RS)]
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -58,7 +113,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
     uint sw, sh;
     src.GetDimensions(sw, sh);
     float2 s = float2(sw, sh) / float2(dst);
-    float2 lo = floor(pos.xy) * s;
+    float2 lo = (floor(pos.xy) - float2(origin)) * s;
     float2 hi = min(lo + s, float2(sw, sh));
     int2 a = (int2)floor(lo);
     int2 b = (int2)ceil(hi);
@@ -135,7 +190,34 @@ impl Scaler {
     /// Record on `list` the draw of `src` (subresource 0, readable as a pixel shader resource)
     /// over all of `dst` (`w`x`h`, `self.fmt`, in RENDER_TARGET state). The descriptors are
     /// rewritten: the previous recording must have finished on the GPU.
+    #[cfg(test)]
     pub unsafe fn record(&self, dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, w: u32, h: u32) {
+        self.record_into(dev, list, src, dst, (0, 0, w, h), false);
+    }
+
+    /// The view of `dst` in the scaler's RTV heap (forgotten by `note_rtv` at once).
+    unsafe fn target(&self, dev: &ID3D12Device, dst: &ID3D12Resource) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let rtv = self.rtv.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(dst, None, rtv);
+        // `dev` is the title's (adopted) device: its CreateRenderTargetView hook keeps a reference
+        // to the view's resource for guessing the title's frame (`note_rtv`). Held on a swap chain
+        // buffer, that reference makes every ResizeBuffers fail (DXGI_ERROR_INVALID_CALL): the
+        // presenter's own view is forgotten at once.
+        super::note_rtv(rtv.ptr, std::ptr::null_mut());
+        rtv
+    }
+
+    /// Record on `list` a clear of all of `dst` (RENDER_TARGET state) to black: the bars around
+    /// a placed image.
+    pub unsafe fn clear(&self, dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, dst: &ID3D12Resource) {
+        let rtv = self.target(dev, dst);
+        list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+    }
+
+    /// As `record`, into the `rect` (x, y, width, height) of `dst` only; `clear`: the rest of
+    /// `dst` is cleared to black first.
+    pub unsafe fn record_into(&self, dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, rect: (u32, u32, u32, u32), clear: bool) {
+        let (x, y, w, h) = rect;
         let view = view_format(src.GetDesc().Format);
         let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: view,
@@ -144,24 +226,21 @@ impl Scaler {
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, ..Default::default() } },
         };
         dev.CreateShaderResourceView(src, Some(&srv_desc), self.srv.GetCPUDescriptorHandleForHeapStart());
-        let rtv = self.rtv.GetCPUDescriptorHandleForHeapStart();
-        dev.CreateRenderTargetView(dst, None, rtv);
-        // `dev` is the title's (adopted) device: its CreateRenderTargetView hook keeps a reference
-        // to the view's resource for guessing the title's frame (`note_rtv`). Held on a swap chain
-        // buffer, that reference makes every ResizeBuffers fail (DXGI_ERROR_INVALID_CALL): the
-        // presenter's own view is forgotten at once.
-        super::note_rtv(rtv.ptr, std::ptr::null_mut());
+        let rtv = self.target(dev, dst);
+        if clear {
+            list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+        }
         let decode = matches!(view, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM);
         let encode = self.fmt != DXGI_FORMAT_R16G16B16A16_FLOAT;
-        let constants = [w, h, decode as u32 | (encode as u32) << 1, 0];
+        let constants = [w, h, decode as u32 | (encode as u32) << 1, 0, x, y];
         list.SetGraphicsRootSignature(&self.rs);
         list.SetDescriptorHeaps(&[Some(self.srv.clone())]);
-        list.SetGraphicsRoot32BitConstants(0, 4, constants.as_ptr() as _, 0);
+        list.SetGraphicsRoot32BitConstants(0, constants.len() as u32, constants.as_ptr() as _, 0);
         list.SetGraphicsRootDescriptorTable(1, self.srv.GetGPUDescriptorHandleForHeapStart());
         list.SetPipelineState(&self.pso);
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
-        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: x as f32, TopLeftY: y as f32, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 }]);
         list.OMSetRenderTargets(1, Some(&rtv as *const _), false, None);
         list.DrawInstanced(3, 1, 0, 0);
     }
@@ -180,16 +259,39 @@ mod tests {
     #[test]
     fn route_filters_only_when_the_window_is_smaller() {
         let uhd = (3840, 2160);
-        for client in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2000), (3000, 2160)] {
-            assert_eq!(route(uhd, client), Route::Filter, "{client:?}");
+        for client in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2000), (3000, 2160), (5120, 2880)] {
+            assert_eq!(route(uhd, client, Scaling::Fit), Route::Filter, "{client:?}");
         }
-        for client in [(3840, 2160), (5120, 2880)] {
-            assert_eq!(route(uhd, client), Route::Copy, "{client:?}");
-        }
+        assert_eq!(route(uhd, (3840, 2160), Scaling::Fit), Route::Copy);
+        // a 21:9 screen of the image's height: the image 1:1 between bars
+        assert_eq!(route(uhd, (5120, 2160), Scaling::Fit), Route::Place);
+        assert_eq!(route(uhd, (5120, 2160), Scaling::Stretch), Route::Filter);
+        assert_eq!(route(uhd, (7680, 4320), Scaling::Integer), Route::Filter);
+        assert_eq!(route(uhd, (4000, 2400), Scaling::Integer), Route::Place);
         // minimized: nothing shown – not a copy into a swap chain resized to the image
         for client in [(0, 0), (1280, 0), (0, 720)] {
-            assert_eq!(route(uhd, client), Route::Skip, "{client:?}");
+            assert_eq!(route(uhd, client, Scaling::Fit), Route::Skip, "{client:?}");
         }
+    }
+
+    #[test]
+    fn place_keeps_the_aspect_ratio() {
+        let uhd = (3840, 2160);
+        // 21:9 at 5120x2160: 640-pixel bars left and right
+        assert_eq!(place(uhd, (5120, 2160), Scaling::Fit), (640, 0, 3840, 2160));
+        assert_eq!(place(uhd, (3440, 1440), Scaling::Fit), (440, 0, 2560, 1440));
+        // taller than 16:9 (16:10): bars above and below
+        assert_eq!(place(uhd, (1920, 1200), Scaling::Fit), (0, 60, 1920, 1080));
+        assert_eq!(place(uhd, (1280, 720), Scaling::Fit), (0, 0, 1280, 720));
+        assert_eq!(place(uhd, (5120, 2160), Scaling::Stretch), (0, 0, 5120, 2160));
+        // integer: 1080p twice on a 4K screen; a window smaller than the image falls back to fit
+        assert_eq!(place((1920, 1080), (5120, 2160), Scaling::Integer), (640, 0, 3840, 2160));
+        assert_eq!(place((1920, 1080), (3440, 1440), Scaling::Integer), (760, 180, 1920, 1080));
+        assert_eq!(place(uhd, (3440, 1440), Scaling::Integer), (440, 0, 2560, 1440));
+        for s in ["fit", "Integer", " stretch "] {
+            assert!(Scaling::parse(s).is_some(), "{s}");
+        }
+        assert_eq!(Scaling::parse("zoom"), None);
     }
 
     fn srgb_to_linear(c: f64) -> f64 {
@@ -388,6 +490,66 @@ mod tests {
         }
     }
 
+    /// A 16:9 image on wider screens: 1:1 between black bars (`Place`, 1280x720 in 1680x720)
+    /// and through the filter between bars (1280x720 in 1032x432: 768x432 at x 132) – the bars
+    /// black, the image as the copy or the CPU filter gives it.
+    #[test]
+    fn placed_image_between_black_bars() {
+        unsafe {
+            let Some(dev) = device() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            if crate::gpu::recomp::dxc::location().is_err() {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            let scaler = Scaler::new(&dev, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
+            let (iw, ih) = (1280u32, 720u32);
+            let src = pattern(iw as usize, ih as usize);
+            for (client, want_route, want_rect) in [((1680u32, 720u32), Route::Place, (200, 0, 1280, 720)), ((1032, 432), Route::Filter, (132, 0, 768, 432))] {
+                let route = route((iw, ih), client, Scaling::Fit);
+                let rect = place((iw, ih), client, Scaling::Fit);
+                assert_eq!((route, rect), (want_route, want_rect), "{client:?}");
+                let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let (tex, _up) = upload(&dev, &list, &src, iw, ih, D3D12_RESOURCE_STATE_COMMON);
+                // the back buffer, with something in it the bars must cover
+                let fill = vec![200u8; (client.0 * client.1 * 4) as usize];
+                let (bb, _up2) = upload(&dev, &list, &fill, client.0, client.1, D3D12_RESOURCE_STATE_COMMON);
+                let bb_rt = texture(&dev, client.0, client.1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+                list.ResourceBarrier(&[super::super::transition(&bb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyResource(&bb_rt, &bb);
+                list.ResourceBarrier(&[super::super::transition(&bb_rt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
+                let after = super::super::draw(&dev, &list, Some(&scaler), route, &tex, &bb_rt, D3D12_RESOURCE_STATE_PRESENT, rect, false);
+                list.ResourceBarrier(&[super::super::transition(&bb_rt, after, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let (rb, fp) = super::super::readback_copy(&list, &bb_rt, &bb_rt.GetDesc()).unwrap();
+                run(&dev, &queue, &list);
+                let got = texels(&rb, &fp, client.0, client.1);
+                let (x0, y0, w, h) = rect;
+                let reference = (route == Route::Filter).then(|| reference(&src, iw as usize, ih as usize, w as usize, h as usize));
+                for y in 0..client.1 {
+                    for x in 0..client.0 {
+                        let t = &got[((y * client.0 + x) * 4) as usize..][..3];
+                        let inside = x >= x0 && x < x0 + w && y >= y0 && y < y0 + h;
+                        if !inside {
+                            assert_eq!(t, [0, 0, 0], "{client:?}: bar pixel ({x}, {y})");
+                        } else if let Some(r) = &reference {
+                            let want = r[((y - y0) * w + (x - x0)) as usize];
+                            for c in 0..3 {
+                                assert!((t[c] as f64 - want[c]).abs() <= 1.5, "{client:?}: ({x}, {y}) is {t:?}, the area filter gives {want:?}");
+                            }
+                        } else {
+                            let s = &src[(((y - y0) * iw + (x - x0)) * 4) as usize..][..3];
+                            assert_eq!(t, s, "{client:?}: ({x}, {y}) is not the image's texel");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A hidden popup window (no frame: the client area is the whole window) on a thread of its
     /// own that pumps its messages, as the XCL window is.
     struct TestWindow {
@@ -491,7 +653,7 @@ mod tests {
                 let sc = p.sc.clone().unwrap();
                 let d = sc.GetDesc1().unwrap();
                 assert_eq!((p.w, p.h, d.Width, d.Height), (w, h, w, h), "the swap chain follows the {w}x{h} client area");
-                assert_eq!(p.route, Some((Route::Filter, (iw, ih))));
+                assert_eq!(p.route, Some((Route::Filter, (iw, ih), (w, h))));
                 if k > 2 {
                     continue; // a size checked already
                 }

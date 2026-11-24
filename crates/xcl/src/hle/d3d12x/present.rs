@@ -537,7 +537,7 @@ struct Presenter {
     scaler: Option<downscale::Scaler>,
     scaler_failed: bool,
     /// the route last logged, with the image size
-    route: Option<(Route, (u32, u32))>,
+    route: Option<(Route, (u32, u32), (u32, u32))>,
     /// the swap chain size (and format) ResizeBuffers last refused, and when: logged once,
     /// asked for again twice a second
     resize_failed: Option<((u32, u32, DXGI_FORMAT), Instant)>,
@@ -730,51 +730,49 @@ unsafe fn present_frame(p: &mut Presenter, hwnd: HWND, src: ID3D12Resource, desc
     p.dumps.clear();
     let image = (desc.Width as u32, desc.Height);
     let client = client_size(hwnd);
-    let mut route = downscale::route(image, client);
-    if route == Route::Filter && !scaler_ready(p, fmt) {
+    let scaling = scaling();
+    let mut route = downscale::route(image, client, scaling);
+    if matches!(route, Route::Filter | Route::Place) && !scaler_ready(p, fmt) {
         route = Route::Copy;
     }
-    if p.route != Some((route, image)) {
+    let mut rect = downscale::place(image, client, scaling);
+    if p.route != Some((route, image, client)) {
         let how = match route {
             Route::Filter => "area filter into a swap chain of the client size",
+            Route::Place => "copied 1:1 into a swap chain of the client size",
+            Route::Copy if client == image => "copy",
             Route::Copy => "copy, the window stretches it",
             Route::Skip => "nothing shown, the swap chain keeps its size",
         };
-        crate::xlog_info!("present: {}x{} image in a {}x{} client area – {how}", image.0, image.1, client.0, client.1);
-        p.route = Some((route, image));
+        let at = if matches!(route, Route::Filter | Route::Place) && (rect.2, rect.3) != client {
+            format!(" at {}x{}+{}+{} ({scaling:?}, black bars around it)", rect.2, rect.3, rect.0, rect.1)
+        } else {
+            String::new()
+        };
+        crate::xlog_info!("present: {}x{} image in a {}x{} client area – {how}{at}", image.0, image.1, client.0, client.1);
+        p.route = Some((route, image, client));
     }
     if route == Route::Skip {
         return false;
     }
-    let (mut sw, mut sh) = if route == Route::Filter { client } else { image };
+    let (sw, sh) = if route == Route::Copy { image } else { client };
     if !ensure_swapchain(p, hwnd, sw, sh, fmt) {
         // the swap chain keeps its size this frame and the filter draws the image into it (the
         // window stretches it): a resize never costs a frame
         if p.sc.is_none() || !scaler_ready(p, p.fmt) {
             return false;
         }
-        (route, sw, sh) = (Route::Filter, p.w, p.h);
+        route = Route::Filter;
+        rect = downscale::place(image, (p.w, p.h), scaling);
     }
+    let full = (rect.0, rect.1, rect.2, rect.3) == (0, 0, p.w, p.h);
     let Some(sc) = p.sc.clone() else { return false };
     let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return false };
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return false;
     }
     // the back buffer's state while it is written
-    let written = match (route, &p.scaler) {
-        (Route::Filter, Some(scaler)) => {
-            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
-            // the title's image is promoted from COMMON to a shader resource, as for the copy
-            scaler.record(&p.dev, &p.list, &src, &bb, sw, sh);
-            D3D12_RESOURCE_STATE_RENDER_TARGET
-        }
-        _ => {
-            let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-            p.list.ResourceBarrier(&b1);
-            p.list.CopyResource(&bb, &src);
-            D3D12_RESOURCE_STATE_COPY_DEST
-        }
-    };
+    let written = draw(&p.dev, &p.list, p.scaler.as_ref(), route, &src, &bb, D3D12_RESOURCE_STATE_PRESENT, rect, full);
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
@@ -848,6 +846,48 @@ unsafe fn present_frame(p: &mut Presenter, hwnd: HWND, src: ID3D12Resource, desc
         }
     }
     true
+}
+
+/// `scaling` (`XCL_SCALING` overrides): how the image fills the window; "fit" when unknown.
+fn scaling() -> downscale::Scaling {
+    static S: std::sync::OnceLock<downscale::Scaling> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let env = std::env::var("XCL_SCALING").ok();
+        let v = env.as_deref().unwrap_or(&crate::state::config().scaling);
+        downscale::Scaling::parse(v).unwrap_or_else(|| {
+            crate::xlog_warn!("scaling: expected \"fit\", \"integer\" or \"stretch\", got {v:?} – using fit");
+            downscale::Scaling::Fit
+        })
+    })
+}
+
+/// Record on `list` how `src` (the title's image) goes into `bb` (a back buffer in state
+/// `from`) for `route` at `rect` (`full`: `rect` covers all of `bb`). Returns `bb`'s state after.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, scaler: Option<&downscale::Scaler>, route: Route, src: &ID3D12Resource, bb: &ID3D12Resource, from: D3D12_RESOURCE_STATES, rect: (u32, u32, u32, u32), full: bool) -> D3D12_RESOURCE_STATES {
+    match (route, scaler) {
+        (Route::Filter, Some(scaler)) => {
+            list.ResourceBarrier(&[transition(bb, from, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            // the title's image is promoted from COMMON to a shader resource, as for the copy
+            scaler.record_into(dev, list, src, bb, rect, !full);
+            D3D12_RESOURCE_STATE_RENDER_TARGET
+        }
+        (Route::Place, Some(scaler)) => {
+            // black bars, then the image copied texel for texel between them
+            list.ResourceBarrier(&[transition(bb, from, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            scaler.clear(dev, list, bb);
+            list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(bb), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            let image = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            list.CopyTextureRegion(&dst, rect.0, rect.1, 0, &image, None);
+            D3D12_RESOURCE_STATE_COPY_DEST
+        }
+        _ => {
+            list.ResourceBarrier(&[transition(bb, from, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyResource(bb, src);
+            D3D12_RESOURCE_STATE_COPY_DEST
+        }
+    }
 }
 
 /// The XCL window's client area (0x0 when minimized or unknown).
