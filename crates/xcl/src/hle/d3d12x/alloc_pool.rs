@@ -72,6 +72,18 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
     s.backings.entry(backing).or_default().users.insert(list);
 }
 
+/// The PC list's final Release ended its recording. Submitted work still holds the backing
+/// through `marks`; removing the list must not remove those fences or the other users.
+pub(super) fn forget_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
+}
+
 /// `list` (of type `ty`; negative: not known) is reset on the title's allocator `alloc`: the
 /// PC allocator to give the PC list.
 pub fn for_list(list: usize, alloc: usize, ty: i32) -> usize {
@@ -237,6 +249,73 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final-release cleanup drops only the recording's hold: another live list and a pending
+    /// GPU fence each still prevent reuse, then completion makes the backing reusable.
+    #[test]
+    fn released_lists_leave_only_live_recordings_and_gpu_work_holding_the_backing() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            releases: Cell<u32>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.releases.set(f.releases.get() + 1);
+            0
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), releases: Cell::new(0) };
+        let mut ids = Box::new([0u8; 3]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let (first, second) = (alloc + 1, alloc + 2);
+        created_on(first, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        created_on(second, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        {
+            let mut g = STATE.lock().unwrap();
+            let b = g.as_mut().unwrap().backings.get_mut(&alloc).unwrap();
+            // The map owns one synthetic fence reference, dropped by forget below.
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            b.marks.insert(1, (f, 7));
+        }
+
+        super::super::list_x::on_release(first);
+        let first_removed = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.of_list.contains_key(&first) && s.of_list.get(&second) == Some(&alloc)
+                && s.backings[&alloc].users == HashSet::from([second])
+                && !unsafe { s.backings[&alloc].free() }
+        };
+        super::super::list_x::on_release(second);
+        super::super::list_x::on_release(first); // duplicate cleanup is harmless
+        let pending_still_held = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
+                && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
+        };
+        fence.value.set(7);
+        let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
+        // Clean up the synthetic COM pointer before assertions, including on the old code.
+        unsafe { forget(alloc) };
+        assert!(first_removed, "another live recording must remain while the released list goes");
+        assert!(pending_still_held, "final list Release must retain the submitted-work fence");
+        assert!(reusable, "a released list cannot keep a completed backing busy");
+        assert_eq!(fence.releases.get(), 1);
+    }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
     /// recording is still there (the device is not removed), the title's allocator goes on with
