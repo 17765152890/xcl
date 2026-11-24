@@ -525,6 +525,13 @@ unsafe fn chosen_monitor() -> Option<(HMONITOR, MONITORINFOEXW)> {
     list.get(k).copied()
 }
 
+/// The size of the `monitor` (pixels), for a render size from the screen's aspect ratio.
+pub fn screen_size() -> Option<(u32, u32)> {
+    let (_, mi) = unsafe { chosen_monitor() }?;
+    let r = mi.monitorInfo.rcMonitor;
+    Some(((r.right - r.left) as u32, (r.bottom - r.top) as u32))
+}
+
 /// Fullscreen: the window loses its frame and covers `mon` (None: the monitor it is on);
 /// back: the frame and the place it had.
 unsafe fn set_fullscreen(hwnd: HWND, on: bool, mon: Option<HMONITOR>) {

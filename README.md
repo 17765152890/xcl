@@ -96,6 +96,11 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   monitor's resolution; Alt+Enter or F11 switches while it runs), `monitor` (`"primary"`, a number
   from the `monitor N:` list in `xcl.log`, or `"\\.\DISPLAY2"`). `XCL_FULLSCREEN` and `XCL_MONITOR`
   override them.
+- **Ultrawide rendering (the newer retail game):** `render_resolution = "screen"` makes the game
+  render at the monitor's aspect ratio instead of 16:9, its UI anchored to the wider screen
+  (4224x1792 on a 21:9 monitor: no more memory than 3840x2160, the most the game's render-target
+  memory holds), or `"WxH"` for a size of your own within that limit; `"native"` (default) keeps
+  3840x2160. `XCL_RENDER_RES` overrides it.
 
 ## Building and usage
 
