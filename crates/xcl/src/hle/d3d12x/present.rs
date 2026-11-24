@@ -26,7 +26,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -329,6 +330,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_compiling(hwnd);
             LRESULT(0)
         }
+        // Alt+Enter, F11: fullscreen on the window's monitor, or back to the window
+        WM_SYSKEYDOWN if wp.0 == VK_RETURN_CODE && lp.0 & (1 << 29) != 0 => {
+            if lp.0 & (1 << 30) == 0 {
+                set_fullscreen(hwnd, !FULLSCREEN.load(Ordering::Relaxed), None);
+            }
+            LRESULT(0)
+        }
+        WM_SYSCHAR if wp.0 == VK_RETURN_CODE => LRESULT(0), // no beep for Alt+Enter
+        WM_KEYDOWN if wp.0 == VK_F11_CODE => {
+            if lp.0 & (1 << 30) == 0 {
+                set_fullscreen(hwnd, !FULLSCREEN.load(Ordering::Relaxed), None);
+            }
+            LRESULT(0)
+        }
+        // moved to a monitor of another scale: the size Windows suggests keeps the window's
+        // size on screen (a fullscreen window keeps its monitor's rectangle)
+        WM_DPICHANGED => {
+            if !FULLSCREEN.load(Ordering::Relaxed) && lp.0 != 0 {
+                let r = &*(lp.0 as *const RECT);
+                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -415,6 +439,128 @@ unsafe fn show_compiling(hwnd: HWND) {
     }
 }
 
+const VK_RETURN_CODE: usize = 0x0D;
+const VK_F11_CODE: usize = 0x7A;
+const WINDOWED_STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+
+/// The XCL window covers its monitor without a frame
+static FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// where the window was before fullscreen (restored when it ends)
+static WINDOWED_AT: Mutex<Option<RECT>> = Mutex::new(None);
+
+/// XCL's windows are per-monitor DPI aware: at 125 % or 150 % scaling the game's image is shown
+/// at the screen's own pixels instead of being drawn smaller and enlarged (blurred) by Windows,
+/// and a fullscreen window is the monitor's real size. Process-wide, before XCL's window; the
+/// title's own (cloaked) window does not show anything.
+pub fn dpi_aware() {
+    if !enabled() {
+        return;
+    }
+    unsafe {
+        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            crate::xlog_info!("present: DPI awareness not changed ({e})");
+        }
+    }
+}
+
+/// The monitors in Windows' order (`monitor = N` counts from 1).
+unsafe fn monitors() -> Vec<(HMONITOR, MONITORINFOEXW)> {
+    unsafe extern "system" fn add(mon: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> windows::core::BOOL {
+        let list = &mut *(list.0 as *mut Vec<(HMONITOR, MONITORINFOEXW)>);
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(mon, &mut mi.monitorInfo).as_bool() {
+            list.push((mon, mi));
+        }
+        true.into()
+    }
+    let mut list: Vec<(HMONITOR, MONITORINFOEXW)> = Vec::new();
+    let _ = EnumDisplayMonitors(None, None, Some(add), LPARAM(&mut list as *mut _ as isize));
+    list
+}
+
+fn device_name(mi: &MONITORINFOEXW) -> String {
+    let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+    String::from_utf16_lossy(&mi.szDevice[..n])
+}
+
+unsafe fn monitor_dpi(mon: HMONITOR) -> u32 {
+    let (mut x, mut y) = (0u32, 0u32);
+    if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_ok() && x > 0 { x } else { 96 }
+}
+
+/// The monitor `want` names: "primary" (or empty), a number from 1 in `list`'s order, or a
+/// device name (`\\.\DISPLAY2` or `DISPLAY2`). None when it names none.
+fn pick_monitor<T: Copy>(list: &[(T, bool, String)], want: &str) -> Option<T> {
+    let want = want.trim();
+    if want.is_empty() || want.eq_ignore_ascii_case("primary") {
+        return list.iter().find(|m| m.1).or(list.first()).map(|m| m.0);
+    }
+    if let Ok(n) = want.parse::<usize>() {
+        return list.get(n.wrapping_sub(1)).map(|m| m.0);
+    }
+    let short = |s: &str| s.trim_start_matches(['\\', '.']).to_ascii_lowercase();
+    list.iter().find(|m| short(&m.2) == short(want)).map(|m| m.0)
+}
+
+/// `monitor` (`XCL_MONITOR` overrides); the primary monitor when it names none. The list is
+/// logged once.
+unsafe fn chosen_monitor() -> Option<(HMONITOR, MONITORINFOEXW)> {
+    let list = monitors();
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
+        for (k, (mon, mi)) in list.iter().enumerate() {
+            let r = mi.monitorInfo.rcMonitor;
+            let primary = if mi.monitorInfo.dwFlags & 1 != 0 { ", primary" } else { "" };
+            crate::xlog_info!("monitor {}: {} {}x{} at {},{}, {} % scale{primary}", k + 1, device_name(mi), r.right - r.left, r.bottom - r.top, r.left, r.top, monitor_dpi(*mon) * 100 / 96);
+        }
+    });
+    let env = std::env::var("XCL_MONITOR").ok();
+    let want = env.as_deref().unwrap_or(&crate::state::config().monitor);
+    let named: Vec<(usize, bool, String)> = list.iter().enumerate().map(|(k, (_, mi))| (k, mi.monitorInfo.dwFlags & 1 != 0, device_name(mi))).collect();
+    let k = pick_monitor(&named, want).or_else(|| {
+        crate::xlog_warn!("monitor: no monitor {want:?} (see the list above) – using the primary one");
+        pick_monitor(&named, "primary")
+    })?;
+    list.get(k).copied()
+}
+
+/// Fullscreen: the window loses its frame and covers `mon` (None: the monitor it is on);
+/// back: the frame and the place it had.
+unsafe fn set_fullscreen(hwnd: HWND, on: bool, mon: Option<HMONITOR>) {
+    let visible = if IsWindowVisible(hwnd).as_bool() { WS_VISIBLE } else { WINDOW_STYLE(0) };
+    if on {
+        let mon = mon.unwrap_or_else(|| MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return;
+        }
+        if !FULLSCREEN.swap(true, Ordering::Relaxed) {
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_ok() {
+                *WINDOWED_AT.lock().unwrap() = Some(r);
+            }
+        }
+        let r = mi.rcMonitor;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | visible).0 as isize);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        crate::xlog_info!("XCL window: fullscreen {}x{} at {},{}", r.right - r.left, r.bottom - r.top, r.left, r.top);
+    } else if FULLSCREEN.swap(false, Ordering::Relaxed) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WINDOWED_STYLE | visible).0 as isize);
+        let r = WINDOWED_AT.lock().unwrap().unwrap_or(RECT { left: 100, top: 100, right: 1380, bottom: 820 });
+        let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        crate::xlog_info!("XCL window: windowed {}x{}", r.right - r.left, r.bottom - r.top);
+    }
+}
+
+/// `fullscreen` (`XCL_FULLSCREEN=1/0` overrides)
+fn fullscreen_setting() -> bool {
+    match std::env::var("XCL_FULLSCREEN") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no"),
+        Err(_) => crate::state::config().fullscreen,
+    }
+}
+
 fn window_thread() {
     unsafe {
         let Ok(inst) = GetModuleHandleW(PCWSTR::null()) else { return };
@@ -429,15 +575,31 @@ fn window_thread() {
         RegisterClassW(&wc);
         let cfg = crate::state::config();
         let title = window_name();
-        let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
-        let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+        let monitor = chosen_monitor();
+        // window_width x window_height are at 100 % scale: the window keeps that size on screen
+        // on a monitor at 125 % (more pixels, not enlarged by Windows)
+        let dpi = monitor.map_or(96, |(m, _)| monitor_dpi(m));
+        let (cw, ch) = ((cfg.window_width * dpi).div_ceil(96) as i32, (cfg.window_height * dpi).div_ceil(96) as i32);
+        let mut rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
+        let _ = AdjustWindowRectExForDpi(&mut rc, WINDOWED_STYLE, false, WINDOW_EX_STYLE(0), dpi);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        let (x, y) = window_position(&cfg.window_pos, w, h);
+        let pos_env = std::env::var("XCL_WINDOW_POS").ok();
+        let pos = pos_env.as_deref().unwrap_or(&cfg.window_pos).trim();
+        let monitor_named = std::env::var_os("XCL_MONITOR").is_some() || !cfg.monitor.trim().eq_ignore_ascii_case("primary");
+        let auto = pos.is_empty() || pos.eq_ignore_ascii_case("auto");
+        let (x, y) = match monitor {
+            // "center", or "auto" with a monitor named: centred on that monitor's work area
+            Some((_, mi)) if pos.eq_ignore_ascii_case("center") || auto && monitor_named => {
+                let r = mi.monitorInfo.rcWork;
+                (r.left + ((r.right - r.left) - w).max(0) / 2, r.top + ((r.bottom - r.top) - h).max(0) / 2)
+            }
+            _ => window_position(&cfg.window_pos, w, h),
+        };
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WINDOWED_STYLE,
             x,
             y,
             w,
@@ -451,8 +613,14 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
+        if fullscreen_setting() {
+            set_fullscreen(hwnd, true, monitor.map(|(m, _)| m));
+        }
+        let _ = ShowWindow(hwnd, SW_SHOW);
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        let (cw, ch) = client_size(hwnd);
+        let full = if FULLSCREEN.load(Ordering::Relaxed) { ", fullscreen – Alt+Enter or F11 for a window" } else { "" };
+        crate::xlog_info!("XCL window created ({cw}x{ch} pixels, {} % scale{full})", GetDpiForWindow(hwnd) * 100 / 96);
         crate::hle::kbm::attach(hwnd.0);
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
@@ -1186,6 +1354,22 @@ mod tests {
         assert_eq!(rate.sample(start + Duration::from_secs(1), 60), 60.0);
         assert_eq!(rate.sample(start + Duration::from_secs(2), 60), 0.0);
         assert_eq!(rate.sample(start + Duration::from_secs(4), 70), 5.0);
+    }
+
+    #[test]
+    fn pick_monitor_by_setting() {
+        let list = [(0, false, r"\\.\DISPLAY1".to_string()), (1, true, r"\\.\DISPLAY2".to_string())];
+        assert_eq!(pick_monitor(&list, "primary"), Some(1));
+        assert_eq!(pick_monitor(&list, ""), Some(1));
+        assert_eq!(pick_monitor(&list, "1"), Some(0));
+        assert_eq!(pick_monitor(&list, "2"), Some(1));
+        assert_eq!(pick_monitor(&list, "3"), None);
+        assert_eq!(pick_monitor(&list, "0"), None);
+        assert_eq!(pick_monitor(&list, r"\\.\DISPLAY1"), Some(0));
+        assert_eq!(pick_monitor(&list, "display2"), Some(1));
+        assert_eq!(pick_monitor(&list, "HDMI"), None);
+        // no primary flag: the first
+        assert_eq!(pick_monitor(&[(7, false, "A".to_string())], "primary"), Some(7));
     }
 
     // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
