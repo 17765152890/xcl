@@ -156,10 +156,11 @@ the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPP
 `scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
 those skips fail. Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
-`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
+`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (the texture archive with 912 textures and 3 volume LUTs),
 `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
-tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
-part of the repository.
+tests pass without running anything (`scripts/test.ps1` lists the ones not set). That archive is the one
+`retail_ttpf_textures_detile_with_their_mip_chains` was written for; a different archive is not a tiling-model bug.
+No game data is part of the repository.
 
 ## Licenses
 
