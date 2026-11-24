@@ -14,6 +14,7 @@ pub mod acphal;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
+pub mod dualsense_haptics;
 pub mod dualsense_report;
 pub mod dxcompiler;
 pub mod gameinput;
