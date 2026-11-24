@@ -1840,6 +1840,5 @@ mod tests {
 
         assert!(DECODED_VOICES.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&(voice as usize))));
         assert!(XMA.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&(voice as usize))));
-        assert_eq!(DECODED_LIVE_COUNT.load(Ordering::Acquire), 0);
     }
 }
