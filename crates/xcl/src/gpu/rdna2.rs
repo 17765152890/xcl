@@ -584,6 +584,16 @@ pub fn format(d: &Decoded) -> String {
                 let _ = write!(s, ", {off:#x}");
             }
         }
+        // one 16-bit offset in the two offset bytes, but for the instructions with two addresses
+        "ENC_DS" if !["DS_READ2", "DS_WRITE2", "DS_WRXCHG2"].iter().any(|two| d.inst.name.starts_with(two)) => {
+            let offset = field_value(d.enc, &d.words, "OFFSET0").unwrap_or(0) | field_value(d.enc, &d.words, "OFFSET1").unwrap_or(0) << 8;
+            if offset != 0 {
+                let _ = write!(s, " offset:{offset}");
+            }
+            if field_value(d.enc, &d.words, "GDS") == Some(1) {
+                s.push_str(" gds");
+            }
+        }
         "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
             for (f, label) in [("OFFSET", "offset"), ("OFFSET0", "offset0"), ("OFFSET1", "offset1")] {
                 if let Some(v) = field_value(d.enc, &d.words, f).filter(|&v| v != 0) {
@@ -740,6 +750,32 @@ mod tests {
         assert_eq!(format(&d), "v_madmk_f32 v1, v2, 0x3f800000, v3");
         // spec instructions keep their opcodes
         assert_eq!(decode(&[0x01, 0x05, 0x0a, 0x56], 0).unwrap().inst.name, "V_FMAC_F32");
+    }
+
+    /// Every LDS / GDS line of LLVM's gfx10 tests that RDNA2 has reads as LLVM writes it: one
+    /// 16-bit `offset:`, or `offset0:` / `offset1:` where the instruction takes two addresses.
+    #[test]
+    fn llvm_gfx10_ds_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut one, mut two, mut wrong) = (0usize, 0usize, 0usize, Vec::new());
+        for line in std::fs::read_to_string(dir.join("gfx10_ds.txt")).unwrap().lines() {
+            let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+            let asm = asm.trim();
+            // not compared: a swizzle pattern, a number here and `swizzle(FFT,31)` there
+            if removed_in_rdna2(asm.split(' ').next().unwrap()) || asm.contains("offset:swizzle(") {
+                continue;
+            }
+            let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+            let got = dis(&bytes);
+            total += 1;
+            one += asm.contains(" offset:") as usize;
+            two += asm.contains(" offset1:") as usize;
+            if got != asm {
+                wrong.push(format!("{got}  (LLVM: {asm})"));
+            }
+        }
+        assert!(total > 1500 && one > 1000 && two > 100, "the DS tests are not all there: {total} lines, {one} with an offset, {two} with two");
+        assert!(wrong.is_empty(), "{} of {total} DS lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
