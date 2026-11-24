@@ -815,6 +815,48 @@ mod tests {
         assert_eq!(v.classify(&format!("\\\\?\\{file}")), Target::Pass);
     }
 
+    /// The D3D12 Agility SDK on a drive a console mount names (#595): without its files among
+    /// XCL's own paths the VFS translates the probe's `D3D12Core.dll` to the game folder, where
+    /// it is not found, and the SDK is reported as unavailable.  The env override, the
+    /// `<exe dir>\D3D12` subfolder and the exe dir itself are all affected.  Only the files are
+    /// XCL's: with xcl.exe at the drive's root, the rest of the drive stays the console's.
+    #[test]
+    fn a_console_drive_mount_leaves_the_agility_sdk_on_that_drive() {
+        use crate::gpu::agility::{candidates, sdk_files};
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_agility_{}", std::process::id()));
+        let game_s = full_path(&dir.join("game").to_string_lossy()).unwrap();
+        let drive = game_s[..2].to_string();
+        let mounts = || vec![(drive.clone(), game_s.clone())];
+        let env_dir = PathBuf::from(full_path(&dir.join("custom-agility").to_string_lossy()).unwrap());
+        let exe_dir = PathBuf::from(full_path(&dir.join("xcl-bin").to_string_lossy()).unwrap());
+        let root = PathBuf::from(format!("{drive}\\"));
+        let files = sdk_files(candidates(Some(env_dir), None, None))
+            .into_iter()
+            .chain(sdk_files(candidates(None, Some(exe_dir), None)))
+            .collect::<Vec<_>>();
+        let root_files = sdk_files(candidates(None, Some(root), None));
+        assert_eq!(files.len(), 3);
+        assert_eq!(root_files.len(), 2);
+        let all = || files.iter().chain(&root_files);
+
+        // Without them: each probe path is taken for a console file.
+        let before = Vfs::new(Path::new(&game_s), &dir.join("xcldata"), mounts());
+        for f in all() {
+            let f = f.to_string_lossy();
+            assert_eq!(before.classify(&f), Target::Game { rel: f[3..].to_string() }, "{f}");
+        }
+
+        // With them: the probe paths reach the host's files.
+        let v = all().fold(Vfs::new(Path::new(&game_s), &dir.join("xcldata"), mounts()), |v, f| v.own_folder(f));
+        for f in all() {
+            assert_eq!(v.classify(&f.to_string_lossy()), Target::Pass, "{}", f.display());
+        }
+        // The rest of the drive is still the console's, also beside the SDK and at the root.
+        assert_eq!(v.classify(&format!("{drive}\\hunter\\data.bin")), Target::Game { rel: "hunter\\data.bin".into() });
+        assert_eq!(v.classify(&format!("{drive}\\D3D12\\other.bin")), Target::Game { rel: "D3D12\\other.bin".into() });
+        assert_eq!(v.classify(&format!("{drive}\\save.dat")), Target::Game { rel: "save.dat".into() });
+    }
+
     #[test]
     fn reads_never_touch_and_writes_copy_on_write() {
         let f = Fixture::new("cow");
