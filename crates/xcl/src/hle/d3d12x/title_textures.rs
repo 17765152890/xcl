@@ -464,6 +464,9 @@ pub fn note_gpu_write(res: usize) {
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
         }
     }
+    drop(t);
+    // page budget: its texels are not in the title's memory, so the page budget keeps it
+    super::vram::pin(res);
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -557,6 +560,58 @@ pub fn list_reset(list: usize) {
     }
 }
 
+/// Page budget: evicted textures `revive` are mapped again and uploaded whole at the next look.
+/// One that could not be mapped stays evicted, for the next use to try again.
+fn map_again(revive: &[usize]) {
+    let mut mapped = Vec::with_capacity(revive.len());
+    for &res in revive {
+        // released since it was taken from the evicted (its pages forgotten): not touched
+        if !super::vram::is_placed_texture(res) {
+            continue;
+        }
+        let p = res as *mut c_void;
+        if !unsafe { ID3D12Resource::from_raw_borrowed(&p).is_some_and(|r| super::vram::remap_if_unmapped(r)) } {
+            super::vram::evicted_again(res);
+            continue;
+        }
+        forget_content(res);
+        mapped.push(res);
+    }
+    if mapped.is_empty() {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    for res in mapped {
+        if let Some(e) = t.get_mut(res) {
+            if !e.pending {
+                e.pending = true;
+                PENDING.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Page budget: about once a second, the textures whose T# is in a shader-visible view heap
+/// are in use (a title that only samples a texture submits no transition for it); evicted ones
+/// among them are mapped again before the title's next work.
+fn look_at_view_heaps() {
+    if !super::vram::tracking() || super::console_heap::global_heap().is_none() {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|l| now.duration_since(l) < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let (visible, cpu_only) = super::console_heap::referenced();
+    let back = super::vram::seen(&visible, &cpu_only);
+    map_again(&back);
+}
+
 /// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
 /// states their transitions leave them in.
 pub fn submitted(lists: &[*mut c_void]) {
@@ -570,6 +625,16 @@ pub fn submitted(lists: &[*mut c_void]) {
     if notes.is_empty() {
         return;
     }
+    // page budget: a texture the title uses is recent; an evicted one is
+    // mapped again and uploaded whole at the next submit
+    let mut revive = Vec::new();
+    for &(res, _, _) in &notes {
+        super::vram::touch(res);
+        if super::vram::any_evicted() && super::vram::take_evicted(res) {
+            revive.push(res);
+        }
+    }
+    map_again(&revive);
     let mut t = TEXTURES.lock().unwrap();
     for (res, sub, after) in notes {
         if let Some(e) = t.get_mut(res) {
@@ -738,6 +803,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
             crate::xlog_info!("frame trace: title textures: {with} with data in memory, {without} all zero; {dirty_len} dirty pages this look");
         }
     }
+    // page budget: textures in use by their T#; evicted ones are mapped again (before the
+    // queue waits for the mappings) and uploaded below
+    look_at_view_heaps();
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
@@ -776,6 +844,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    // page budget: a texture the CPU wrote again is mapped again before its
+    // whole upload
+    if super::vram::any_evicted() {
+        for (r, _) in &todo {
+            if super::vram::take_evicted(r.as_raw() as usize) {
+                super::vram::remap_if_unmapped(r);
+                forget_content(r.as_raw() as usize);
+            }
+        }
+    }
     upload_all(todo);
 }
 
@@ -793,6 +871,12 @@ fn unchanged_skip() -> bool {
 /// content from here on (the caller uploads it when this is false).
 fn same_as_last_upload(res: usize, h: u64) -> bool {
     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// Page budget: `res` was mapped again on fresh tiles, so its next upload
+/// must not be left out as unchanged.
+fn forget_content(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -1205,6 +1289,19 @@ mod tests {
         assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    /// Page budget: a texture mapped again after an eviction sits on fresh
+    /// tiles, so unchanged memory is uploaded again.
+    #[test]
+    fn a_texture_mapped_again_after_eviction_is_uploaded_even_if_unchanged() {
+        let a = 0x7E57_0000_3000usize;
+        let h = content_hash(&[7u8; 4096]);
+        assert!(!same_as_last_upload(a, h));
+        assert!(same_as_last_upload(a, h), "unchanged: left out");
+        forget_content(a);
+        assert!(!same_as_last_upload(a, h), "mapped again: uploaded whole");
+        forget_content(a);
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
