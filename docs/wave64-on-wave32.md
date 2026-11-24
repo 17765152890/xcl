@@ -280,7 +280,7 @@ driver picks 64 lanes.
 
 ## Relation to earlier work
 
-* **PR #33** (ElHombreAlex, draft): first wave64 → wave32 "rendezvous" through groupshared
+* **PR #33** (ElHombreAlex, closed): first wave64 → wave32 "rendezvous" through groupshared
   for compute, and the finding that NVIDIA rejects `[WaveSize(64)]`. Its exchange keeps one
   slot per half (the partner can overwrite it with the next exchange before it is read),
   publishes from lane 0 only and times out into stale data; the FSR4 pass it targeted hung
