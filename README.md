@@ -137,6 +137,20 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+### Comparing performance runs
+
+Run the same workload twice with `XCL_ACTIVITY=1` (also enabled by `scripts/smoke.ps1`).
+Keep each resulting `xcl.log`, then compare them:
+
+```powershell
+.\scripts\compare-perf.ps1 -Baseline .\base.log -Candidate .\candidate.log
+```
+
+The table pairs two-second activity samples from startup up to the shorter run. It shows each
+sample's elapsed time, presentation count and DirectStorage request count. Peak process commit
+uses the available memory samples in that common span. The first displayed frame time is read
+from each whole log and may include a black frame.
+
 ## Tests
 
 ```powershell
