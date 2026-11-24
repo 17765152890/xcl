@@ -203,13 +203,14 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    // what a run that ended without its summary (a crash in the driver or DXC) was making: left
-    // to the title, so the same pipeline does not end every run
+    // what a run of this binary that ended without its summary (a crash in the driver or DXC)
+    // was making: left to the title, so the same pipeline does not end every run. Only what was
+    // in flight (`in_flight`), and nothing after a Ctrl+C (`stop_cleanly_on_ctrl_c`).
     let trying_path = journal.with_extension("trying");
     let crashed: Vec<u64> = {
         let t = std::fs::read(&trying_path).unwrap_or_default();
         let mut g = q.0.lock().unwrap();
-        t.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).filter(|h| g.taken.insert(*h)).collect()
+        in_flight(&t, key).into_iter().filter(|h| g.taken.insert(*h)).collect()
     };
     for h in &crashed {
         let _ = done_file.write_all(&h.to_le_bytes());
@@ -217,13 +218,14 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     if !crashed.is_empty() {
         eprintln!("xcl pipelines: the last run ended while making {} pipelines: left to the title", crashed.len());
     }
-    let trying = match std::fs::File::create(&trying_path) {
-        Ok(f) => Mutex::new(f),
+    match std::fs::File::create(&trying_path).and_then(|mut f| f.write_all(&key.to_le_bytes()).map(|_| f)) {
+        Ok(f) => *TRYING.lock().unwrap() = Some(f),
         Err(e) => {
             eprintln!("xcl pipelines: {}: {e}", trying_path.display());
             return 2;
         }
-    };
+    }
+    stop_cleanly_on_ctrl_c();
     let (already, first) = {
         let mut g = q.0.lock().unwrap();
         let first = g.ingest(&mut file);
@@ -267,7 +269,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             });
         }
         for k in 0..threads {
-            let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started, trying) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started, &trying);
+            let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started);
             let _ = std::thread::Builder::new().name(format!("xcl-warm-{k}")).stack_size(64 << 20).spawn_scoped(s, move || loop {
                 let item = {
                     let mut g = q.0.lock().unwrap();
@@ -288,7 +290,8 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                     }
                 };
                 let (hash, replay) = item;
-                let _ = trying.lock().unwrap().write_all(&hash.to_le_bytes());
+                // in flight: written when it starts, and again when it has ended (`in_flight`)
+                note_trying(hash);
                 let r = match &replay {
                     None => Err("not readable from the journal".to_string()),
                     // the driver's compiles, few at once (the biggest take ~1.5 GB each)
@@ -314,7 +317,8 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                 if done {
                     let _ = done_tx.lock().unwrap().write_all(&hash.to_le_bytes());
                 }
-                let n = made.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed);
+                note_trying(hash);
+                let n =made.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed);
                 if n % 100 == 0 {
                     let left = q.0.lock().unwrap().left();
                     let rate = n as f64 / t0.elapsed().as_secs_f64().max(0.001);
@@ -324,7 +328,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
     });
     // ended by itself: nothing was cut short
-    drop(trying);
+    drop(TRYING.lock().unwrap().take());
     let _ = std::fs::remove_file(&trying_path);
     let g = q.0.lock().unwrap();
     println!(
@@ -368,6 +372,52 @@ impl Drop for DriverSlot<'_> {
 
 /// The GPU the title's runs use: its `xcl.toml`'s `d3d12_adapter` (or `XCL_ADAPTER`), as
 /// `real::init` picks it – the driver's cache and the wave width are the adapter's.
+/// The `.trying` file of the running `xcl pipelines`: the binary's key, then each pipeline's
+/// hash when its build starts and again when it has ended. None once it is closed.
+static TRYING: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+fn note_trying(hash: u64) {
+    if let Some(f) = TRYING.lock().unwrap().as_mut() {
+        let _ = f.write_all(&hash.to_le_bytes());
+    }
+}
+
+/// The pipelines a `.trying` file says were being built when its run ended: a hash written an
+/// odd number of times. A file of another binary (`key`), or none, says nothing.
+fn in_flight(bytes: &[u8], key: u64) -> Vec<u64> {
+    if bytes.len() < 8 || bytes[..8] != key.to_le_bytes() {
+        return Vec::new();
+    }
+    let mut odd: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for c in bytes[8..].chunks_exact(8) {
+        let h = u64::from_le_bytes(c.try_into().unwrap());
+        if !seen.remove(&h) {
+            seen.insert(h);
+            odd.push(h);
+        }
+    }
+    odd.retain(|h| seen.contains(h));
+    odd
+}
+
+/// Ctrl+C / closing the console is a stop, not a crash: what was in flight is left for the next
+/// run to build, so `.trying` is emptied (to its key) before the default handler ends the process.
+fn stop_cleanly_on_ctrl_c() {
+    unsafe extern "system" fn handler(_ctrl: u32) -> windows_sys::core::BOOL {
+        if let Ok(mut g) = TRYING.lock() {
+            if let Some(f) = g.as_mut() {
+                let _ = f.set_len(8);
+            }
+            *g = None;
+        }
+        0
+    }
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
 fn adapter_setting(journal: &Path) -> String {
     let toml = journal.parent().and_then(Path::parent).map(|d| d.join("xcl.toml"));
     match toml.filter(|t| t.is_file()).map(|t| crate::config::Config::load_or_create(&t)) {
@@ -495,5 +545,23 @@ mod tests {
         assert!(q.next().is_none(), "each pipeline once");
         drop(f);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_what_was_in_flight_with_this_binary_counts_as_crashed() {
+        let rec = |key: u64, hs: &[u64]| -> Vec<u8> { std::iter::once(key).chain(hs.iter().copied()).flat_map(u64::to_le_bytes).collect() };
+        // 1 and 2 ended (written twice); 3 and 4 were still being built
+        let t = rec(7, &[1, 2, 1, 3, 2, 4]);
+        let mut f = in_flight(&t, 7);
+        f.sort();
+        assert_eq!(f, vec![3, 4]);
+        // another binary's file, an empty one, a Ctrl+C one (just the key): nothing
+        assert!(in_flight(&t, 8).is_empty());
+        assert!(in_flight(&[], 7).is_empty());
+        assert!(in_flight(&rec(7, &[]), 7).is_empty());
+        // a torn last record is left out
+        let mut torn = rec(7, &[5]);
+        torn.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(in_flight(&torn, 7), vec![5]);
     }
 }
