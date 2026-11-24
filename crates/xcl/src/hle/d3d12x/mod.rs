@@ -19,6 +19,7 @@ mod fence_x;
 pub mod frame;
 pub mod gpu_views;
 pub mod guard;
+pub mod indirect;
 pub mod layout;
 pub mod list_x;
 pub mod null;

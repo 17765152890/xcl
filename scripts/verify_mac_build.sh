@@ -96,7 +96,32 @@ check "Network isolation default off (netoff)" \
 check "16 MiB title stacks under Wine" \
     "grep -q '16 << 20' crates/xcl/src/hle/kernelx.rs"
 
-# 7. CI Workflow
+# 7. Stage 6 Ingame Mechanics & Subsystems
+check "Sparse buffer lock safety (try_lock in forget_buffer)" \
+    "grep -q 'try_lock' crates/xcl/src/hle/d3d12x/sparse.rs && grep -q 'forget_gone' crates/xcl/src/hle/d3d12x/sparse.rs"
+
+check "World-load watchdog & fatal crash bypass at 0x23cf683" \
+    "grep -q '0x4d8bd421' crates/xcl/src/eh.rs"
+
+check "DirectStorage BCPack acceptance (XCL_DSTORAGE_BCPACK_ACCEPT)" \
+    "grep -q 'bcpack_accept' crates/xcl/src/hle/dstorage.rs"
+
+check "Mesh root-argument layout (user_data_ms, inline_ms)" \
+    "grep -q 'user_data_ms' crates/xcl/src/hle/d3d12x/console_list.rs"
+
+check "Mesh companion DISPATCH signature creation" \
+    "grep -q 'note_dispatch_mesh_signature' crates/xcl/src/hle/d3d12x/device_x.rs"
+
+check "Real D3D12 DispatchMesh hooking (slot 127 / newer 129)" \
+    "grep -q '127, b::dispatch_mesh' crates/xcl/src/hle/d3d12x/real.rs"
+
+check "GPU-side root-changing ExecuteIndirect repack" \
+    "test -f crates/xcl/src/hle/d3d12x/indirect.rs && grep -q 'pub mod indirect' crates/xcl/src/hle/d3d12x/mod.rs"
+
+check "Two-pass DispatchMesh & ExecuteIndirect execution harness" \
+    "grep -q 'dispatch_mesh' crates/xcl/src/hle/d3d12x/bind.rs && grep -q 'make_scaled_args_buffer' crates/xcl/src/hle/d3d12x/bind.rs"
+
+# 8. CI Workflow
 check "Mac cross-build CI workflow (.github/workflows/mac-cross.yml)" \
     "test -f .github/workflows/mac-cross.yml && grep -q 'x86_64-pc-windows-gnullvm' .github/workflows/mac-cross.yml"
 

@@ -518,7 +518,7 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rip = ctx.Rip as usize;
-    if rip < 0x1_0000 || *KEEP.get_or_init(|| std::env::var("XCL_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1")) || !crate::gpu::shader::readable(rip.wrapping_sub(0x42), 0x4E) {
+    if rip < 0x1_0000 || *KEEP.get_or_init(|| std::env::var("XCL_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1")) || !crate::gpu::shader::readable(rip, 16) {
         return false;
     }
     let at = |a: usize, n: usize| std::slice::from_raw_parts(a as *const u8, n);
@@ -531,9 +531,36 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
         ctx.Rip += 11;
         return true;
     }
+    // the fatal error / GPU hang watchdog (`mov dword ptr [0], 0x4d8bd421`): deliberate crash
+    // tripped when world-load decompression or background compute pipeline builds take >30s
+    if at(rip + 7, 4) == [0x21, 0xD4, 0x8B, 0x4D] {
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if n < 4 || n.is_power_of_two() {
+            crate::xlog_warn!("the title's fatal error / GPU hang watchdog triggered (#{n}: 0x4d8bd421 at rip={rip:#x}) – deliberate crash is skipped and title proceeds (XCL_TITLE_WATCHDOG=1 keeps the crash)");
+        }
+        if at(rip + 11, 1) == [0xC3] {
+            ctx.Rip += 11;
+        } else if at(rip + 11, 1) == [0xCC] || at(rip + 11, 2) == [0x0F, 0x0B] {
+            let ret_addr = *(ctx.Rsp as *const usize);
+            if crate::gpu::shader::readable(ret_addr, 1) {
+                ctx.Rsp += 8;
+                ctx.Rip = ret_addr as u64;
+            } else {
+                ctx.Rip += 11;
+            }
+        } else {
+            ctx.Rip += 11;
+        }
+        return true;
+    }
     // the watchdog: `mov r14, rsi; mov ebx, ebp` 0x29 bytes before, `mov r15, [rip+..]; mov r14, rsi;
     // mov ebp, 0x1e` (the path taken when no slot is stale) 0x42 bytes before
-    if at(rip + 7, 5) == [0, 0, 0, 0, 0xCC] && at(rip - 0x29, 5) == [0x49, 0x89, 0xF6, 0x89, 0xEB] && at(rip - 0x42, 3) == [0x4C, 0x8B, 0x3D] && at(rip - 0x3B, 8) == [0x49, 0x89, 0xF6, 0xBD, 0x1E, 0, 0, 0] {
+    if crate::gpu::shader::readable(rip.wrapping_sub(0x42), 0x42)
+        && at(rip + 7, 5) == [0, 0, 0, 0, 0xCC]
+        && at(rip - 0x29, 5) == [0x49, 0x89, 0xF6, 0x89, 0xEB]
+        && at(rip - 0x42, 3) == [0x4C, 0x8B, 0x3D]
+        && at(rip - 0x3B, 8) == [0x49, 0x89, 0xF6, 0xBD, 0x1E, 0, 0, 0]
+    {
         let n = SEEN.fetch_add(1, Ordering::Relaxed);
         if n < 4 || n.is_power_of_two() {
             crate::xlog_warn!("the title's stall watchdog fired (#{n}: a thread's heartbeat is older than its limit) – its deliberate crash is skipped and the title goes on (XCL_TITLE_WATCHDOG=1 keeps the crash)");
@@ -1657,4 +1684,24 @@ mod tests {
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
     }
+
+    /// The title's fatal error / GPU hang watchdog at world load (`mov dword ptr [0], 0x4d8bd421`)
+    /// is resumed by skipping the crash, allowing long shader compilation to complete.
+    #[test]
+    fn title_watchdog_resumes_fatal_crash_at_world_load() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+            assert!(code != 0);
+            // mov dword ptr [0], 0x4d8bd421; ret
+            let insn = [0xC7u8, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D, 0xC3];
+            std::ptr::copy_nonoverlapping(insn.as_ptr(), code as *mut u8, insn.len());
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = code as u64;
+            assert!(title_watchdog_resume(&mut ctx));
+            assert_eq!(ctx.Rip as usize, code + 11);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+        }
+    }
 }
+
