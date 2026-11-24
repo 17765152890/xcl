@@ -468,6 +468,32 @@ pub fn note_gpu_write(res: usize) {
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
+/// Under Wine, the coherent UMA window has no `MEM_WRITE_WATCH` (to avoid `amdgpu` userptr
+/// MMU-notifier stalls), so DirectStorage writes into it notify us directly here.
+pub fn mark_dirty_range(va: usize, len: usize) {
+    if !any() || len == 0 {
+        return;
+    }
+    if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, len)) {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    let end = va.saturating_add(len);
+    let hits = t.active_overlaps(va, end);
+    let mut added = 0usize;
+    for (_, res, _) in hits {
+        if let Some(e) = t.by_res.get_mut(&res) {
+            if !e.gpu_written && !e.pending {
+                e.pending = true;
+                added += 1;
+            }
+        }
+    }
+    if added > 0 {
+        PENDING.fetch_add(added, Ordering::Relaxed);
+    }
+}
+
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
     TEXTURES.lock().unwrap().overlapping(va, len)
@@ -746,25 +772,40 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::vram::before_execute(q);
         });
     }
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    let wine_hash_committed = crate::util::under_wine() && TEXTURES_LEN.load(Ordering::Relaxed) > 0;
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && !wine_hash_committed {
         return;
     }
+    static HASH_TICK: AtomicU64 = AtomicU64::new(0);
+    let hash_tick = if wine_hash_committed { HASH_TICK.fetch_add(1, Ordering::Relaxed) } else { 0 };
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
+        let last = if wine_hash_committed { Some(LAST_CONTENT.lock().unwrap()) } else { None };
         t.by_res
             .iter_mut()
-            .filter(|(_, e)| {
+            .filter(|(&res, e)| {
                 if e.pending {
                     return true;
                 }
                 if e.gpu_written {
                     return false;
                 }
+                let size = e.tex.size() as usize;
+                if wine_hash_committed && u.in_committed_window(e.src, size) {
+                    // Hash dynamic/small textures (Bink video, glyph caches, UI) every submit;
+                    // large static textures are notified by DirectStorage (`mark_dirty_range`)
+                    // and swept round-robin so submits stay < 1 ms.
+                    if size > (4 << 20) && (e.seq & 15) != (hash_tick & 15) {
+                        return false;
+                    }
+                    let h = content_hash(std::slice::from_raw_parts(e.src as *const u8, size));
+                    return last.as_ref().unwrap().get(&res).copied() != Some(h);
+                }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                dirty.get(i).is_some_and(|&p| p < e.src + size)
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
