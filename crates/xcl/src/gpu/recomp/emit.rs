@@ -2966,7 +2966,8 @@ impl Em {
             if m.clamp {
                 s = format!("saturate({s})");
             }
-            if name == "v_mul_f16" {
+            // exact in binary32: a product of two halves, a 16-bit integer
+            if matches!(name, "v_mul_f16" | "v_cvt_f16_u16" | "v_cvt_f16_i16") {
                 to_f16_rounded_expr(dyn_rm, &s)
             } else {
                 to_f16_expr(dyn_rm, &s)

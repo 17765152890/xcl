@@ -6526,6 +6526,130 @@ fn float_compares_random(wave64: bool) {
     assert_eq!(total_bad, 0);
 }
 
+/// A finite f16 as an exact integer in units of 2^-24 (every f16 is a multiple of 2^-24, at most
+/// 65504 = 2^40 units); None for inf / NaN.
+fn f16_exact(h: u16) -> Option<i128> {
+    let (e, m) = ((h >> 10) & 0x1F, (h & 0x3FF) as i128);
+    let mag = match e {
+        31 => return None,
+        0 => m,
+        _ => (m | 0x400) << (e - 1),
+    };
+    Some(if h & 0x8000 != 0 { -mag } else { mag })
+}
+
+/// An exact value in units of 2^-`u` (u >= 24) rounded to f16, to nearest, ties to even (the
+/// RDNA default, MODE.FP_ROUND f16 = 0), overflowing to inf; `neg_zero`: the sign of an exact
+/// zero.
+fn f16_round_exact(v: i128, u: u32, neg_zero: bool) -> u16 {
+    let sign = if v < 0 || (v == 0 && neg_zero) { 0x8000u16 } else { 0 };
+    let m = v.unsigned_abs();
+    let bits = |x: u128| 127 - x.leading_zeros(); // 2^bits <= x
+    // the quantum, in units: 2^-24 below the smallest normal (2^-14), else 2^(exponent - 10)
+    let min_normal = 1u128 << (u - 14);
+    let q_log = if m < min_normal { u - 24 } else { bits(m) - 10 };
+    let mut k = m >> q_log;
+    if q_log > 0 {
+        let (r, half) = (m & ((1u128 << q_log) - 1), 1u128 << (q_log - 1));
+        if r > half || (r == half && k & 1 == 1) {
+            k += 1;
+        }
+    }
+    let rounded = k << q_log;
+    if rounded < min_normal {
+        return sign | (rounded >> (u - 24)) as u16;
+    }
+    let l = bits(rounded);
+    let e = l as i32 - u as i32 + 15;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    sign | (e as u16) << 10 | ((rounded >> (l - 10)) as u16 & 0x3FF)
+}
+
+#[test]
+fn f16_exact_reference_round_trips() {
+    for h in 0..=u16::MAX {
+        if let Some(v) = f16_exact(h) {
+            assert_eq!(v as f64 / 2f64.powi(24), f16_to_f64(h), "{h:#06x}");
+            for u in [24, 48] {
+                assert_eq!(f16_round_exact(v << (u - 24), u, h & 0x8000 != 0), h, "{h:#06x} in units of 2^-{u}");
+            }
+        }
+    }
+    // in units of 2^-48: 1.0 = 2^48, its ulp 2^38
+    let (one, ulp) = (1i128 << 48, 1i128 << 38);
+    let r = |v: i128| f16_round_exact(v, 48, false);
+    assert_eq!(r(one + ulp / 2), 0x3C00, "a tie to the even 1.0");
+    assert_eq!(r(one + 3 * ulp / 2), 0x3C02, "a tie to the even 1 + 2^-9");
+    assert_eq!(r(one + ulp / 2 + 1), 0x3C01, "just above the tie");
+    assert_eq!(r(one + ulp / 2 - 1), 0x3C00, "just below the tie");
+    assert_eq!(r(-(one + ulp / 2 + 1)), 0xBC01);
+    let max = f16_exact(0x7BFF).unwrap() << 24; // 65504; 65520 is the tie with 2^16
+    assert_eq!(r(max + (16 << 48)), 0x7C00, "65520 rounds to inf");
+    assert_eq!(r(max + (16 << 48) - 1), 0x7BFF);
+    assert_eq!(r(1 << 23), 0x0000, "half the smallest subnormal: a tie to 0");
+    assert_eq!(r((1 << 23) + 1), 0x0001);
+    assert_eq!(r(3 << 23), 0x0002, "1.5 subnormal quanta: a tie to the even 2");
+    assert_eq!(f16_round_exact(0, 48, true), 0x8000);
+}
+
+/// v_cvt_f16_u16 / v_cvt_f16_i16 on every 16-bit input against the exact reference: the
+/// integer rounded to nearest even (default mode), 65 520 and above to inf. 16 conversions per
+/// lane per dispatch; the high halves of the sources hold junk.
+#[test]
+fn gpu_cvt_f16_from_16_bit_integers_exhaustive() {
+    for wave64 in gpu_waves() {
+        cvt_f16_from_16_bit_integers(wave64);
+    }
+}
+
+fn cvt_f16_from_16_bit_integers(wave64: bool) {
+    // v16..v31 = cvt_f16_u16 of v0..v15, v32..v47 = cvt_f16_i16 of v0..v15
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>)> = Vec::new();
+    for k in 0..16u64 {
+        list.push(("V_CVT_F16_U16", "ENC_VOP1", vec![("VDST", 16 + k), ("SRC0", V + k)]));
+        list.push(("V_CVT_F16_I16", "ENC_VOP1", vec![("VDST", 32 + k), ("SRC0", V + k)]));
+    }
+    let p = prog(&list.iter().map(|(n, e, f)| (*n, *e, &f[..], None)).collect::<Vec<_>>());
+    let (dxil, mem) = kernel_wave(&p, wave64);
+    let n = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0xC0F1_6000_0000_0001);
+    let mut bad: Vec<String> = Vec::new();
+    let (mut checked, mut wrong_u, mut wrong_i) = (0usize, 0usize, 0usize);
+    for d in 0..(65536 / (16 * n)) {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().take(n).enumerate() {
+            for k in 0..16 {
+                let x = ((d * n + l) * 16 + k) as u32;
+                r[k] = x | (rng.next() as u32) << 16;
+            }
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for l in 0..n {
+            for k in 0..16 {
+                let x = ((d * n + l) * 16 + k) as u16;
+                let (want_u, want_i) = (f16_round_exact((x as i128) << 24, 24, false), f16_round_exact((x as i16 as i128) << 24, 24, false));
+                let (got_u, got_i) = (r.vgpr[l][16 + k] as u16, r.vgpr[l][32 + k] as u16);
+                checked += 1;
+                if got_u != want_u {
+                    wrong_u += 1;
+                    bad.push(format!("v_cvt_f16_u16({x}) = {got_u:#06x} ({}), want {want_u:#06x} ({})", f16_to_f64(got_u), f16_to_f64(want_u)));
+                }
+                if got_i != want_i {
+                    wrong_i += 1;
+                    bad.push(format!("v_cvt_f16_i16({}) = {got_i:#06x} ({}), want {want_i:#06x} ({})", x as i16, f16_to_f64(got_i), f16_to_f64(want_i)));
+                }
+            }
+        }
+    }
+    println!("wave{n}: {checked} inputs each; wrong: v_cvt_f16_u16 {wrong_u}, v_cvt_f16_i16 {wrong_i}");
+    for b in bad.iter().take(20) {
+        println!("  {b}");
+    }
+    assert!(bad.is_empty(), "{} results differ from the exact reference", bad.len());
+}
+
 fn hwreg_imm(id: u64, offset: u64, width: u64) -> u64 {
     id | (offset << 6) | ((width - 1) << 11)
 }
