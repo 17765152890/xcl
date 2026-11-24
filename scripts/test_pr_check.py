@@ -154,5 +154,44 @@ class SectionHeadingTests(unittest.TestCase):
         self.assertEqual([self.empty("AI use")], self.problems(self.FILLED.replace("- none\n", "")))
 
 
+class BannedModelTests(unittest.TestCase):
+    """The model check reads what is visible under **AI use**, as the section check does."""
+
+    FILLED = SectionHeadingTests.FILLED
+    QWEN = FILLED.replace("- none\n", "- Qwen3-Coder wrote the code\n")
+
+    def problems(self, body):
+        return check(body, HEAD, [changed("scripts/example.py")], lambda _: False)
+
+    @staticmethod
+    def banned(*models):
+        return ("**AI use** names a model this repository does not accept for code ("
+                + ", ".join(models) + "): see CONTRIBUTING.md")
+
+    def test_model_under_ai_use_is_refused(self):
+        self.assertEqual([self.banned("qwen")], self.problems(self.QWEN))
+        self.assertEqual([], self.problems(self.FILLED))
+
+    def test_section_name_elsewhere_does_not_hide_the_section(self):
+        # in a comment at the top, or in a sentence of another section
+        body = "<!-- see **AI use** at the end -->\n" + self.QWEN
+        self.assertEqual([self.banned("qwen")], self.problems(body))
+        body = self.QWEN.replace("- `scripts/example.py`: the change\n",
+                                 "- the **AI use** section is short\n")
+        self.assertEqual([self.banned("qwen")], self.problems(body))
+
+    def test_bold_line_does_not_end_the_section(self):
+        body = self.FILLED.replace("- none\n", "- Claude Code\n**also** Qwen3 for the tests\n")
+        self.assertEqual([self.banned("qwen")], self.problems(body))
+
+    def test_comment_is_not_what_was_used(self):
+        body = self.FILLED.replace("- none\n", "<!-- not qwen or llama -->\n- Claude Code\n")
+        self.assertEqual([], self.problems(body))
+
+    def test_model_in_another_section_is_not_ai_use(self):
+        body = self.FILLED.replace("- Windows\n", "- nothing with Llama\n")
+        self.assertEqual([], self.problems(body))
+
+
 if __name__ == "__main__":
     unittest.main()
