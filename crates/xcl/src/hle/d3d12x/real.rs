@@ -507,10 +507,19 @@ pub fn init() -> Result<String, String> {
                 list = crate::gpu::adapter::candidates(&factory, &crate::gpu::adapter::Selector::Auto);
             }
             for (adapter, desc) in list {
-                if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
-                    device = Some(dev);
-                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
-                    break;
+                match crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    Ok(dev) => {
+                        device = Some(dev);
+                        name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                        break;
+                    }
+                    Err(err) => {
+                        crate::xlog_warn!(
+                            "D3D12: failed to initialize GPU '{}': {}",
+                            crate::gpu::adapter::name(&desc),
+                            err
+                        );
+                    }
                 }
             }
         }
