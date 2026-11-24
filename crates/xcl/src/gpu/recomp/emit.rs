@@ -1919,7 +1919,11 @@ impl Em {
         self.line(&format!("int2 {t}_xy = int2(xi.xcl_pos.x > QuadReadAcrossX(xi.xcl_pos.x), xi.xcl_pos.y > QuadReadAcrossY(xi.xcl_pos.y));"));
         self.line(&format!("float4 {t}_values; [unroll] for (uint {t}_q = 0; {t}_q < 4; ++{t}_q) {{"));
         self.line(&format!("    int2 {t}_delta = {t}_xy - int2({t}_q & 1u, {t}_q >> 1);"));
-        self.line(&format!("    {ty} {t}_p = QuadReadLaneAt({coord}, {t}_q) + {t}_delta.x * QuadReadLaneAt({dx}, {t}_q) + {t}_delta.y * QuadReadLaneAt({dy}, {t}_q);"));
+        self.line(&format!("    {ty} {t}_p = QuadReadLaneAt({coord}, {t}_q);"));
+        self.line(&format!("    {ty} {t}_dx = QuadReadLaneAt({dx}, {t}_q), {t}_dy = QuadReadLaneAt({dy}, {t}_q);"));
+        // Keep the coordinate on each stationary axis even for a nonfinite gradient (0 * inf is NaN).
+        self.line(&format!("    {t}_p = {t}_delta.x == 0 ? {t}_p : {t}_p + {t}_delta.x * {t}_dx;"));
+        self.line(&format!("    {t}_p = {t}_delta.y == 0 ? {t}_p : {t}_p + {t}_delta.y * {t}_dy;"));
         self.line(&format!("    {t}_values[{t}_q] = {t}_T.SampleCmp({t}_S, {args});"));
         self.line("}");
         format!("{t}_values[{t}_xy.x + 2 * {t}_xy.y].xxxx")
