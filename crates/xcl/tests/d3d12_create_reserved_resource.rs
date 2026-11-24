@@ -38,9 +38,8 @@ type CreateReservedResourceFn = unsafe extern "system" fn(
 ) -> HRESULT;
 
 struct TestDevices {
-    host_raw: usize,
-    host_create_reserved: CreateReservedResourceFn,
     xcl_raw: usize,
+    host_create_reserved: CreateReservedResourceFn,
 }
 
 static DEVICES: OnceLock<Option<TestDevices>> = OnceLock::new();
@@ -53,7 +52,7 @@ unsafe fn call_host_create_reserved(
     riid: &GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    (devs.host_create_reserved)(devs.host_raw as *mut c_void, desc, state, clear, riid, ppv)
+    (devs.host_create_reserved)(devs.xcl_raw as *mut c_void, desc, state, clear, riid, ppv)
 }
 
 unsafe fn call_xcl_create_reserved(
@@ -72,8 +71,8 @@ unsafe fn call_xcl_create_reserved(
 }
 
 unsafe fn host_device(devs: &TestDevices) -> ID3D12Device {
-    // Borrowed wrapper: bump refcount so dropping the returned ID3D12Device keeps DEVICES alive.
-    let raw = devs.host_raw as *mut c_void;
+    // Borrowed wrapper on the same adopted device: bump refcount so dropping keeps DEVICES alive.
+    let raw = devs.xcl_raw as *mut c_void;
     let vt = *(raw as *const *const usize);
     let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
     add_ref(raw);
@@ -82,16 +81,6 @@ unsafe fn host_device(devs: &TestDevices) -> ID3D12Device {
 
 fn init_devices(test_name: &str) -> Option<&'static TestDevices> {
     let entry = DEVICES.get_or_init(|| unsafe {
-        // Capture the unhooked PC driver's CreateReservedResource pointer BEFORE
-        // d3d12x::backend() hooks the singleton device's vtable in place.
-        let Ok(host) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
-            return None;
-        };
-        let host_raw = host.into_raw();
-        let orig_vt = *(host_raw as *const *const usize);
-        let host_create_reserved: CreateReservedResourceFn =
-            std::mem::transmute(*orig_vt.add(CREATE_RESERVED_RESOURCE_SLOT));
-
         if d3d12x::backend() != Backend::Real {
             return None;
         }
@@ -106,17 +95,26 @@ fn init_devices(test_name: &str) -> Option<&'static TestDevices> {
         if hr < 0 || xcl_raw.is_null() {
             return None;
         }
+        // Use the adopted XCL backend device for both paths so host and XCL are guaranteed to
+        // share the exact same adapter (including on multi-GPU systems with XCL_ADAPTER set).
+        assert_eq!(
+            xcl_raw,
+            d3d12x::real::device_raw(),
+            "D3D12CreateDevice should return the adopted XCL backend device"
+        );
+        let orig_ptr = d3d12x::real::orig_fn(xcl_raw, CREATE_RESERVED_RESOURCE_SLOT);
+        assert_ne!(orig_ptr, 0, "orig_fn returned null for CreateReservedResource slot 30");
         let hooked_vt = *(xcl_raw as *const *const usize);
         let hooked_fn = *hooked_vt.add(CREATE_RESERVED_RESOURCE_SLOT);
         assert_ne!(
             hooked_fn,
-            host_create_reserved as usize,
+            orig_ptr,
             "XCL should have hooked ID3D12Device::CreateReservedResource (slot 30)"
         );
+        let host_create_reserved: CreateReservedResourceFn = std::mem::transmute(orig_ptr);
         Some(TestDevices {
-            host_raw: host_raw as usize,
-            host_create_reserved,
             xcl_raw: xcl_raw as usize,
+            host_create_reserved,
         })
     });
     if entry.is_none() {
