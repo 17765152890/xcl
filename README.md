@@ -81,6 +81,8 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
+  `mouse_sensitivity` must be a finite 32-bit float; NaN, infinities, and values that overflow
+  that range are rejected when reading the configuration.
 
 ## Building and usage
 
