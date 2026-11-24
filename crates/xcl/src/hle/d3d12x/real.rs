@@ -4218,8 +4218,21 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         return None;
     }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
-    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+    let mut as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
+    let mut ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+    // `XCL_MS_IN_AS=1` (experiment): such a pipeline is translated as the mesh pipeline it holds
+    // (its draws are logged and skipped in `bind` until two-pass draws run)
+    static MS_IN_AS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *MS_IN_AS.get_or_init(|| std::env::var_os("XCL_MS_IN_AS").is_some()) && ms_slot.is_none() {
+        if let Some(a) = as_slot.filter(|a| is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS")) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                let types: Vec<(u32, usize)> = subs.iter().map(|s| (s.0, s.1.len())).collect();
+                crate::xlog_info!("D3D12.X: XCL_MS_IN_AS: mesh pipeline with its MS {:016x} in the AS slot translated; subobjects (type, bytes) {types:?}", crate::gpu::shader::fnv64(a));
+            }
+            (ms_slot, as_slot) = (Some(a), None);
+        }
+    }
     // A console MS container in the AS slot and no MS subobject (a retail game's minimap
     // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
     // from then on (a black screen every run); refused, it goes on to its menus. What it

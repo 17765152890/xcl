@@ -217,6 +217,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if two_pass_skipped(pso, format_args!("ExecuteIndirect(signature {sig:#x}, max {max}, count buffer {})", count_buf != 0)) {
+        return;
+    }
     if !gfx && !compute {
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
@@ -361,12 +364,40 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
+/// PC lists that bound a two-pass pipeline since their last Close (`take_mesh_list`)
+static MESH_LISTS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether PC list `list` bound a two-pass pipeline in the recording that is closing (with
+/// `XCL_LIST_TRACE`, `title_list` logs the console slots it called)
+pub(super) fn take_mesh_list(list: usize) -> bool {
+    MESH_LISTS.lock().unwrap().remove(&list)
+}
+
+/// A pipeline made of two passes (a console mesh shader or VS + GS: a compute pass, then a mesh
+/// pass): its draws do not run yet – what the title does with one is logged (`what`, the first
+/// 16) and the draw skipped. As a PC pipeline the mesh pipeline would be drawn without its
+/// compute pass, with the title's root signature: an invalid call that ends the list.
+fn two_pass_skipped(pso: usize, what: std::fmt::Arguments) -> bool {
+    let real = super::pso_async::resolve_wait(pso);
+    let Some(tp) = super::real::two_pass_of(real) else { return false };
+    count(DRAWS_SKIPPED);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        crate::xlog_info!("D3D12.X: {what} with a two-pass pipeline {real:#x} (console {}) skipped", tp.kind);
+    }
+    true
+}
+
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
 /// arguments are bound (None: the draw is skipped – a console pipeline without a
 /// translation, or no unified memory).
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
+    let (indexed, n, instances, _, _) = DRAW_ARGS.with(|d| d.get());
+    if two_pass_skipped(pso, format_args!("Draw{}Instanced({n}, {instances})", if indexed { "Indexed" } else { "" })) {
+        return None;
+    }
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
     if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
         count(DRAWS_PC);
@@ -668,6 +699,13 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     with(this, |s| s.pso = pso as usize);
+    if let Some(tp) = super::real::two_pass_of(super::pso_async::resolve_wait(pso as usize)) {
+        MESH_LISTS.lock().unwrap().insert(this as usize);
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_info!("D3D12.X: a two-pass pipeline {pso:p} (console {}) is bound", tp.kind);
+        }
+    }
     super::real::bind_pipeline(this, pso);
 }
 

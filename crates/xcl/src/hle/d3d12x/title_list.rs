@@ -109,6 +109,15 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
     let n = *((this as usize + F_RING_AT) as *const usize);
+    // a recording that bound a two-pass pipeline: what it called (the first 12)
+    if super::bind::take_mesh_list(pc as usize) && n > 0 {
+        static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+            let first = n.saturating_sub(RING);
+            let slots: Vec<String> = (first..n).map(|k| (*((this as usize + F_RING + 2 * (k % RING)) as *const u16)).to_string()).collect();
+            crate::xlog_info!("D3D12.X: a list with a two-pass pipeline closes ({:#x}); console slots called (last {} of {n}): {}", hr as u32, slots.len(), slots.join(" "));
+        }
+    }
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);
         let slots: Vec<String> = (first..n).map(|k| (*((this as usize + F_RING + 2 * (k % RING)) as *const u16)).to_string()).collect();
