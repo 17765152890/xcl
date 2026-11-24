@@ -579,9 +579,26 @@ pub fn format(d: &Decoded) -> String {
         }
     }
     match d.enc.name {
-        "ENC_SMEM" => {
-            if let Some(off) = field_value(d.enc, &d.words, "OFFSET") {
-                let _ = write!(s, ", {off:#x}");
+        // `s_load_dword s5, s[2:3], 0x64` (immediate offset), or `s0 offset:0x12345` (SGPR offset,
+        // then the immediate when not 0), then glc / dlc. Instructions with no offset operand
+        // (s_memtime, s_dcache_inv) print neither.
+        "ENC_SMEM" if d.ienc.operands.iter().any(|o| o.field == Some("SOFFSET")) => {
+            let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+            let off = f("OFFSET");
+            if f("SOFFSET") == 125 {
+                // SOFFSET = null: the immediate is the offset (`null` when it is 0 as well)
+                if off != 0 {
+                    let _ = write!(s, ", {off:#x}");
+                } else {
+                    s.push_str(", null");
+                }
+            } else if off != 0 {
+                let _ = write!(s, " offset:{off:#x}");
+            }
+            for (n, label) in [("GLC", "glc"), ("DLC", "dlc")] {
+                if f(n) == 1 {
+                    let _ = write!(s, " {label}");
+                }
             }
         }
         "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
@@ -693,6 +710,32 @@ mod tests {
         // SBASE counts SGPR pairs, SRSRC SGPR quads (seen in retail code)
         assert_eq!(dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]), "s_load_dwordx4 s[8:11], s[16:17], 0x920");
         assert_eq!(dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]), "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40");
+    }
+
+    /// Every SMEM line of LLVM's gfx10 tests: SGPR / immediate offset, glc, dlc.
+    #[test]
+    fn smem_text_matches_llvm() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu/gfx10_smem.txt");
+        let (mut n, mut skipped, mut bad) = (0, 0, Vec::new());
+        for line in std::fs::read_to_string(p).unwrap().lines() {
+            let Some((_, rest)) = line.strip_prefix('#').and_then(|r| r.split_once(':')) else { continue };
+            let Some((asm, enc)) = rest.split_once("; encoding: [") else { continue };
+            let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+            let want = asm.split_whitespace().collect::<Vec<_>>().join(" ");
+            n += 1;
+            let Ok(d) = decode(&bytes, 0) else {
+                skipped += 1; // not in RDNA2 (LLVM's gfx10 tests also cover instructions RDNA2 removed)
+                continue;
+            };
+            let got = format(&d);
+            if got != want {
+                bad.push(format!("{want} <- {got}"));
+            }
+        }
+        assert!(n - skipped > 150, "only {} SMEM lines decoded of {n}", n - skipped);
+        assert!(bad.is_empty(), "{} of {n} SMEM lines differ: {:?}", bad.len(), &bad[..bad.len().min(25)]);
+        // the word from issue #664
+        assert_eq!(dis(&[0x62, 0xdf, 0x0f, 0xf4, 0xa7, 0x50, 0xcf, 0xd4]), "s_load_dwordx8 null, s[68:69], vcc_lo offset:0xf50a7 glc dlc");
     }
 
     #[test]
