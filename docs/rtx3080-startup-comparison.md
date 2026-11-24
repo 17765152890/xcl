@@ -49,3 +49,7 @@ An isolated 109-file test using a local windowed build based on `d208e14` displa
 ### Player1 input check
 
 The same 109-file Wacom test used XCL’s built-in input script to send one A press at 60 seconds. The host logged the A button bit (`0x4`). Before the press, the window showed the dark Player1 prompt. After it, the game displayed the colored Navigation Experience setup screen, with Minimap (Dynamic) and Continue. The final activity intervals remained near 30 accepted presents per second, and the job reached its 180-second limit without a reported exception. This verifies the title’s response to an app-local scripted press. Physical input and world rendering remain to be checked.
+
+### Normal keyboard input
+
+The stock keyboard run recorded an A button bit, but brief taps left the Player1 screen unchanged. A local opt-in build buffered mapped key taps for 125 ms on the focused XCL window. With that build, Enter selected Player1, the game rendered its loading artwork, and ordinary keyboard and mouse-wheel input advanced first-run setup and navigated Settings. The window stayed near 30 FPS through those screens. All 12 Display options were inspected; no frame-rate option was exposed there. Finish Setup and the notices page led to Rockstar’s Legal Terms & Policies screen, with consent left to the player. In-world rendering and performance are still unverified.
