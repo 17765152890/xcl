@@ -600,7 +600,9 @@ impl State {
         let done = unsafe { self.fence.GetCompletedValue() };
         if let Some(i) = self.retired.iter().position(|(_, v, _)| done >= *v) {
             let (heap, _, _) = self.retired.remove(i);
-            return Some((self.adopt_heap(heap), false));
+            // A retired heap still holds its old tile contents: tile 0 needs the same
+            // clearing a free-list tile gets (`reused` queues it in `to_zero`).
+            return Some((self.adopt_heap(heap), true));
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
