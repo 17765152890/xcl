@@ -7168,6 +7168,41 @@ fn gpu_cmp_class_f16_preserves_snan() {
     }
 }
 
+/// `v_cmp_class_f32` with ABS / NEG: the modifiers are the sign bit, as for the f16 and f64
+/// forms; a denormal stays a denormal (not a zero of a flushing float op) and a signalling NaN
+/// stays signalling (#1281).
+#[test]
+fn gpu_cmp_class_f32_modifiers_keep_denormals_and_snan() {
+    let c = |dst: u64, src: u64, mask: u32, m: &'static str| {
+        ("V_CMP_CLASS_F32", "ENC_VOP3", vec![("VDST", dst), ("SRC0", V + src), ("SRC1", 255), (m, 1)], Some(mask))
+    };
+    let list = [
+        c(0, 0, 1 << 4, "NEG"), // -(+denormal): -denormal
+        c(2, 0, 1 << 5, "NEG"), // ... not -0
+        c(4, 1, 1 << 7, "ABS"), // |-denormal|: +denormal
+        c(6, 1, 1 << 6, "ABS"), // ... not +0
+        c(8, 2, 1 << 0, "NEG"), // -sNaN: still a signalling NaN
+        c(10, 2, 1 << 1, "NEG"), // ... not quiet
+        c(12, 3, 1 << 0, "ABS"), // |-sNaN|: still a signalling NaN
+        c(14, 3, 1 << 1, "ABS"), // ... not quiet
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let p = prog(&refs);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2], r[3]) = (0x0000_0001, 0x8000_0001, 0x7F80_0001, 0xFF80_0001);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        let what = ["-(+denormal) is -denormal", "-(+denormal) is no -0", "|-denormal| is +denormal", "|-denormal| is no +0", "-sNaN is sNaN", "-sNaN is no qNaN", "|-sNaN| is sNaN", "|-sNaN| is no qNaN"];
+        for (k, w) in what.iter().enumerate() {
+            let want = if k % 2 == 0 { all } else { (0, 0) };
+            assert_eq!((r.sgpr[2 * k], r.sgpr[2 * k + 1]), want, "wave{lanes}: {w}");
+        }
+    }
+}
+
 #[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[
