@@ -495,6 +495,37 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     }
 }
 
+/// Run a tracked resource's real COM `Release` under `TEXTURES` and remove it atomically when
+/// its refcount reaches zero, so no concurrent `refresh` / `register` / `retire_overlapping` can
+/// `AddRef` a destroyed `ID3D12Resource` between `Release() == 0` and `forget()`. Returns `None`
+/// if `res` is not tracked here; otherwise `Some((refcount, to_remap))`.
+pub(super) unsafe fn release_if_tracked(
+    res: usize,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+) -> Option<(u32, Vec<ID3D12Resource>)> {
+    let mut t = TEXTURES.lock().unwrap();
+    if !t.by_res.contains_key(&res) && !t.shadowed.contains_key(&res) {
+        return None;
+    }
+    let n = release(res as *mut c_void);
+    if n != 0 {
+        return Some((n, Vec::new()));
+    }
+    let (_removed, delta, remap_ptrs) = t.remove(res);
+    adjust_pending(delta);
+    TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+    Some((0, clone_resources(&remap_ptrs)))
+}
+
+/// Complete cleanup after `release_if_tracked` removed `res` on final release.
+pub(super) unsafe fn finish_forget(res: usize, to_remap: Vec<ID3D12Resource>) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
+    for r in &to_remap {
+        super::vram::remap_if_unmapped(r);
+    }
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+}
+
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
@@ -1501,6 +1532,40 @@ mod tests {
         assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
+    }
+
+    /// Releasing a tracked texture runs COM `Release` under `TEXTURES` and removes the entry
+    /// atomically when refcount hits zero so no concurrent `refresh` can `AddRef` a dead object.
+    #[test]
+    fn release_if_tracked_removes_atomically_under_textures_lock() {
+        use std::sync::atomic::AtomicU32;
+        static REFCNT: AtomicU32 = AtomicU32::new(2);
+        unsafe extern "system" fn fake_release(_this: *mut c_void) -> u32 {
+            // Must hold TEXTURES while Release runs so no concurrent refresh can AddRef it.
+            assert!(TEXTURES.try_lock().is_err(), "TEXTURES must be held across COM Release");
+            REFCNT.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        let _guard = TEST_LOCK.lock().unwrap();
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let res = 0x7E57_0000_9000usize;
+        REFCNT.store(2, Ordering::Release);
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res, Entry { device: 0, va: 0x7E57_0000_8000, src: 0x7E57_0000_8000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+            TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        }
+        unsafe {
+            assert!(release_if_tracked(0x7E57_0000_9999, fake_release).is_none());
+            // First release: refcount 2 -> 1, stays tracked.
+            let r1 = release_if_tracked(res, fake_release).unwrap();
+            assert_eq!(r1.0, 1);
+            assert!(TEXTURES.lock().unwrap().by_res.contains_key(&res));
+            // Final release: refcount 1 -> 0, removed before TEXTURES is unlocked.
+            let r2 = release_if_tracked(res, fake_release).unwrap();
+            assert_eq!(r2.0, 0);
+            assert!(!TEXTURES.lock().unwrap().by_res.contains_key(&res));
+            finish_forget(res, r2.1);
+        }
     }
 
     /// The title's bytes are used where they are when all of them are readable, and read with the

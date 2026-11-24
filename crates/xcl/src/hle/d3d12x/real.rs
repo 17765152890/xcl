@@ -1546,7 +1546,10 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let (n, tracked_remap) = match super::title_textures::release_if_tracked(this as usize, f) {
+        Some((n, to_remap)) => (n, Some(to_remap)),
+        None => (f(this), None),
+    };
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1562,7 +1565,10 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
+        match tracked_remap {
+            Some(to_remap) => super::title_textures::finish_forget(this as usize, to_remap),
+            None => super::title_textures::forget(this as usize),
+        }
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
