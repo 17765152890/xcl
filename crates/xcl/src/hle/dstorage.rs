@@ -278,7 +278,6 @@ unsafe fn bcpack_dump_source(r: &Request) {
         return;
     }
     let stem = format!("{k:03}-mode{}", r.bcpack());
-    let _ = std::fs::write(dir.join(format!("{stem}.bin")), &src);
     let meta = format!(
         "mode {} {} swizzle {} source_size {} destination_size {} intermediate_size {} zlib {} options {:#x}\n",
         r.bcpack(),
@@ -290,8 +289,34 @@ unsafe fn bcpack_dump_source(r: &Request) {
         r.zlib(),
         r.options
     );
-    let _ = std::fs::write(dir.join(format!("{stem}.meta")), meta);
-    crate::xlog_info!("DirectStorage: BCPack dump: request {k} kept ({} bytes, mode {}) under {}", src.len(), r.bcpack(), dir.display());
+    match dump_pair(&dir, &stem, &src, &meta) {
+        Ok(()) => crate::xlog_info!("DirectStorage: BCPack dump: request {k} kept ({} bytes, mode {}) under {}", src.len(), r.bcpack(), dir.display()),
+        // a .meta whose bytes never landed is the pair a decoder would test against, so a
+        // failed dump leaves no pair behind at all
+        Err(e) => crate::xlog_warn!("DirectStorage: BCPack dump: request {k}: not kept ({e}); no pair left behind"),
+    }
+}
+
+/// Writes a dump's bytes and its description as one pair: both go to `.tmp` names first, the
+/// bytes are renamed into place, and the description follows them. If anything fails, the
+/// temporary files and any `NNN-modeM.bin`/`.meta` pair are removed, so a reader never finds a
+/// description that outlived the bytes it describes. The bytes land before the description,
+/// never the other way around.
+fn dump_pair(dir: &std::path::Path, stem: &str, src: &[u8], meta: &str) -> std::io::Result<()> {
+    let bin = dir.join(format!("{stem}.bin"));
+    let meta_path = dir.join(format!("{stem}.meta"));
+    let bin_tmp = dir.join(format!("{stem}.bin.tmp"));
+    let meta_tmp = dir.join(format!("{stem}.meta.tmp"));
+    let written = std::fs::write(&bin_tmp, src)
+        .and_then(|()| std::fs::write(&meta_tmp, meta))
+        .and_then(|()| std::fs::rename(&bin_tmp, &bin))
+        .and_then(|()| std::fs::rename(&meta_tmp, &meta_path));
+    if written.is_err() {
+        for p in [&bin_tmp, &meta_tmp, &bin, &meta_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    written
 }
 
 /// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
@@ -2316,6 +2341,29 @@ mod tests {
             std::env::remove_var("XCL_DATA_ROOT");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bcpack_dump_failure_leaves_no_meta_that_describes_missing_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("xcl-test-bcpack-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // an earlier dump of this slot, then its bytes held open the way a decoder would:
+        // a reader that does not share writes makes the rename fail
+        std::fs::write(dir.join("001-mode1.bin"), [0x11u8; 16]).unwrap();
+        std::fs::write(dir.join("001-mode1.meta"), "source_size 16\n").unwrap();
+        let hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(dir.join("001-mode1.bin")).unwrap();
+
+        let written = dump_pair(&dir, "001-mode1", &[0xA5u8; 64], "source_size 64\n");
+
+        assert!(written.is_err(), "a .bin opened without sharing cannot be replaced");
+        drop(hold);
+        assert_eq!(std::fs::read(dir.join("001-mode1.bin")).unwrap(), [0x11u8; 16], "the bytes that could not be replaced are untouched");
+        assert!(!dir.join("001-mode1.meta").exists(), "no .meta describing bytes that never landed");
+        assert!(!dir.join("001-mode1.bin.tmp").exists() && !dir.join("001-mode1.meta.tmp").exists(), "no temporary files left");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
