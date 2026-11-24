@@ -377,6 +377,30 @@ mod help_tests {
         assert_eq!(resolve(slow), 0x5556);
         released(slow);
     }
+
+    /// A second copy that fails decides nothing: the worker's build is still the pipeline, and
+    /// the bind returns it (a copy that ran short of commit used to leave the pipeline failed
+    /// for the rest of the run, so every dispatch of it was skipped).
+    #[test]
+    fn a_second_copy_that_fails_leaves_the_workers_build_to_decide() {
+        let pso = 0x7E57_7012usize;
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let s = started.clone();
+        let worker = Box::new(move || {
+            s.store(true, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            0x7777usize
+        });
+        submit_second(pso, true, worker, true, 0, Some(Box::new(|| 0)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(started.load(Ordering::Acquire), "a worker is building it");
+        assert_eq!(resolve_wait(pso), 0x7777, "the worker's build, not the copy's failure");
+        assert_eq!(resolve(pso), 0x7777);
+        released(pso);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -401,13 +425,17 @@ pub fn resolve(pso: usize) -> usize {
 
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
-/// When a worker is building it and that takes long, the thread builds a second copy after
-/// `HELP_AFTER` and the first of the two to finish is the pipeline: a retail title's world
-/// loading waited on one slow build at a time with the rest of the machine idle.
+/// When a worker has it and is still not done after `HELP_AFTER`, a second copy of the build
+/// goes to a thread of its own and the first of the two to finish is the pipeline: a worker
+/// held up before its build (the one big driver compile at a time, the commit and DXC gates)
+/// otherwise keeps the title's thread waiting with the machine idle. The copy builds on its
+/// own thread, not this one: translation recurses deeply and a title's thread may have a
+/// small stack, and waiting inside the build would miss the worker finishing first.
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    if let Some(job) = p.job.lock().unwrap().take() {
+    let job = p.job.lock().unwrap().take();
+    if let Some(job) = job {
         complete(&p, job());
     } else {
         let start = std::time::Instant::now();
@@ -415,11 +443,24 @@ pub fn resolve_wait(pso: usize) -> usize {
         while !*done && start.elapsed() < *HELP_AFTER {
             (done, _) = p.cv.wait_timeout(done, *HELP_AFTER - start.elapsed()).unwrap();
         }
-        let second = if *done { None } else { p.second.lock().unwrap().take() };
+        // (None: already built, another bind took it, there is none, or help is off)
+        let second = if *done || HELP_AFTER.is_zero() { None } else { p.second.lock().unwrap().take() };
         drop(done);
-        // (None: another bind took it, or there is none: wait for the worker as before)
         if let Some(job) = second {
-            complete(&p, job());
+            let p = p.clone();
+            // `xcl-pso-help`: the big-driver-compile slot and the commit gate take it for one
+            // of theirs (`real::translated_compute_pso`), and 64 MB for the translation
+            let spawned = std::thread::Builder::new().name("xcl-pso-help".into()).stack_size(64 << 20).spawn(move || {
+                // a copy that fails decides nothing: the worker's own build still completes it
+                let real = job();
+                if real != 0 {
+                    complete(&p, real);
+                }
+            });
+            if let Err(e) = spawned {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("D3D12.X: no thread for a second copy of a pipeline's build ({e}) – waiting for the worker"));
+            }
         }
         let mut done = p.done.lock().unwrap();
         while !*done {
