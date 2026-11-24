@@ -7,9 +7,9 @@
 //! for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -72,27 +72,66 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+struct WorkQueue<T> {
+    gfx: VecDeque<T>,
+    compute: VecDeque<T>,
+}
+
+impl<T> WorkQueue<T> {
+    fn new() -> Self {
+        Self { gfx: VecDeque::new(), compute: VecDeque::new() }
+    }
+
+    fn push(&mut self, compute: bool, item: T) {
+        if compute {
+            self.compute.push_back(item);
+        } else {
+            self.gfx.push_back(item);
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<T> {
+        self.gfx.pop_front().or_else(|| self.compute.pop_front())
+    }
+}
+
+struct Pool {
+    q: Mutex<WorkQueue<Arc<Pending>>>,
+    cv: Condvar,
+}
+
+fn pool() -> &'static Arc<Pool> {
+    static Q: OnceLock<Arc<Pool>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-        let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
+        let p = Arc::new(Pool { q: Mutex::new(WorkQueue::new()), cv: Condvar::new() });
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
-            let rx = rx.clone();
+            let p = p.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
+                let next = {
+                    let mut q = p.q.lock().unwrap();
+                    loop {
+                        if let Some(item) = q.pop_next() {
+                            break item;
+                        }
+                        q = p.cv.wait(q).unwrap();
+                    }
+                };
+                let job = next.job.lock().unwrap().take();
                 if let Some(job) = job {
-                    complete(&p, job());
+                    complete(&next, job());
                 }
             });
         }
-        Mutex::new(tx)
+        p
     })
+}
+
+fn enqueue(p: Arc<Pending>) {
+    let pool = pool();
+    let mut q = pool.q.lock().unwrap();
+    q.push(p.compute, p);
+    pool.cv.notify_one();
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -141,7 +180,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -331,7 +370,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                enqueue(p);
             }
             pso
         }
@@ -391,4 +430,92 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn graphics_jobs_dequeue_ahead_of_queued_compute_jobs() {
+        let mut q = WorkQueue::new();
+        q.push(true, "c1");
+        q.push(true, "c2");
+        q.push(false, "g1");
+        q.push(true, "c3");
+        q.push(false, "g2");
+        assert_eq!(q.pop_next(), Some("g1"));
+        assert_eq!(q.pop_next(), Some("g2"));
+        assert_eq!(q.pop_next(), Some("c1"));
+        assert_eq!(q.pop_next(), Some("c2"));
+        assert_eq!(q.pop_next(), Some("c3"));
+        assert_eq!(q.pop_next(), None);
+    }
+
+    #[test]
+    fn worker_pool_prioritizes_graphics_pipeline_over_queued_compute() {
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel::<usize>();
+        let mut gates = Vec::with_capacity(n);
+        let mut blockers = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = 0x7600_0001usize + i * 2;
+            let (tx, rx) = mpsc::channel::<()>();
+            let stx = started_tx.clone();
+            submit(
+                id,
+                true,
+                Box::new(move || {
+                    let _ = stx.send(id);
+                    let _ = rx.recv_timeout(Duration::from_secs(10));
+                    id + 1
+                }),
+            );
+            gates.push(tx);
+            blockers.push(id);
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(5)).expect("worker started blocker");
+        }
+        let (order_tx, order_rx) = mpsc::channel::<&'static str>();
+        let compute_id = 0x7601_0001usize;
+        let graphics_id = 0x7601_0003usize;
+        let ctx = order_tx.clone();
+        let (c_release_tx, c_release_rx) = mpsc::channel::<()>();
+        submit(
+            compute_id,
+            true,
+            Box::new(move || {
+                let _ = ctx.send("compute");
+                let _ = c_release_rx.recv_timeout(Duration::from_secs(5));
+                compute_id + 1
+            }),
+        );
+        let gtx = order_tx.clone();
+        submit(
+            graphics_id,
+            false,
+            Box::new(move || {
+                let _ = gtx.send("graphics");
+                graphics_id + 1
+            }),
+        );
+        gates[0].send(()).unwrap();
+        assert_eq!(order_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "graphics");
+        for g in &gates[1..] {
+            let _ = g.send(());
+        }
+        let _ = c_release_tx.send(());
+        assert_eq!(order_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "compute");
+        assert_eq!(resolve_wait(graphics_id), graphics_id + 1);
+        assert_eq!(resolve_wait(compute_id), compute_id + 1);
+        for id in blockers {
+            assert_eq!(resolve_wait(id), id + 1);
+            let _ = released(id);
+        }
+        let _ = released(compute_id);
+        let _ = released(graphics_id);
+    }
 }
