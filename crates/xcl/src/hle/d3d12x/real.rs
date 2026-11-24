@@ -5285,6 +5285,51 @@ pub fn drain_gpu() {
     }
 }
 
+/// DRED gives us a linked list in driver order. Keep the diagnostic bounded even on a
+/// long chain, with room in the log for work that the GPU had already started.
+unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report: impl FnMut(&D3D12_AUTO_BREADCRUMB_NODE, usize)) {
+    const SCAN_LIMIT: usize = 4096;
+    const REPORT_LIMIT: usize = 64;
+    let nodes = || std::iter::successors(head.as_ref(), |node| node.pNext.as_ref()).take(SCAN_LIMIT);
+    let mut reported = 0;
+    for started in [true, false] {
+        for node in nodes() {
+            let done = node.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+            if done < node.BreadcrumbCount && (done != 0) == started {
+                report(node, done as usize);
+                reported += 1;
+                if reported == REPORT_LIMIT { return; }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dred_tests {
+    use super::*;
+
+    #[test]
+    fn a_late_partially_executed_list_is_reported_before_unstarted_lists() {
+        let progress = [0u32, 1, 2];
+        let mut nodes = vec![D3D12_AUTO_BREADCRUMB_NODE::default(); 606];
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.BreadcrumbCount = 2;
+            node.pLastBreadcrumbValue = if i < 193 { &progress[0] } else { &progress[2] };
+        }
+        nodes[605].pLastBreadcrumbValue = &progress[1];
+        for i in 1..nodes.len() {
+            nodes[i - 1].pNext = &nodes[i];
+        }
+        let mut reported = Vec::new();
+        unsafe { report_dred_lists(nodes.as_ptr(), |node, done| reported.push((std::ptr::from_ref(node), done))) };
+        assert_eq!(reported.first(), Some(&(std::ptr::from_ref(&nodes[605]), 1)));
+        assert_eq!(reported.len(), 64);
+        for (i, &(node, done)) in reported[1..].iter().enumerate() {
+            assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
+        }
+    }
+}
+
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
 /// it) and the operations each command list got to – into the log, once.
 pub fn log_device_removed() {
@@ -5314,19 +5359,11 @@ pub fn log_device_removed() {
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
-            let mut n = bc.pHeadAutoBreadcrumbNode;
-            let mut k = 0;
-            while !n.is_null() && k < 64 {
-                let node = &*n;
+            report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
-                let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
-                if done < count {
-                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                    crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
-                }
-                n = node.pNext;
-                k += 1;
-            }
+                let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
+                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+            });
         }
     }
 }
