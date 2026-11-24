@@ -2436,6 +2436,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("WriteToSubresource", res_write_to_subresource as usize),
         ]),
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
+        Kind::CommandSignature => v.push(("Release", signature_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
         Kind::Fence => v.push(("Signal", fence_signal as usize)),
@@ -4862,6 +4863,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_allocator_release(this as usize);
+        super::indirect::allocator_reset(this as usize);
     }
     n
 }
@@ -4873,8 +4875,18 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
+        super::indirect::allocator_reset(this as usize);
     }
     hr
+}
+
+unsafe extern "system" fn signature_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        super::indirect::forget(this as usize);
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------------------
