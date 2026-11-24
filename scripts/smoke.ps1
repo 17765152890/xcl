@@ -8,9 +8,11 @@
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe')
+    [string]$Xcl
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty while param defaults are evaluated.
+if (-not $Xcl) { $Xcl = Join-Path $PSScriptRoot '..\target\release\xcl.exe' }
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $root = Split-Path $PSScriptRoot -Parent
