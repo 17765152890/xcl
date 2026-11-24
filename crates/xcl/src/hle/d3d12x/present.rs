@@ -80,24 +80,31 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         // plane over the game's): logged with the planes' raw words
         static LAST: AtomicU64 = AtomicU64::new(1);
         if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = 8 * plane_count as usize;
+            let n = 9 * plane_count as usize;
             let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
+            for i in 0..plane_count as usize {
+                let res = plane_resource(planes, i);
+                let d = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc()).map(|d| (d.Width, d.Height, d.Format.0));
+                crate::xlog_info!("D3D12.X: PresentX plane {i}: resource {res:#x} {d:?}");
+            }
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
+    if !enabled() {
         return;
     }
-    let res = (list as *const usize).read_unaligned();
+    let res = plane_resource(planes, 0);
     if res == 0 {
         return;
     }
+    // the planes above the first (a UI plane): blended over it (`compose`)
+    let overlays: Vec<usize> = (1..(plane_count as usize).min(super::compose::MAX_PLANES)).map(|i| plane_resource(planes, i)).filter(|&r| r != 0).collect();
     {
         let mut p = PRESENTED.lock().unwrap();
-        if !p.contains(&res) {
-            p.push(res);
+        for &r in std::iter::once(&res).chain(&overlays) {
+            if !p.contains(&r) {
+                p.push(r);
+            }
         }
     }
     if trace_frame() {
@@ -125,7 +132,18 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    present_now(Duration::ZERO, Some((queue as usize, res)), &overlays);
+}
+
+/// The first resource of plane `i` of PresentX's planes (0x48 bytes each: frame token, resource
+/// count @8, `ID3D12Resource**` @0x10, …); 0 when there is none.
+unsafe fn plane_resource(planes: *const u8, i: usize) -> usize {
+    let p = planes.add(0x48 * i);
+    if !crate::gpu::shader::readable(p as usize, 0x18) || (p.add(8) as *const u32).read_unaligned() == 0 {
+        return 0;
+    }
+    let list = (p.add(0x10) as *const usize).read_unaligned();
+    if crate::gpu::shader::readable(list, 8) { (list as *const usize).read_unaligned() } else { 0 }
 }
 
 thread_local! {
@@ -288,7 +306,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     // no console present call seen recently → present on submissions (rate limited)
     if now_ms().saturating_sub(LAST_BOUNDARY_MS.load(Ordering::Relaxed)) > 500 {
-        present_now(Duration::from_millis(15), None);
+        present_now(Duration::from_millis(15), None, &[]);
     }
 }
 
@@ -299,7 +317,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
-    unsafe { present_now(Duration::from_millis(4), None) };
+    unsafe { present_now(Duration::from_millis(4), None, &[]) };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -529,6 +547,10 @@ struct Presenter {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
+    /// the planes blended over `copy_source` in the last frame (kept until it is done)
+    overlay_sources: Vec<ID3D12Resource>,
+    /// draws several display planes into the swap chain (`compose`); Err: could not be made
+    compositor: Option<Result<super::compose::Compositor, ()>>,
     dumps: Vec<FrameDump>,
     disabled: bool,
     value: u64,
@@ -573,7 +595,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_source: None, overlay_sources: Vec::new(), compositor: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
@@ -624,7 +646,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>, overlays: &[usize]) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -682,6 +704,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     p.copy_source = None;
+    p.overlay_sources.clear();
     p.dumps.clear();
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
@@ -691,14 +714,34 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
+    let overlay_sources: Vec<ID3D12Resource> = overlays.iter().filter_map(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()).collect();
     let due = frame_dump_due();
     let mut dumps = Vec::new();
-    if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+    // the back buffer's state after this frame's work on it
+    let mut bb_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    if !overlay_sources.is_empty() && compositor_for(p, fmt) {
+        // several planes: drawn into the back buffer (the size of plane 0), what was shown is dumped
+        let Some(Ok(c)) = p.compositor.as_ref() else { return };
+        let planes: Vec<ID3D12Resource> = std::iter::once(src.clone()).chain(overlay_sources.iter().cloned()).collect();
+        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+        c.record(&p.dev, &p.list, &bb, desc.Width as u32, desc.Height, &planes);
+        bb_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if due {
+            p.list.ResourceBarrier(&[transition(&bb, bb_state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            bb_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let bd = bb.GetDesc();
+            if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bd) {
+                dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bd.Format, tag: "frame".into() });
+            }
+        }
+    } else {
+        let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+        p.list.ResourceBarrier(&b1);
+        p.list.CopyResource(&bb, &src);
+        if due {
+            if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
+                dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+            }
         }
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
@@ -724,7 +767,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+    let b2 = [transition(&bb, bb_state, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
@@ -734,6 +777,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
+    p.overlay_sources = overlay_sources;
     p.dumps = dumps;
     p.value += 1;
     if let Err(e) = q.Signal(&p.fence, p.value) {
@@ -770,6 +814,25 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }
+}
+
+/// The presenter's compositor for a swap chain of `fmt` (made at the first frame with several
+/// planes); false when it cannot be made – plane 0 alone is shown then.
+unsafe fn compositor_for(p: &mut Presenter, fmt: DXGI_FORMAT) -> bool {
+    if let Some(Ok(c)) = &p.compositor {
+        if c.format() != fmt {
+            p.compositor = None;
+        }
+    }
+    if p.compositor.is_none() {
+        let made = super::compose::Compositor::new(&p.dev, fmt);
+        match &made {
+            Ok(_) => crate::xlog_info!("present: the title's display planes are blended into the XCL window ({:?})", fmt),
+            Err(e) => crate::xlog_error!("present: display planes cannot be blended ({e}) – plane 0 alone is shown"),
+        }
+        p.compositor = Some(made.map_err(|_| ()));
+    }
+    matches!(p.compositor, Some(Ok(_)))
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
