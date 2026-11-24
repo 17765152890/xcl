@@ -185,6 +185,48 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
     ID3D12Device::from_raw_borrowed(&dev).is_some_and(probe_dynamic_depth_bias)
 }
 
+/// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6)`:
+/// -1 = not yet probed, otherwise `(tier & 3) | ((additional_rates as i8) << 2)`.
+static VSR_CAPS: AtomicI8 = AtomicI8::new(-1);
+
+fn probe_vsr_caps(dev: &ID3D12Device) -> (u32, bool) {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    let ok = unsafe {
+        dev.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6,
+            &mut opts as *mut _ as *mut c_void,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+        )
+        .is_ok()
+    };
+    let (tier, additional) = if ok {
+        ((opts.VariableShadingRateTier.0 as u32).min(3), opts.AdditionalShadingRatesSupported.as_bool())
+    } else {
+        (0, false)
+    };
+    let packed = (tier as i8) | ((additional as i8) << 2);
+    VSR_CAPS.store(packed, Ordering::Release);
+    crate::xlog_info!("D3D12.X: variable shading rate (OPTIONS6): tier {tier}, additional rates {additional}");
+    (tier, additional)
+}
+
+/// Cached `(VariableShadingRateTier, AdditionalShadingRatesSupported)` if already probed.
+pub(super) fn cached_variable_shading_rate_caps() -> Option<(u32, bool)> {
+    let cached = VSR_CAPS.load(Ordering::Acquire);
+    (cached >= 0).then(|| ((cached & 3) as u32, (cached & 4) != 0))
+}
+
+/// Cached `(VariableShadingRateTier, AdditionalShadingRatesSupported)` for `dev`.
+pub(super) unsafe fn variable_shading_rate_caps(dev: *mut c_void) -> (u32, bool) {
+    if let Some(caps) = cached_variable_shading_rate_caps() {
+        return caps;
+    }
+    if dev.is_null() {
+        return (0, false);
+    }
+    ID3D12Device::from_raw_borrowed(&dev).map_or((0, false), probe_vsr_caps)
+}
+
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
 /// device supports it (retrying without the flag if creation fails), and record it as a base.
 unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -592,7 +634,13 @@ pub(super) unsafe extern "system" fn set_debug_flags_x(_this: *mut c_void, _flag
     S_OK
 }
 
+const PAGE_64K: u64 = 0x1_0000;
+
 static PAGE_POOLS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+/// Console GPU page mappings (`dest_page_va -> pool_page_va`, 64 KiB aligned) recorded by
+/// `ID3D12CommandQueue::UpdatePageMappingsX`. Kept separate from `kernelx::AWAY` so CPU-view
+/// pages mapped via `XMemMapPhysicalPagesScatter` are never evicted or decommitted.
+static GPU_PAGE_MAPPINGS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 
 /// device #74 RegisterPagePoolX(address, pages, index out)
 pub(super) unsafe extern "system" fn register_page_pool_x(_this: *mut c_void, va: u64, pages: u32, out: *mut u32) -> HRESULT {
@@ -612,13 +660,112 @@ pub(super) unsafe extern "system" fn register_page_pool_x(_this: *mut c_void, va
 
 /// device #75 UnregisterPagePoolX(index)
 pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, index: u64) -> HRESULT {
-    match PAGE_POOLS.lock().unwrap().get_mut(index as usize) {
-        Some(e) if e.1 != 0 => {
-            *e = (0, 0);
-            S_OK
+    let removed = {
+        let mut p = PAGE_POOLS.lock().unwrap();
+        match p.get_mut(index as usize) {
+            Some(e) if e.1 != 0 => {
+                let old = *e;
+                *e = (0, 0);
+                old
+            }
+            _ => return E_FAIL,
         }
-        _ => E_FAIL,
+    };
+    let pool_end = removed.0.saturating_add(removed.1 as u64 * PAGE_64K);
+    if let Some(m) = GPU_PAGE_MAPPINGS.lock().unwrap().as_mut() {
+        m.retain(|_, &mut target| target < removed.0 || target >= pool_end);
     }
+    S_OK
+}
+
+/// command queue #29 (older) / #31 (newer)
+/// `UpdatePageMappingsX(numMappings, pMappings, pagePoolBase, numPagesInPool, flags)`:
+/// validates and records 64 KiB page mappings from a registered GPU page pool.
+pub(super) unsafe extern "system" fn update_page_mappings_x(
+    _queue: *mut c_void,
+    num_mappings: u32,
+    mappings: *const u8,
+    page_pool_base: u64,
+    num_pages_in_pool: u32,
+    flags: u32,
+) -> HRESULT {
+    static LOG_ONCE: AtomicU64 = AtomicU64::new(0);
+    static WARN_ONCE: AtomicU64 = AtomicU64::new(0);
+    if num_mappings == 0 {
+        return S_OK;
+    }
+    let Some(bytes) = (num_mappings as usize).checked_mul(24) else {
+        return E_INVALIDARG;
+    };
+    if mappings.is_null() || !crate::gpu::shader::readable(mappings as usize, bytes) {
+        return E_INVALIDARG;
+    }
+    if once(&LOG_ONCE, 1) {
+        crate::xlog_info!("D3D12.X: UpdatePageMappingsX ({num_mappings} mapping(s), pool {page_pool_base:#x}, {num_pages_in_pool} pages, flags {flags:#x})");
+    }
+    let mut g = GPU_PAGE_MAPPINGS.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    for i in 0..num_mappings as usize {
+        let entry = mappings.add(i * 24);
+        let dest_va = (entry as *const u64).read_unaligned();
+        let num_ranges = (entry.add(8) as *const u32).read_unaligned();
+        let ranges_ptr = (entry.add(0x10) as *const usize).read_unaligned();
+        if num_ranges == 0 {
+            continue;
+        }
+        let Some(rbytes) = (num_ranges as usize).checked_mul(12) else {
+            if once(&WARN_ONCE, 4) {
+                crate::xlog_warn!("D3D12.X: UpdatePageMappingsX – range count overflow ({num_ranges})");
+            }
+            return E_INVALIDARG;
+        };
+        if dest_va == 0 || !dest_va.is_multiple_of(PAGE_64K) || ranges_ptr == 0 || !crate::gpu::shader::readable(ranges_ptr, rbytes) {
+            if once(&WARN_ONCE, 4) {
+                crate::xlog_warn!("D3D12.X: UpdatePageMappingsX – invalid mapping dest={dest_va:#x} ranges={ranges_ptr:#x} count={num_ranges}");
+            }
+            return E_INVALIDARG;
+        }
+        let mut cur_va = dest_va;
+        for j in 0..num_ranges as usize {
+            let r = (ranges_ptr + j * 12) as *const u8;
+            let op = (r as *const u32).read_unaligned();
+            let pool_idx = (r.add(4) as *const u32).read_unaligned();
+            let page_count = (r.add(8) as *const u32).read_unaligned();
+            match op {
+                0 => {}
+                1 => {
+                    if page_pool_base == 0 || (pool_idx as u64).checked_add(page_count as u64).is_none_or(|end| end > num_pages_in_pool as u64) {
+                        if once(&WARN_ONCE, 4) {
+                            crate::xlog_warn!(
+                                "D3D12.X: UpdatePageMappingsX – pool range [{pool_idx}..+{page_count}) exceeds {num_pages_in_pool} pages (base {page_pool_base:#x})"
+                            );
+                        }
+                        return E_INVALIDARG;
+                    }
+                    for k in 0..page_count as u64 {
+                        map.insert(cur_va + k * PAGE_64K, page_pool_base + (pool_idx as u64 + k) * PAGE_64K);
+                    }
+                }
+                2 => {
+                    for k in 0..page_count as u64 {
+                        map.remove(&(cur_va + k * PAGE_64K));
+                    }
+                }
+                _ => {
+                    if once(&WARN_ONCE, 4) {
+                        crate::xlog_warn!("D3D12.X: UpdatePageMappingsX – unknown page range op {op}");
+                    }
+                }
+            }
+            cur_va = cur_va.saturating_add((page_count as u64).saturating_mul(PAGE_64K));
+        }
+    }
+    S_OK
+}
+
+#[cfg(test)]
+pub(super) fn gpu_page_mapping_for_test(dest_va: u64) -> Option<u64> {
+    GPU_PAGE_MAPPINGS.lock().unwrap().as_ref()?.get(&dest_va).copied()
 }
 
 /// device #61 CreateSamplerX(desc, destination): the title uses it for anisotropic samplers;
@@ -1158,6 +1305,65 @@ mod tests {
             assert_eq!(register_page_pool_x(std::ptr::null_mut(), 0, 16, &mut j), E_INVALIDARG);
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), S_OK);
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), E_FAIL);
+        }
+    }
+
+    #[test]
+    fn update_page_mappings_x_maps_unmaps_and_validates() {
+        #[repr(C)]
+        struct PageRange {
+            op: u32,
+            pool_idx: u32,
+            count: u32,
+        }
+        #[repr(C)]
+        struct Mapping {
+            dest_va: u64,
+            num_ranges: u32,
+            _pad: u32,
+            ranges: *const PageRange,
+        }
+        unsafe {
+            let pool_base = 0x5_0000_0000u64;
+            let mut pool_idx = u32::MAX;
+            assert_eq!(register_page_pool_x(std::ptr::null_mut(), pool_base, 16, &mut pool_idx), S_OK);
+
+            // Empty call succeeds.
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 0, std::ptr::null(), pool_base, 16, 0), S_OK);
+            // Null mappings with non-zero count is rejected.
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, std::ptr::null(), pool_base, 16, 0), E_INVALIDARG);
+
+            // Map 2 pages at pool[3..5], skip 1 page, map 1 page at pool[8].
+            let ranges = [
+                PageRange { op: 1, pool_idx: 3, count: 2 },
+                PageRange { op: 0, pool_idx: 0, count: 1 },
+                PageRange { op: 1, pool_idx: 8, count: 1 },
+            ];
+            let dest_base = 0x6_0000_0000u64;
+            let map = Mapping { dest_va: dest_base, num_ranges: ranges.len() as u32, _pad: 0, ranges: ranges.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &map as *const _ as *const u8, pool_base, 16, 0), S_OK);
+            assert_eq!(gpu_page_mapping_for_test(dest_base), Some(pool_base + 3 * PAGE_64K));
+            assert_eq!(gpu_page_mapping_for_test(dest_base + PAGE_64K), Some(pool_base + 4 * PAGE_64K));
+            assert_eq!(gpu_page_mapping_for_test(dest_base + 2 * PAGE_64K), None);
+            assert_eq!(gpu_page_mapping_for_test(dest_base + 3 * PAGE_64K), Some(pool_base + 8 * PAGE_64K));
+
+            // Unmap the second mapped page.
+            let unmap = [PageRange { op: 2, pool_idx: 0, count: 1 }];
+            let unmap_entry = Mapping { dest_va: dest_base + PAGE_64K, num_ranges: 1, _pad: 0, ranges: unmap.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &unmap_entry as *const _ as *const u8, pool_base, 16, 0), S_OK);
+            assert_eq!(gpu_page_mapping_for_test(dest_base + PAGE_64K), None);
+
+            // Unaligned destination and out-of-bounds pool ranges return E_INVALIDARG.
+            let bad_dest = Mapping { dest_va: dest_base + 0x100, num_ranges: 1, _pad: 0, ranges: ranges.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &bad_dest as *const _ as *const u8, pool_base, 16, 0), E_INVALIDARG);
+            let oob_range = [PageRange { op: 1, pool_idx: 15, count: 2 }];
+            let oob = Mapping { dest_va: dest_base, num_ranges: 1, _pad: 0, ranges: oob_range.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &oob as *const _ as *const u8, pool_base, 16, 0), E_INVALIDARG);
+
+            // Unregistering the pool prunes all mappings targeting it.
+            assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), pool_idx as u64), S_OK);
+            assert_eq!(gpu_page_mapping_for_test(dest_base), None);
+            assert_eq!(gpu_page_mapping_for_test(dest_base + 3 * PAGE_64K), None);
         }
     }
 }
