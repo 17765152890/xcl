@@ -23,6 +23,8 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// title threads currently blocked in `resolve_wait` for this pipeline
+    waiters: AtomicUsize,
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -60,13 +62,56 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
+thread_local! {
+    /// True while a regular `xcl-pso-*` worker executes a job.
+    static IN_NORMAL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Remaining driver-compile closure deferred from a regular worker to `big_queue()`.
+    static DEFER_BIG: std::cell::RefCell<Option<Job>> = const { std::cell::RefCell::new(None) };
+}
+
+/// True when running on a regular `xcl-pso-*` worker (not a title thread or `xcl-pso-big`).
+pub fn in_normal_worker() -> bool {
+    IN_NORMAL_WORKER.with(|c| c.get())
+}
+
+/// Park a slow driver compile for the dedicated `xcl-pso-big-*` pool so regular `xcl-pso-*`
+/// workers stay free for smaller pipelines. Only effective when `in_normal_worker()` is true.
+pub fn defer_big(rest: Job) {
+    DEFER_BIG.with(|slot| *slot.borrow_mut() = Some(rest));
+}
+
+fn big_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static BIG_Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+    BIG_Q.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = std::env::var("XCL_BIG_PSO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).clamp(1, 4);
+        for k in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-big-{k}")).stack_size(64 << 20).spawn(move || loop {
+                let Ok(p) = rx.lock().unwrap().recv() else { return };
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    if p.orphan.load(Ordering::Acquire) {
+                        complete(&p, 0);
+                    } else {
+                        complete(&p, job());
+                    }
+                }
+            });
+        }
+        Mutex::new(tx)
+    })
+}
+
 fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        // translation recurses deeply on big programs; DXC itself runs on its own pool.
+        // Cap normal background PSO workers at 16 so high-core CPUs keep cores free for title/DirectStorage threads.
+        let n = crate::gpu::recomp::dxc::compile_threads().min(16);
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
@@ -78,7 +123,29 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                     if p.orphan.load(Ordering::Acquire) {
                         complete(&p, 0);
                     } else {
-                        complete(&p, job());
+                        IN_NORMAL_WORKER.with(|c| c.set(true));
+                        DEFER_BIG.with(|s| *s.borrow_mut() = None);
+                        let real = job();
+                        IN_NORMAL_WORKER.with(|c| c.set(false));
+                        let deferred = DEFER_BIG.with(|s| s.borrow_mut().take());
+                        if let Some(big_job) = deferred {
+                            if p.orphan.load(Ordering::Acquire) {
+                                complete(&p, 0);
+                            } else if p.waiters.load(Ordering::SeqCst) > 0 {
+                                complete(&p, big_job());
+                            } else {
+                                *p.job.lock().unwrap() = Some(big_job);
+                                if p.waiters.load(Ordering::SeqCst) > 0 {
+                                    if let Some(j) = p.job.lock().unwrap().take() {
+                                        complete(&p, j());
+                                    }
+                                } else {
+                                    let _ = big_queue().lock().unwrap().send(p);
+                                }
+                            }
+                        } else {
+                            complete(&p, real);
+                        }
                     }
                 }
             });
@@ -132,6 +199,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         cv: Condvar::new(),
         compute,
         orphan: Default::default(),
+        waiters: AtomicUsize::new(0),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -166,6 +234,14 @@ pub fn resolve(pso: usize) -> usize {
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    struct WaiterGuard<'a>(&'a Pending);
+    impl Drop for WaiterGuard<'_> {
+        fn drop(&mut self) {
+            self.0.waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    p.waiters.fetch_add(1, Ordering::SeqCst);
+    let _waiter = WaiterGuard(&p);
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         complete(&p, job());
