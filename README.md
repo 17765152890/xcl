@@ -142,6 +142,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+- The title sees only `SystemRoot`, `windir`, `TEMP`/`TMP`, a few other system variables and `XCL_*`:
+  the rest of the PC's environment is removed before it starts, so its crash dumps do not carry it
+  (`XCL_KEEP_ENV=1` keeps it all).
 
 ## Tests
 

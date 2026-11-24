@@ -140,9 +140,67 @@ pub fn host_main(boot_path: &Path) -> i32 {
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
+    scrub_title_env();
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+/// Whether an environment variable stays for the title: what Windows, the C runtime and XCL need.
+/// A console title sees no PC environment, and whatever the title's crash reporter uploads
+/// carries the process's environment block (user names, profile paths, credentials, #702).
+fn title_env_keeps(name: &str) -> bool {
+    const KEEP: &[&str] = &["SystemRoot", "windir", "SystemDrive", "TEMP", "TMP", "ComSpec", "PATHEXT", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"];
+    KEEP.iter().any(|k| k.eq_ignore_ascii_case(name)) || name.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("XCL_"))
+}
+
+/// Before the title's entry point: the process environment is cut to `title_env_keeps`.
+/// `XCL_KEEP_ENV=1` leaves it whole.
+fn scrub_title_env() {
+    if std::env::var("XCL_KEEP_ENV").is_ok_and(|v| v.trim() == "1") {
+        crate::xlog_info!("XCL_KEEP_ENV=1: the title sees the PC's whole environment");
+        return;
+    }
+    // (the DXIL cache folder comes from LOCALAPPDATA, which goes)
+    if std::env::var_os("XCL_DXIL_CACHE").is_none() {
+        std::env::set_var("XCL_DXIL_CACHE", crate::gpu::recomp::dxc::cache_dir());
+    }
+    let gone = remove_env_except(title_env_keeps);
+    crate::xlog_info!("environment: {gone} PC variables removed before the title starts (XCL_KEEP_ENV=1 keeps them)");
+}
+
+/// Removes every environment variable `keep` refuses; returns how many went.
+fn remove_env_except(keep: fn(&str) -> bool) -> usize {
+    let names: Vec<_> = std::env::vars_os().map(|(k, _)| k).filter(|k| !k.to_str().is_some_and(keep)).collect();
+    for k in &names {
+        std::env::remove_var(k);
+    }
+    names.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_env_keeps_only_system_and_xcl_variables() {
+        for k in ["SystemRoot", "SYSTEMROOT", "windir", "TEMP", "TMP", "XCL_NETWORK", "xcl_uma_mb"] {
+            assert!(title_env_keeps(k), "{k}");
+        }
+        for k in ["USERNAME", "COMPUTERNAME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PATH", "AWS_SECRET_ACCESS_KEY", "XCLX", "X"] {
+            assert!(!title_env_keeps(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn remove_env_except_strips_the_process_block() {
+        // a synthetic credential; only it is refused, so other tests keep their environment
+        std::env::set_var("XCL702_TEST_SECRET", "hunter2");
+        let gone = remove_env_except(|k| k != "XCL702_TEST_SECRET");
+        assert_eq!(gone, 1);
+        assert!(std::env::var_os("XCL702_TEST_SECRET").is_none());
+        assert!(!std::env::vars_os().any(|(_, v)| v == "hunter2"));
+    }
 }
