@@ -468,12 +468,12 @@ fn f64_class_compare_vopc_and_vop3() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    assert_eq!(t.hlsl.matches("fclass64(").count(), 5, "{}", t.hlsl); // helper plus four calls
+    assert_eq!(t.hlsl.matches("fclass64_u32(").count(), 5, "{}", t.hlsl); // helper plus four calls
     // SRC0 is the 64-bit f64 operand (VGPR/SGPR pair), SRC1 stays a plain 32-bit mask;
-    // abs/neg act on the double operand only
-    assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, (v11 & 0x7FFFFFFFu)))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v13) >> fclass64(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
+    // abs/neg act on the double operand only, on the sign bit of its high word
+    assert!(t.hlsl.contains("(v12) >> fclass64_u32(v10, v11)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v12) >> fclass64_u32(v10, (v11 & 0x7FFFFFFFu))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v13) >> fclass64_u32(v10, (v11 ^ 0x80000000u))"), "{}", t.hlsl);
     // mask destinations go through the shared compare/write-mask path: vcc, an SGPR pair, exec
     assert!(t.hlsl.contains("vcc_lo = t") && t.hlsl.contains("vcc_hi = t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("s20 = t") && t.hlsl.contains("s21 = t"), "{}", t.hlsl);
@@ -7165,6 +7165,40 @@ fn gpu_cmp_class_f16_preserves_snan() {
         assert_eq!((r.sgpr[6], r.sgpr[7]), all, "wave{lanes} f16 qNaN matches qNaN bit");
         assert_eq!((r.sgpr[8], r.sgpr[9]), all, "wave{lanes} f16 abs(-1.0) matches +normal");
         assert_eq!((r.sgpr[10], r.sgpr[11]), all, "wave{lanes} f16 neg(-1.0) matches +normal");
+    }
+}
+
+#[test]
+fn gpu_cmp_class_f32_preserves_denormals_and_snan() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // 0x80000001 (neg f32 subnormal) with ABS -> +subnormal, mask 1 << 7 -> true
+            // (a float abs() would flush the denormal to +0.0, class 6)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 255), ("ABS", 1)], Some(1 << 7)),
+            // 0x7f800001 (sNaN) with NEG -> sign-flipped sNaN, mask 1 << 0 -> true
+            // (a float negate could quiet the sNaN into a qNaN, class 1)
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 1), ("SRC1", 255), ("NEG", 1)], Some(1 << 0)),
+            // 0x7f800001 (sNaN) against mask 1 << 1 (qNaN) -> false
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 130)], None),
+            // 0x7fc00001 (qNaN) against mask 1 << 1 (qNaN) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 2), ("SRC1", 130)], None),
+            // 0x00000001 (+f32 subnormal), no modifiers, mask 1 << 7 -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 3), ("SRC1", 255)], Some(1 << 7)),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x8000_0001; // f32 negative subnormal
+            r[1] = 0x7f80_0001; // f32 sNaN
+            r[2] = 0x7fc0_0001; // f32 qNaN
+            r[3] = 0x0000_0001; // f32 positive subnormal
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} abs(neg subnormal) matches +subnormal");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), all, "wave{lanes} neg(sNaN) still matches sNaN");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), (0, 0), "wave{lanes} sNaN does not match qNaN");
+        assert_eq!((r.sgpr[6], r.sgpr[7]), all, "wave{lanes} qNaN matches qNaN");
+        assert_eq!((r.sgpr[8], r.sgpr[9]), all, "wave{lanes} +subnormal matches +subnormal");
     }
 }
 
