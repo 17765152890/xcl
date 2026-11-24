@@ -31,6 +31,11 @@ pub(super) struct Em {
     dpp_enable: Option<String>,
     /// PS: interpolation modifier per attribute ("", "centroid", "nointerpolation" …)
     pub ps_modes: BTreeMap<u32, String>,
+    /// PS: attributes read through `v_interp_mov_f32` P10 / P20 (forced `nointerpolation` for
+    /// `GetAttributeAtVertex`; any `v_interp_p2_*` on them interpolates via `SV_Barycentrics`)
+    pub ps_vertex_attrs: BTreeSet<u32>,
+    /// PS: `SV_Barycentrics` input needed for an attribute mixed between `P10`/`P20` and `p2`
+    ps_uses_bary: bool,
     /// PS: an export with DONE was emitted (lanes without it are discarded)
     ps_done: bool,
     /// LDS used (compute): declare the groupshared array
@@ -476,6 +481,8 @@ impl Em {
             tmp: 0,
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
+            ps_vertex_attrs: BTreeSet::new(),
+            ps_uses_bary: false,
             ps_done: false,
             uses_lds: false,
             uses_scratch: false,
@@ -2005,27 +2012,43 @@ impl Em {
         };
         let src = format!("xi.a{slot}[{chan}]");
         let act = self.act();
+        let interp_float = |em: &mut Self| -> String {
+            if em.ps_vertex_attrs.contains(&(attr as u32)) {
+                em.ps_uses_bary = true;
+                format!(
+                    "(xi.xcl_bary.x * (float)GetAttributeAtVertex(xi.a{slot}, 0u)[{chan}] + xi.xcl_bary.y * (float)GetAttributeAtVertex(xi.a{slot}, 1u)[{chan}] + xi.xcl_bary.z * (float)GetAttributeAtVertex(xi.a{slot}, 2u)[{chan}])"
+                )
+            } else {
+                format!("(float){src}")
+            }
+        };
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
                 self.line("/* first half of the interpolation – p2 produces the value */");
             }
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
+                let val = interp_float(self);
                 // P2 supplies a floating-point interpolation result.
-                self.line(&format!("{v} = select({act}, asuint((float){src}), {v});"));
+                self.line(&format!("{v} = select({act}, asuint({val}), {v});"));
             }
             "v_interp_mov_f32" => {
-                if ij != 2 {
-                    return Err("v_interp_mov p10/p20");
-                }
                 let v = self.vreg(vdst);
-                // P0 loads the parameter word, including integer selector bits (#249).
-                self.line(&format!("{v} = select({act}, asuint({src}), {v});"));
+                let expr = match ij {
+                    // P10 = P1 - P0, P20 = P2 - P0 (SM 6.1+ GetAttributeAtVertex)
+                    0 => format!("asuint(asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 1u)[{chan}])) - asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 0u)[{chan}])))"),
+                    1 => format!("asuint(asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 2u)[{chan}])) - asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 0u)[{chan}])))"),
+                    // P0 loads the parameter word, including integer selector bits (#249).
+                    2 => format!("asuint({src})"),
+                    _ => return Err("v_interp_mov"),
+                };
+                self.line(&format!("{v} = select({act}, {expr}, {v});"));
             }
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);
+                let val = interp_float(self);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
-                let h = to_f16_expr(self.dynamic_f16_rm, &format!("(float){src}"));
+                let h = to_f16_expr(self.dynamic_f16_rm, &val);
                 let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
                 self.line(&format!("{v} = select({act}, {e}, {v});"));
             }
@@ -4654,6 +4677,9 @@ impl Em {
                 if ps.input_ena >> 14 & 1 == 1 {
                     h.push_str("    uint xcl_cov : SV_Coverage;\n");
                 }
+                if self.ps_uses_bary {
+                    h.push_str("    float3 xcl_bary : SV_Barycentrics;\n");
+                }
                 h.push_str("};\nstruct XclOut {\n");
                 for e in &ps.outputs {
                     match e.system_value {
@@ -4943,7 +4969,26 @@ pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
                 None => continue,
             }
         };
+        if name == "v_interp_mov_f32" && (ij == 0 || ij == 1) {
+            // GetAttributeAtVertex requires `nointerpolation` even if p1/p2 also reads `attr`
+            out.insert(attr as u32, "nointerpolation".to_string());
+            continue;
+        }
         out.entry(attr as u32).or_insert_with(|| mode.to_string());
+    }
+    out
+}
+
+/// Attributes read through `v_interp_mov_f32` P10 / P20 (need `nointerpolation` + `GetAttributeAtVertex`).
+pub fn ps_vertex_attrs(insts: &[Decoded]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for d in insts {
+        if d.inst.name.eq_ignore_ascii_case("v_interp_mov_f32") {
+            let (_, ij, attr, _) = Em::interp_fields(d);
+            if ij == 0 || ij == 1 {
+                out.insert(attr as u32);
+            }
+        }
     }
     out
 }

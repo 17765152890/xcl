@@ -1360,6 +1360,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         .unwrap_or(0);
     if let Mode::Pixel(ps) = &opt.mode {
         em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
+        em.ps_vertex_attrs = emit::ps_vertex_attrs(&insts);
     }
     let mut body = String::new();
     let mut blocks = 0usize;
