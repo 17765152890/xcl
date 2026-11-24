@@ -10,6 +10,8 @@
 
 By executing console x86_64 code seamlessly via Apple's Rosetta 2 and mapping RDNA2 console GPU pipelines through DirectX 12 into Apple **D3DMetal (Game Porting Toolkit 2+)**, XCL enables GDK retail titles to run on macOS under Wine and CrossOver **without CPU emulation**.
 
+XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
+
 This repository consolidates community breakthroughs from Ahmet Dedeler ([`Ahmet-Dedeler/xcl`](https://github.com/Ahmet-Dedeler/xcl)), Michael McCrimmons ([`mikebuckets171/xcl`](https://github.com/mikebuckets171/xcl)), and upstream PRs [#666](https://github.com/ivall/xcl/pull/666), [#541](https://github.com/ivall/xcl/pull/541), [#258](https://github.com/ivall/xcl/pull/258), and [#257](https://github.com/ivall/xcl/pull/257) on top of upstream `beaa245`.
 
 ---

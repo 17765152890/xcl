@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+mod alloc_pool;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -20,6 +21,7 @@ pub mod frame;
 pub mod gpu_views;
 pub mod guard;
 pub mod indirect;
+mod late_release;
 pub mod layout;
 pub mod list_x;
 pub mod null;
