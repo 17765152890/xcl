@@ -13,7 +13,7 @@ name: Mac cross-build
 
 on:
   push:
-    branches: [main]
+    branches: [main, mac-native]
   pull_request:
   workflow_dispatch:
 
