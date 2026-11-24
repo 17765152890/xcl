@@ -1293,6 +1293,8 @@ pub unsafe fn decommitted(a: usize, n: usize) {
             by_window.entry(wi).or_default().push(t);
         }
     }
+    let queues = super::present::known_queues();
+    after_work_on(s, &queues);
     for (wi, ts) in by_window {
         let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
         s.unmap_tiles(&r, b, &ts);
@@ -1300,6 +1302,30 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     s.signal();
     s.retire_free_pools();
+}
+
+/// Before tiles are unmapped: `queue` waits on the GPU for the work the title's queues have been
+/// given so far (a fence per queue). The title unmaps pages its own work is done with, but the
+/// unmap ran on `queue` at once, ahead of work still in flight on the title's queues that reads
+/// or writes those tiles: NVIDIA's MMU faulted in a copy engine (Xid 31) and the device was lost
+/// while a retail game streamed its world under Wine.
+unsafe fn after_work_on(s: &mut State, queues: &[usize]) {
+    static FENCES: Mutex<Option<FxHashMap<usize, (ID3D12Fence, u64)>>> = Mutex::new(None);
+    let mut g = FENCES.lock().unwrap();
+    let fences = g.get_or_insert_with(FxHashMap::default);
+    for &q in queues {
+        let raw = q as *mut c_void;
+        let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&raw) else { continue };
+        if !fences.contains_key(&q) {
+            let Ok(f) = s.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { continue };
+            fences.insert(q, (f, 0));
+        }
+        let (f, v) = fences.get_mut(&q).unwrap();
+        *v += 1;
+        if queue.Signal(&*f, *v).is_ok() {
+            let _ = s.queue.Wait(&*f, *v);
+        }
+    }
 }
 
 impl State {
@@ -1703,6 +1729,76 @@ mod tests {
             s.wait_for(s.value);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Tiles are unmapped only after the title's queues are past what they were given: with work
+    /// held on a title queue (a wait on a gate fence), `queue`'s next signal does not complete
+    /// until the gate opens. Unmapped at once, a tile in use by work in flight faulted the GPU
+    /// (NVIDIA Xid 31 in a copy engine, device lost).
+    #[test]
+    fn unmapping_waits_for_work_on_title_queues() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+            // the title's work in flight: its queue held until the gate opens
+            title.Wait(&gate, 1).expect("title wait");
+            after_work_on(&mut s, &[title.as_raw() as usize]);
+            s.signal();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(s.fence.GetCompletedValue() < s.value, "the unmap queue went ahead of the title's work in flight");
+            gate.Signal(1).expect("open the gate");
+            s.wait_for(s.value);
+            assert_eq!(s.fence.GetCompletedValue(), s.value, "the unmap queue goes on once the title's work is done");
+            drop(s);
         }
     }
 
