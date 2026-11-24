@@ -75,7 +75,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
-                    complete(&p, job());
+                    if p.orphan.load(Ordering::Acquire) {
+                        complete(&p, 0);
+                    } else {
+                        complete(&p, job());
+                    }
                 }
             });
         }
@@ -103,6 +107,15 @@ pub fn submit(standin: usize, compute: bool, job: Job) {
 pub fn lazy() -> bool {
     static L: OnceLock<bool> = OnceLock::new();
     *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
+}
+
+/// Lazy creation for compute pipelines (`XCL_LAZY_COMPUTE_PSO=1` to defer them until first
+/// bind like graphics pipelines). Graphics pipelines stay lazy because they never block on
+/// bind; compute pipelines block in `resolve_wait` at first bind, so pre-compiling them in
+/// the background avoids cold-compile stalls when a frame binds many compute shaders at once.
+pub fn lazy_compute() -> bool {
+    static L: OnceLock<bool> = OnceLock::new();
+    *L.get_or_init(|| lazy() && std::env::var("XCL_LAZY_COMPUTE_PSO").is_ok_and(|v| v == "1"))
 }
 
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`).

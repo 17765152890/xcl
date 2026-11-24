@@ -3702,7 +3702,8 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
+    let use_lazy = if compute { super::pso_async::lazy_compute() } else { super::pso_async::lazy() };
+    let submit = if use_lazy { super::pso_async::submit_lazy } else { super::pso_async::submit };
     submit(
         *ppv as usize,
         compute,
