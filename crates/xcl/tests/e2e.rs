@@ -132,6 +132,13 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
     assert!(out.status.success(), "exit code {:?}", out.status.code());
+    assert!(
+        stderr.contains(concat!(
+            "XErrorReport 0x89240107 (reported by the title): ",
+            "XGameRuntime is missing required dependencies, run GamingRepair.exe to resolve.",
+        )),
+        "XErrorReport should identify the source of the message"
+    );
 
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");
