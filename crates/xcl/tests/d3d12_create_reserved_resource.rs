@@ -79,7 +79,7 @@ unsafe fn host_device(devs: &TestDevices) -> ID3D12Device {
     ID3D12Device::from_raw(raw)
 }
 
-fn init_devices(test_name: &str) -> Option<&'static TestDevices> {
+fn init_devices(_test_name: &str) -> Option<&'static TestDevices> {
     let entry = DEVICES.get_or_init(|| unsafe {
         if d3d12x::backend() != Backend::Real {
             return None;
@@ -118,7 +118,7 @@ fn init_devices(test_name: &str) -> Option<&'static TestDevices> {
         })
     });
     if entry.is_none() {
-        println!("SKIPPED {test_name}: no real D3D12 GPU");
+        xcl::gpu::recomp::runner::skip_test("no GPU");
     }
     entry.as_ref()
 }
