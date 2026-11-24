@@ -117,11 +117,11 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
 
-xcl inspect D:\Game\game.exe               # the game's imports and what XCL has for them
-xcl run D:\Game [-- game arguments]        # run
-xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
-xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
-xcl rpf D:\data\shaders.rpf --extract NAME --out folder
+.\target\release\xcl.exe inspect D:\Game\game.exe        # the game's imports and what XCL has for them
+.\target\release\xcl.exe run D:\Game                     # append -- followed by any game arguments
+.\target\release\xcl.exe disasm D:\data\shader.bin --hex # RDNA2 disassembler (console containers too)
+.\target\release\xcl.exe shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+.\target\release\xcl.exe rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
