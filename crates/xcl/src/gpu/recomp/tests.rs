@@ -7307,6 +7307,34 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_pack_b32_f16_abs_and_neg() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // NEG on SRC0 (+1.0h -> -1.0h = 0xBC00), ABS on SRC1 (-2.0h -> +2.0h = 0x4000)
+            ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("NEG", 1), ("ABS", 2)], None),
+            // ABS+NEG on SRC0 (-1.0h -> -abs(-1.0h) = -1.0h = 0xBC00), OP_SEL=3 (high halves) + NEG on SRC1 (+0.5h -> -0.5h = 0xB800)
+            ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3), ("ABS", 1), ("NEG", 3)], None),
+            // NaN sign bit preserved/flipped bitwise without payload loss
+            ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 4), ("SRC1", V + 4), ("ABS", 1), ("NEG", 2)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x0000_3C00; // lo = +1.0h
+            r[1] = 0x0000_C000; // lo = -2.0h
+            r[2] = 0xBC00_0000; // hi = -1.0h
+            r[3] = 0x3800_0000; // hi = +0.5h
+            r[4] = 0x0000_FE01; // lo = -qNaN (payload 1)
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 0x4000_BC00, "wave{lanes} lane {l} v_pack_b32_f16 NEG0 + ABS1");
+            assert_eq!(v[11], 0xB800_BC00, "wave{lanes} lane {l} v_pack_b32_f16 OP_SEL + ABS+NEG");
+            assert_eq!(v[12], 0x7E01_7E01, "wave{lanes} lane {l} v_pack_b32_f16 ABS/NEG bitwise on NaN");
+        }
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
