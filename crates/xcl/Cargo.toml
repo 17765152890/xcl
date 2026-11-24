@@ -79,3 +79,11 @@ harness = false
 [[bench]]
 name = "formats"
 harness = false
+
+[[bench]]
+name = "gpu_cpu"
+harness = false
+
+[[bench]]
+name = "runtime"
+harness = false
