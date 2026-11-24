@@ -62,15 +62,20 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
         0 | 100 | 10000 => d[1], // NORMAL, HIGH, GLOBAL_REALTIME
         _ => 100,
     };
-    // flags: the PC has only DISABLE_GPU_TIMEOUT (1); the console's others (a retail game: 2, 3 on
-    // compute queues) are dropped – the PC refuses them with E_INVALIDARG
-    if d[2] & !1 != 0 {
+    // flags: the PC has only DISABLE_GPU_TIMEOUT (1). On Windows consumer drivers (e.g. AMD amdkmdag.sys),
+    // disabling GPU timeout can turn a shader stall into a kernel bugcheck (0xD1). Drop unless forced.
+    let flags = if std::env::var_os("XCL_DISABLE_GPU_TIMEOUT").is_some() {
+        d[2] & 1
+    } else {
+        0
+    };
+    if d[2] & !1 != 0 || (d[2] & 1 != 0 && flags == 0) {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("D3D12.X: command queue flags {:#x} (type {}) – the console-only bits are dropped", d[2], d[0]);
+            crate::xlog_info!("D3D12.X: command queue flags {:#x} (type {}) – sanitized for PC", d[2], d[0]);
         }
     }
-    [pc_list_type(d[0]), priority, d[2] & 1, if d[3] == 0 { 0 } else { 1 }]
+    [pc_list_type(d[0]), priority, flags, if d[3] == 0 { 0 } else { 1 }]
 }
 
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
@@ -1030,7 +1035,7 @@ mod tests {
         assert_eq!(pc_list_type(XBOX_TYPE_DMA), D3D12_COMMAND_LIST_TYPE_COPY.0 as u32);
         assert_eq!(pc_list_type(2), 2);
         assert_eq!(pc_queue_desc([XBOX_TYPE_DMA, 1, 0, 0x10]), [3, 100, 0, 1]);
-        assert_eq!(pc_queue_desc([0, 10000, 1, 0]), [0, 10000, 1, 0]);
+        assert_eq!(pc_queue_desc([0, 10000, 1, 0]), [0, 10000, 0, 0]);
         let mut x = [0u8; 0x38];
         x[0] = 1; // buffer
         x[8] = 0x40; // alignment

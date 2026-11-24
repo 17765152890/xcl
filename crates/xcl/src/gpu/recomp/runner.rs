@@ -80,7 +80,7 @@ unsafe fn wait_for_submission(
     dev: &ID3D12Device, queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: u64, stage: &str,
 ) -> Result<(), String> {
     queue.Signal(fence, value).map_err(|e| format!("{stage}: {}", fence::api_error(dev, "Signal", e)))?;
-    fence::wait(fence, value, dev, None, 10_000).map_err(|e| format!("{stage}: {e}"))
+    fence::wait(fence, value, dev, None, 60_000).map_err(|e| format!("{stage}: {e}"))
 }
 
 fn init() -> Result<Gpu, String> {

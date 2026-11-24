@@ -294,10 +294,13 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
     }
 }
 
-/// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid BCn blocks (magenta, red for BC4/BC5).
-/// The request still fails.
+/// `XCL_DSTORAGE_BCPACK_FILL=1` (or default): a refused BCPack destination gets solid blocks
+/// of its BCn format instead of failing the streaming queue, allowing asset loading to continue.
 fn bcpack_fill_from_env() -> bool {
-    std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+    std::env::var("XCL_DSTORAGE_BCPACK_FILL").map_or(true, |v| v.trim() != "0")
+}
+fn bcpack_fill_from_env() -> bool {
+    std::env::var("XCL_DSTORAGE_BCPACK_FILL").map_or(true, |v| v.trim() != "0")
 }
 
 /// BC1 colour block: both endpoints magenta (565 `0xF81F`), every index 0.
@@ -1112,8 +1115,10 @@ impl QueueInner {
                     }
                     Entry::Refused { hr, req, file, fill } => {
                         if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
+                            // the destination gets solid blocks; soft success so asset streamer proceeds
+                            if unsafe { bcpack_fill(&req, t) } {
+                                continue;
+                            }
                         }
                         self.fail(hr, req, file.as_deref());
                         if since_status >= 0 {

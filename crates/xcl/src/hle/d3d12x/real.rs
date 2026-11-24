@@ -1995,14 +1995,18 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
         let va = v.Anonymous.RaytracingAccelerationStructure.Location;
-        let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-        if in_uma {
-            let w = crate::gpu::desc::bvh_words(va, true);
+        let resolved = if va != 0 {
+            crate::hle::kernelx::mirrors::source(va as usize).map(|s| s as u64).unwrap_or(va)
+        } else {
+            0
+        };
+        if resolved != 0 {
+            let w = crate::gpu::desc::bvh_words(resolved, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) at {va:#x} is not in unified memory – writing empty BVH descriptor");
+            crate::xlog_warn!("D3D12.X: CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) has null location – writing empty BVH descriptor");
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
@@ -4422,7 +4426,9 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let has_25 = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32 || s.0 == 25));
+    let has_24 = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == 24));
+    let mesh = has_25 || has_24;
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -4439,10 +4445,28 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         };
         match ty {
             1 => put(&mut buf, &d.vs),
-            2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
+            2 => put(&mut buf, dm.as_ref().map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
-            3 | 4 | 5 | 24 => put(&mut buf, &[]),
-            25 => put(&mut buf, &dm?.0),
+            3 | 4 | 5 => put(&mut buf, &[]),
+            24 => {
+                if has_25 {
+                    put(&mut buf, &[]);
+                } else {
+                    buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                    if let Some(m) = &dm {
+                        put(&mut buf, &m.0);
+                    } else {
+                        put(&mut buf, &[]);
+                    }
+                }
+            }
+            25 => {
+                if let Some(m) = &dm {
+                    put(&mut buf, &m.0);
+                } else {
+                    put(&mut buf, &[]);
+                }
+            }
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}

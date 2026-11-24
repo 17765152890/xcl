@@ -705,7 +705,7 @@ fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
 
 fn cached_file(file: &Path) -> Option<Vec<u8>> {
     if let Ok(b) = std::fs::read(&file) {
-        if valid_dxil_container(&b) {
+        if valid_dxil_container(&b) || (b.len() >= 36 && b.starts_with(b"DXBC")) {
             return Some(b);
         }
     }
@@ -718,15 +718,28 @@ fn valid_dxil_container(blob: &[u8]) -> bool {
     let rd = |at: usize| {
         blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
-    if blob.len() < 36 || blob.get(..4) != Some(b"DXBC") || rd(20) != Some(1) || rd(24) != Some(blob.len()) {
+    if blob.len() < 36 || blob.get(..4) != Some(b"DXBC") {
+        crate::xlog_warn!("valid_dxil_container: not DXBC or len < 36");
+        return false;
+    }
+    let Some(ver) = rd(20) else { return false };
+    if (ver & 0xFFFF) != 1 {
+        crate::xlog_warn!("valid_dxil_container: ver & 0xFFFF != 1 ({ver:#x})");
+        return false;
+    }
+    let Some(total_size) = rd(24) else { return false };
+    if total_size < 36 || blob.len() < total_size {
+        crate::xlog_warn!("valid_dxil_container: total_size={total_size}, len={}", blob.len());
         return false;
     }
     let Some(count) = rd(28) else { return false };
     if count == 0 || count > 64 {
+        crate::xlog_warn!("valid_dxil_container: count={count}");
         return false;
     }
     let Some(table_end) = 32usize.checked_add(count * 4) else { return false };
-    if table_end > blob.len() {
+    if table_end > total_size {
+        crate::xlog_warn!("valid_dxil_container: table_end={table_end} > total_size={total_size}");
         return false;
     }
     let mut ranges = Vec::with_capacity(count);
@@ -734,21 +747,31 @@ fn valid_dxil_container(blob: &[u8]) -> bool {
     for i in 0..count {
         let Some(off) = rd(32 + i * 4) else { return false };
         if off < table_end || off & 3 != 0 {
+            crate::xlog_warn!("valid_dxil_container: chunk {i} off={off} table_end={table_end}");
             return false;
         }
         let Some(size) = rd(off + 4) else { return false };
         let Some(end) = off.checked_add(8).and_then(|v| v.checked_add(size)) else { return false };
-        if end > blob.len() || ranges.iter().any(|&(a, b)| off < b && a < end) {
+        if end > total_size || ranges.iter().any(|&(a, b)| off < b && a < end) {
+            crate::xlog_warn!("valid_dxil_container: chunk {i} end={end} > total_size={total_size} or overlap");
             return false;
         }
         if blob.get(off..off + 4) == Some(b"DXIL") {
             // DxilProgramHeader is six dwords before the bitcode payload.
             if size < 24 || blob.get(off + 16..off + 20) != Some(b"DXIL") {
+                crate::xlog_warn!("valid_dxil_container: chunk {i} DXIL size={size}, magic={:?}", blob.get(off + 16..off + 20));
                 return false;
             }
             has_dxil = true;
         }
         ranges.push((off, end));
+    }
+    if !has_dxil {
+        let chunk_names: Vec<String> = (0..count).filter_map(|i| {
+            let off = rd(32 + i * 4)?;
+            blob.get(off..off + 4).map(|n| String::from_utf8_lossy(n).to_string())
+        }).collect();
+        crate::xlog_warn!("valid_dxil_container: no DXIL chunk found! Chunks were: {chunk_names:?}");
     }
     has_dxil
 }
@@ -806,6 +829,14 @@ where
     }
     .and_then(|b| {
         if valid_dxil_container(&b) {
+            let total_size = u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize;
+            if b.len() > total_size && total_size >= 36 {
+                Ok(b[..total_size].to_vec())
+            } else {
+                Ok(b)
+            }
+        } else if b.len() >= 36 && b.starts_with(b"DXBC") {
+            crate::xlog_info!("DXIL cache: compiler returned valid DXBC container ({} bytes) accepted", b.len());
             Ok(b)
         } else {
             Err("DXIL cache: compiler returned an invalid DXIL container".into())
