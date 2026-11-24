@@ -114,14 +114,40 @@ fn big_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     })
 }
 
+/// Dedicated fast-lane workers for actually-bound lazy graphics pipelines so UI / video /
+/// visible draws never queue behind speculative background compute pre-compilation.
+fn urgent_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static URGENT_Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+    URGENT_Q.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = crate::gpu::recomp::dxc::compile_threads().clamp(1, 2);
+        for k in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-gfx-{k}")).stack_size(64 << 20).spawn(move || loop {
+                let Ok(p) = rx.lock().unwrap().recv() else { return };
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    if p.orphan.load(Ordering::Acquire) {
+                        complete(&p, 0);
+                    } else {
+                        complete(&p, job());
+                    }
+                }
+            });
+        }
+        Mutex::new(tx)
+    })
+}
+
 fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool.
-        // Cap normal background PSO workers at 16 so high-core CPUs keep cores free for title/DirectStorage threads.
-        let n = crate::gpu::recomp::dxc::compile_threads().min(16);
+        // Reserve up to 2 DXC pool slots for urgent bound graphics PSOs and title `resolve_wait`
+        // so speculative compute pre-compilation never starves visible draws or DXC.
+        let n = crate::gpu::recomp::dxc::compile_threads().saturating_sub(2).clamp(1, 8);
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
@@ -233,9 +259,9 @@ pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy one is wanted now: to the workers
+            // a lazy one is wanted now: straight to the urgent graphics workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                let _ = urgent_queue().lock().unwrap().send(p);
             }
             pso
         }
@@ -288,7 +314,7 @@ pub fn resolve_nonblocking(pso: usize) -> Option<usize> {
         return Some(r);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        let _ = urgent_queue().lock().unwrap().send(p.clone());
     }
     if *p.done.lock().unwrap() {
         Some(match p.real.load(Ordering::Acquire) {
