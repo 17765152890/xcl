@@ -3335,6 +3335,12 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// driver's verdict on it).
 /// DXIL size from which a compute pipeline's driver compile goes to the background
 const BIG_DRIVER_COMPILE: usize = 256 << 10;
+/// DXIL size from which that compile waits in a queue of its own (`GIANT_COMPILES`): a retail
+/// title's screen-probe programs (88 863 console instructions, unrolled) are 13 – 29 MB of DXIL,
+/// and the NVIDIA driver alone had not built the smallest after 14 minutes. In `BIG_COMPILES` one
+/// of them, preloaded 4 s into the run, held the only slot to the end, and every 0.3 – 1 MB program
+/// the title bound queued behind it.
+const GIANT_DRIVER_COMPILE: usize = 4 << 20;
 
 /// A counting semaphore: background driver compiles of big programs at once.
 struct Slots {
@@ -3364,6 +3370,18 @@ impl Drop for SlotGuard {
 }
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+/// Background driver compiles of giant programs (`GIANT_DRIVER_COMPILE`), one at a time, beside
+/// `BIG_COMPILES`.
+static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+
+/// The queue a background driver compile of `len` bytes of DXIL waits in.
+fn compile_slots(len: usize) -> &'static Slots {
+    if len >= GIANT_DRIVER_COMPILE {
+        &GIANT_COMPILES
+    } else {
+        &BIG_COMPILES
+    }
+}
 
 /// Before a big driver compile in the background: until 3 GB of commit are free (each takes
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
@@ -3428,9 +3446,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     let started = std::time::Instant::now();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+    // in the background, one at a time (a giant beside the others) and within the commit left
+    // (each ~1.5 GB in the driver)
     let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
+        let slot = compile_slots(dxil.len()).acquire();
         wait_for_commit();
         slot
     });
@@ -3607,6 +3626,25 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
         if let Some(b) = m.remove(&key) {
             *total -= b.len();
         }
+    }
+}
+
+#[cfg(test)]
+mod compile_slots_tests {
+    #[test]
+    fn a_giant_driver_compile_does_not_hold_the_big_compile_slot() {
+        let (big, giant) = (super::BIG_DRIVER_COMPILE, super::GIANT_DRIVER_COMPILE);
+        assert!(std::ptr::eq(super::compile_slots(big), super::compile_slots(giant - 1)));
+        assert!(std::ptr::eq(super::compile_slots(giant), super::compile_slots(29 << 20)));
+        assert!(!std::ptr::eq(super::compile_slots(big), super::compile_slots(giant)));
+        // while a giant program builds, a 1 MB one gets its slot at once
+        let _giant = super::compile_slots(giant).acquire();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _slot = super::compile_slots(1 << 20).acquire();
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "a big compile waited for a giant one");
     }
 }
 
