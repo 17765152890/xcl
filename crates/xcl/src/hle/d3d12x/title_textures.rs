@@ -126,6 +126,26 @@ impl Table {
         Some(entry)
     }
 
+    /// Runs `recheck` on every texture, shadowed ones too, and keeps `remapped` in step with the
+    /// sources it changed on the active ones. Whether any source changed.
+    fn recheck_sources(&mut self, mut recheck: impl FnMut(&mut Entry) -> bool) -> bool {
+        let mut changed = false;
+        for (&res, e) in self.by_res.iter_mut() {
+            if recheck(e) {
+                if e.src == e.va {
+                    self.remapped.remove(&res);
+                } else {
+                    self.remapped.insert(res);
+                }
+                changed = true;
+            }
+        }
+        for e in self.shadowed.values_mut() {
+            changed |= recheck(e);
+        }
+        changed
+    }
+
     fn collect_uploads<T>(
         &mut self, dirty: &[usize], page: usize, pending: bool,
         mut prepare: impl FnMut(usize, &mut Entry) -> Option<T>,
@@ -492,24 +512,8 @@ fn recheck_gpu_view_sources() {
     if SEEN.swap(gen, Ordering::AcqRel) == gen {
         return;
     }
-    let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
-    let mut g = TEXTURES.lock().unwrap();
-    let Table { by_res, remapped, shadowed, .. } = &mut *g;
-    for (&res, e) in by_res.iter_mut() {
-        if recheck_source(e) {
-            if e.src == e.va {
-                remapped.remove(&res);
-            } else {
-                remapped.insert(res);
-            }
-            changed = true;
-        }
-    }
-    for e in shadowed.values_mut() {
-        changed |= recheck_source(e);
-    }
-    drop(g);
+    let changed = TEXTURES.lock().unwrap().recheck_sources(recheck_source);
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -1678,6 +1682,73 @@ mod tests {
         // A first upload is due even without a written page or after a recorded GPU write.
         table.by_res.get_mut(&259).unwrap().pending = true;
         assert_eq!(table.collect_uploads(&[], PAGE, true, |res, _| Some(res)), [259]);
+    }
+
+    /// A source that moves after registration (`recheck_gpu_view_sources`, here through
+    /// `Table::recheck_sources`) is found at its new place and no longer at its old one.
+    #[test]
+    fn a_source_that_flips_keeps_the_sparse_selection_exact() {
+        const PAGE: usize = 0x1000;
+        let (mut table, tex) = texture_candidate_fixture(24);
+        let (up, up_cpu) = (0x14_0000, 0x1000_0000); // direct, then reads the CPU view
+        let (down, down_cpu) = (0x20_0000, 0x1100_0000); // reads the CPU view, then direct
+        table.insert(25, candidate_entry(down, down_cpu, &tex));
+        table.insert(26, candidate_entry(0x3_0010, 0x3_0010, &tex)); // shadows 22 at 0x3_0000
+        assert!(table.shadowed.contains_key(&22));
+        assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [25]);
+
+        let check = |t: &mut Table, at: usize| {
+            let dirty = [at + PAGE];
+            assert!(t.dirty_candidates(&dirty, PAGE).is_some(), "a sparse look");
+            let want = linear_upload_keys(t, &dirty, PAGE);
+            assert_eq!(
+                t.collect_uploads(&dirty, PAGE, false, |res, _| Some(res)),
+                want,
+                "write at {at:#x}"
+            );
+            want
+        };
+        // a flip as `recheck_source` makes one, for the texture whose placement is `va`
+        let flip = |t: &mut Table, va: usize, to: usize| {
+            assert!(t.recheck_sources(|e| {
+                let moved = e.va == va && e.src != to;
+                if moved {
+                    e.src = to;
+                }
+                moved
+            }));
+        };
+
+        assert_eq!(check(&mut table, up), [5]);
+        assert!(check(&mut table, up_cpu).is_empty());
+        assert!(check(&mut table, down).is_empty());
+        assert_eq!(check(&mut table, down_cpu), [25]);
+
+        for _ in 0..2 {
+            flip(&mut table, up, up_cpu); // direct → the CPU view
+            assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [5, 25]);
+            assert!(check(&mut table, up).is_empty());
+            assert_eq!(check(&mut table, up_cpu), [5]);
+            flip(&mut table, down, down); // the CPU view → direct
+            assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [5]);
+            assert_eq!(check(&mut table, down), [25]);
+            assert!(check(&mut table, down_cpu).is_empty());
+
+            flip(&mut table, up, up); // back
+            flip(&mut table, down, down_cpu);
+            assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [25]);
+            assert_eq!(check(&mut table, up), [5]);
+            assert!(check(&mut table, up_cpu).is_empty());
+            assert!(check(&mut table, down).is_empty());
+            assert_eq!(check(&mut table, down_cpu), [25]);
+        }
+
+        // A shadowed texture's source changes too, but it is not indexed until it comes back.
+        flip(&mut table, 0x3_0000, 0x1200_0000);
+        assert_eq!(table.shadowed[&22].src, 0x1200_0000);
+        assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [25]);
+        assert_eq!(check(&mut table, 0x3_0000), [26]);
+        assert!(!table.recheck_sources(|_| false), "nothing moved");
     }
 
     #[test]
