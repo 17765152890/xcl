@@ -4045,6 +4045,12 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
             if disk.as_deref().is_some_and(std::path::Path::is_file) {
                 return Ok(());
             }
+            // a big one as the title's background makes it: one at a time, within the commit left
+            let _big = (compiled.dxil.len() >= BIG_DRIVER_COMPILE).then(|| {
+                let slot = BIG_COMPILES.acquire();
+                wait_for_commit();
+                slot
+            });
             let _slot = driver();
             let started = std::time::Instant::now();
             let made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
