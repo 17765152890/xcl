@@ -430,13 +430,53 @@ pub fn missing_console_cpu_features() -> Vec<&'static str> {
     })
 }
 
+fn filtered_host_environment(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    boot_path: &Path,
+) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+
+    // Keep Windows and temp paths, plus the runtime's local cache and XCL settings.
+    const SYSTEM_VARS: &[&[u8]] = &[b"SYSTEMROOT", b"WINDIR", b"LOCALAPPDATA", b"TEMP", b"TMP"];
+    let mut vars: Vec<_> = vars.into_iter()
+        .filter(|(name, _)| {
+            let name = name.as_encoded_bytes();
+            !name.eq_ignore_ascii_case(b"XCL_HOST")
+                && (name.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"XCL_"))
+                    || SYSTEM_VARS.iter().any(|v| name.eq_ignore_ascii_case(v)))
+        })
+        .map(|(name, value)| (name.encode_wide().collect::<Vec<_>>(), value))
+        .collect();
+    vars.push(("XCL_HOST".encode_utf16().collect(), boot_path.as_os_str().to_owned()));
+    // CreateProcessW takes a double-NUL-terminated block sorted by name, ignoring case.
+    vars.sort_unstable_by(|(a, _), (b, _)| unsafe {
+        CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1).cmp(&CSTR_EQUAL)
+    });
+    let mut block = Vec::new();
+    for (name, value) in vars {
+        block.extend(name);
+        block.push(b'=' as u16);
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+        PROCESS_INFORMATION, STARTUPINFOW,
     };
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    std::env::set_var("XCL_HOST", boot_path);
+    // Filter before Windows starts the child, not after title DLLs or CRTs can copy its environment.
+    let inherit = std::env::var("XCL_INHERIT_ENV").is_ok_and(|v| v == "1");
+    let env = (!inherit).then(|| filtered_host_environment(std::env::vars_os(), boot_path));
+    if inherit {
+        std::env::set_var("XCL_HOST", boot_path);
+    }
     let app = wide(&me.to_string_lossy());
     let mut cmd = wide(cmdline);
     let dir = wide(&cwd.to_string_lossy());
@@ -450,15 +490,18 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
             std::ptr::null(),
             std::ptr::null(),
             1,
-            0,
-            std::ptr::null(),
+            CREATE_UNICODE_ENVIRONMENT,
+            env.as_ref().map_or(std::ptr::null(), |b| b.as_ptr().cast()),
             dir.as_ptr(),
             &si,
             &mut pi,
         );
-        std::env::remove_var("XCL_HOST");
-        if ok == 0 {
-            return Err(format!("CreateProcessW: error {}", GetLastError()));
+        let error = (ok == 0).then(|| GetLastError());
+        if inherit {
+            std::env::remove_var("XCL_HOST");
+        }
+        if let Some(error) = error {
+            return Err(format!("CreateProcessW: error {error}"));
         }
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code = 0u32;
@@ -520,6 +563,28 @@ fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_environment_is_a_sorted_unicode_allowlist() {
+        let vars = [
+            ("xCl_試験", "keep=🦀"),
+            ("DuMmY_cRaSh_sEcReT", "not-a-secret"),
+            ("xCl_hOsT", "stale-boot.json"),
+            ("xCl_NeTwOrK", "0"),
+            ("TMP", ""),
+            ("wInDiR", r"C:\Windows"),
+            ("temp", r"C:\雪\Temp"),
+            ("sYsTeMrOoT", r"C:\Windows"),
+            ("LocalAppData", r"C:\雪\Local"),
+            ("PATH", r"C:\tools"),
+        ].map(|(key, value)| (key.into(), value.into()));
+        let block = filtered_host_environment(vars, Path::new(r"C:\雪\boot.json"));
+        let expected: Vec<_> = concat!(
+            "LocalAppData=C:\\雪\\Local\0sYsTeMrOoT=C:\\Windows\0temp=C:\\雪\\Temp\0TMP=\0",
+            "wInDiR=C:\\Windows\0XCL_HOST=C:\\雪\\boot.json\0xCl_NeTwOrK=0\0xCl_試験=keep=🦀\0\0",
+        ).encode_utf16().collect();
+        assert_eq!(block, expected);
+    }
 
     #[test]
     fn microsoft_game_config_parsing() {
