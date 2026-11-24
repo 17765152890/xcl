@@ -101,9 +101,21 @@ struct Inner {
     status: HRESULT,
     result_size: usize,
     phase: Phase,
+    /// The block's completion callback, read when the call completed (the block may be gone by
+    /// the time the callback item runs).
+    callback: usize,
+    /// False from completion until the completion callback has returned (or was never queued):
+    /// `XAsyncGetStatus(b, true)` waits for it, as libHttpClient's waiter does.
+    wait_satisfied: bool,
+    /// The thread running the completion callback, so a wait from inside it does not deadlock.
+    callback_thread: Option<std::thread::ThreadId>,
 }
 
 impl Inner {
+    fn new() -> Self {
+        Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending, callback: 0, wait_satisfied: true, callback_thread: None }
+    }
+
     fn is_done(&self) -> bool {
         !matches!(self.phase, Phase::Pending | Phase::Completing)
     }
@@ -111,6 +123,9 @@ impl Inner {
 
 pub struct State {
     id: u64,
+    /// The block this call runs on; queued items carry the state, not the block address, so an
+    /// item left over from an earlier call cannot act on a later call on the same block.
+    block: usize,
     provider: usize,
     context: usize,
     identity: usize,
@@ -196,10 +211,15 @@ unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_
 }
 
 unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
-    let b = ctx as *mut XAsyncBlock;
-    let Lookup::Active(s) = lookup(b) else { return };
+    // SAFETY: `ctx` is the `Arc::into_raw` made in `XAsyncSchedule`; an item runs once.
+    let s = Arc::from_raw(ctx as *const State);
+    let b = s.block as *mut XAsyncBlock;
+    // an item of a call that already completed does nothing (libHttpClient: `!state->valid`)
+    if s.inner.lock().unwrap().phase != Phase::Pending {
+        return;
+    }
     if canceled {
-        XAsyncComplete(b, E_ABORT, 0);
+        complete_state(&s, b, E_ABORT, 0);
         return;
     }
     let hr = if s.work != 0 {
@@ -212,16 +232,33 @@ unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
         // providers that finish synchronously in DoWork may not call XAsyncComplete
         let pending = s.inner.lock().unwrap().phase == Phase::Pending;
         if pending {
-            XAsyncComplete(b, hr, 0);
+            complete_state(&s, b, hr, 0);
         }
     }
 }
 
 unsafe extern "system" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
-    let b = ctx as *mut XAsyncBlock;
-    if (*b).callback != 0 {
-        let f: Completion = std::mem::transmute((*b).callback);
-        f(b);
+    // SAFETY: `ctx` is the `Arc::into_raw` made in `complete_state`; an item runs once.
+    let s = Arc::from_raw(ctx as *const State);
+    let cb = {
+        let mut g = s.inner.lock().unwrap();
+        g.callback_thread = Some(std::thread::current().id());
+        g.callback
+    };
+    if cb != 0 {
+        let f: Completion = std::mem::transmute(cb);
+        f(s.block as *mut XAsyncBlock);
+    }
+    // only now may a waiter go on: it may free a block the callback was still using
+    let mut g = s.inner.lock().unwrap();
+    g.callback_thread = None;
+    g.wait_satisfied = true;
+    let consumed = g.phase == Phase::Consumed;
+    drop(g);
+    s.cv.notify_all();
+    if consumed {
+        // `complete_state` kept a call with no payload registered until now
+        unregister_locked(&mut active_map().lock().unwrap(), &s);
     }
 }
 
@@ -241,11 +278,12 @@ pub unsafe extern "system" fn XAsyncBegin(
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        block: b as usize,
         provider,
         context: context as usize,
         identity: identity as usize,
         work: 0,
-        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
+        inner: Mutex::new(Inner::new()),
         cv: Condvar::new(),
     });
     register_state(b, s.clone());
@@ -269,8 +307,13 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     let Some(q) = taskqueue::queue_from((*b).queue) else {
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
     };
+    let Lookup::Active(s) = lookup(b) else { return E_INVALIDARG };
+    // the item carries the call's state, not the block (see `State::block`)
+    let ctx = Arc::into_raw(s) as usize;
     // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
-    if !taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
+    if !taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx }) {
+        // SAFETY: the refused item will never run, so its reference is still ours.
+        drop(Arc::from_raw(ctx as *const State));
         return E_ABORT;
     }
     S_OK
@@ -286,6 +329,11 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         return;
     }
     let Lookup::Active(s) = lookup(b) else { return };
+    complete_state(&s, b, result, required);
+}
+
+/// Complete the call `s`, which runs on block `b`.
+unsafe fn complete_state(s: &Arc<State>, b: *mut XAsyncBlock, result: HRESULT, required: usize) {
     // Atomically claim completion while keeping `is_done() == false` until `OP_CLEANUP` and
     // `write_header` finish, so waiters/pollers cannot destroy `b` or race on `FLAG_CONSUMED`.
     let (status, cleanup_now);
@@ -303,8 +351,9 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
     // Snapshot callback/queue before publishing completion so a waiter woken from
     // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
     let (cb, queue_ptr) = ((*b).callback, (*b).queue);
+    let queue = if cb != 0 { taskqueue::queue_from(queue_ptr) } else { None };
     if cleanup_now {
-        call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
+        call_provider(s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
     }
     // Persist the finalized status into `b.internal` under `ACTIVE`, remove `s` if no payload
     // remains, and publish `Done`/`Consumed` (lock order: `ACTIVE` -> `s.inner`) before
@@ -312,18 +361,36 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
     {
         let mut map = active_map().lock().unwrap();
         write_header(b, BlockHeader { status, flags: FLAG_DONE, id: s.id });
-        if cleanup_now && map.get(&(b as usize)).is_some_and(|cur| cur.id == s.id) {
-            map.remove(&(b as usize));
+        // With a completion callback queued the state stays registered until the callback has
+        // returned, so a wait that starts meanwhile still finds it and waits for the callback.
+        if cleanup_now && queue.is_none() {
+            unregister_locked(&mut map, s);
         }
         let mut g = s.inner.lock().unwrap();
         g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
+        g.callback = cb;
+        // a waiter is released only after the completion callback has returned
+        g.wait_satisfied = queue.is_none();
     }
-    if cb != 0 {
-        if let Some(q) = taskqueue::queue_from(queue_ptr) {
-            let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
+    if let Some(q) = queue {
+        let ctx = Arc::into_raw(s.clone()) as usize;
+        if !taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx }) {
+            // SAFETY: the refused item will never run, so its reference is still ours.
+            drop(Arc::from_raw(ctx as *const State));
+            s.inner.lock().unwrap().wait_satisfied = true;
+            if cleanup_now {
+                unregister_locked(&mut active_map().lock().unwrap(), s);
+            }
         }
     }
     s.cv.notify_all();
+}
+
+/// Drop `s` from `ACTIVE` unless a later call on the same block has replaced it.
+fn unregister_locked(map: &mut HashMap<usize, Arc<State>>, s: &State) {
+    if map.get(&s.block).is_some_and(|cur| cur.id == s.id) {
+        map.remove(&s.block);
+    }
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
@@ -335,7 +402,9 @@ pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -
         Lookup::Active(s) => {
             let mut g = s.inner.lock().unwrap();
             if wait {
-                while !g.is_done() {
+                // a wait from inside the completion callback cannot wait for that callback
+                let me = std::thread::current().id();
+                while !(g.is_done() && (g.wait_satisfied || g.callback_thread == Some(me))) {
                     g = s.cv.wait(g).unwrap();
                 }
             }
@@ -355,6 +424,10 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
         Lookup::Active(s) => {
             let g = s.inner.lock().unwrap();
             if !g.is_done() {
+                // libHttpClient writes the size in every case
+                if !size.is_null() {
+                    *size = 0;
+                }
                 return E_PENDING;
             }
             if !size.is_null() {
@@ -363,7 +436,7 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
             g.status
         }
         Lookup::Finished(h) => {
-            if !size.is_null() && h.status >= 0 {
+            if !size.is_null() {
                 *size = 0;
             }
             h.status
@@ -469,11 +542,12 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        block: b as usize,
         provider: 0,
         context: 0,
         identity: 0,
         work,
-        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
+        inner: Mutex::new(Inner::new()),
         cv: Condvar::new(),
     });
     register_state(b, s);
@@ -1225,6 +1299,141 @@ mod tests {
 
             taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    static P1_WORK: AtomicU32 = AtomicU32::new(0);
+    static P2_WORK: AtomicU32 = AtomicU32::new(0);
+    unsafe extern "system" fn schedules_on_begin(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+        match op {
+            OP_BEGIN => XAsyncSchedule((*data).async_, 0),
+            OP_DO_WORK => {
+                P1_WORK.fetch_add(1, Ordering::SeqCst);
+                S_OK
+            }
+            _ => S_OK,
+        }
+    }
+    unsafe extern "system" fn counts_work_only(op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+        if op == OP_DO_WORK {
+            P2_WORK.fetch_add(1, Ordering::SeqCst);
+        }
+        S_OK
+    }
+
+    /// A work item left over from a call that completed does nothing to a later call on the same
+    /// block: that call gets no DoWork and stays pending.
+    #[test]
+    fn a_stale_work_item_does_not_run_a_later_call_on_the_block() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let (w1, w2) = (P1_WORK.load(Ordering::SeqCst), P2_WORK.load(Ordering::SeqCst));
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            let none = std::ptr::null();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), none, none as *const u8, schedules_on_begin as usize), S_OK);
+            XAsyncComplete(&mut b, E_ABORT, 0);
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), none, none as *const u8, counts_work_only as usize), S_OK);
+            while taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0) {}
+            assert_eq!(P1_WORK.load(Ordering::SeqCst), w1, "the first call completed, its DoWork must not run");
+            assert_eq!(P2_WORK.load(Ordering::SeqCst), w2, "the second call never scheduled");
+            assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, false), S_OK);
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    /// `XAsyncGetStatus(b, true)` returns only after the completion callback has run, and a wait
+    /// from inside that callback does not wait for itself.
+    #[test]
+    fn a_status_wait_covers_the_completion_callback() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        static CB_RAN: AtomicBool = AtomicBool::new(false);
+        static INNER_WAIT: AtomicU32 = AtomicU32::new(u32::MAX);
+        unsafe extern "system" fn cb(b: *mut XAsyncBlock) {
+            INNER_WAIT.store(XAsyncGetStatus(b, true) as u32, Ordering::SeqCst);
+            CB_RAN.store(true, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let mut b = Box::new(std::mem::zeroed::<XAsyncBlock>());
+            b.queue = q;
+            b.callback = cb as usize;
+            let none = std::ptr::null();
+            assert_eq!(XAsyncBegin(&mut *b, std::ptr::null_mut(), none, none as *const u8, begins_without_work as usize), S_OK);
+            let b_addr = &mut *b as *mut XAsyncBlock as usize;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let hr = XAsyncGetStatus(b_addr as *mut XAsyncBlock, true);
+                let _ = tx.send((hr, CB_RAN.load(Ordering::SeqCst)));
+            });
+            std::thread::sleep(Duration::from_millis(100)); // the waiter is waiting on the pending call
+            XAsyncComplete(&mut *b, S_OK, 0);
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "the wait returned before the completion port was dispatched");
+            assert!(taskqueue::XTaskQueueDispatch(q, PORT_COMPLETION, 0));
+            let (hr, ran) = rx.recv_timeout(Duration::from_secs(2)).expect("the wait never ended");
+            waiter.join().unwrap();
+            assert_eq!(hr, S_OK);
+            assert!(ran, "the wait returned before the callback ran");
+            assert_eq!(INNER_WAIT.load(Ordering::SeqCst) as i32, S_OK);
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    /// A wait that starts after a call with no payload completed, before its completion callback
+    /// ran, still waits for the callback; and the call is forgotten once the callback returned.
+    #[test]
+    fn a_late_status_wait_covers_the_completion_callback() {
+        use std::time::Duration;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn cb(_b: *mut XAsyncBlock) {}
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let mut b = Box::new(std::mem::zeroed::<XAsyncBlock>());
+            b.queue = q;
+            b.callback = cb as usize;
+            let none = std::ptr::null();
+            assert_eq!(XAsyncBegin(&mut *b, std::ptr::null_mut(), none, none as *const u8, begins_without_work as usize), S_OK);
+            XAsyncComplete(&mut *b, S_OK, 0);
+            let b_addr = &mut *b as *mut XAsyncBlock as usize;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let _ = tx.send(XAsyncGetStatus(b_addr as *mut XAsyncBlock, true));
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "a late wait returned before the completion port was dispatched");
+            assert!(taskqueue::XTaskQueueDispatch(q, PORT_COMPLETION, 0));
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).expect("the wait never ended"), S_OK);
+            waiter.join().unwrap();
+            assert!(!active_map().lock().unwrap().contains_key(&b_addr), "the finished call stayed registered");
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    /// `XAsyncGetResultSize` writes the size while pending and after a failed call.
+    #[test]
+    fn get_result_size_always_writes_the_size() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            let none = std::ptr::null();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), none, none as *const u8, begins_without_work as usize), S_OK);
+            let mut size = 0xAAAAusize;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), E_PENDING);
+            assert_eq!(size, 0);
+            XAsyncComplete(&mut b, crate::util::E_FAIL, 0);
+            let mut size = 0xAAAAusize;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), crate::util::E_FAIL);
+            assert_eq!(size, 0);
         }
     }
 }
