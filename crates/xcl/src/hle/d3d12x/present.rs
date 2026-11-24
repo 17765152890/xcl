@@ -518,6 +518,26 @@ fn ensure_window() -> Option<HWND> {
 // presenter
 // ---------------------------------------------------------------------------------------
 
+const PRESENT_SLOTS: usize = 3;
+
+#[inline]
+fn slot_is_completed(fence_val: u64, completed: u64) -> bool {
+    fence_val != 0 && completed != u64::MAX && completed >= fence_val
+}
+
+#[inline]
+fn slot_wait_value(fence_val: u64, completed: u64) -> Option<u64> {
+    (fence_val != 0 && (completed == u64::MAX || completed < fence_val)).then_some(fence_val)
+}
+
+struct PresentSlot {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    copy_source: Option<ID3D12Resource>,
+    dumps: Vec<FrameDump>,
+    fence_val: u64,
+}
+
 struct Presenter {
     queue: usize,
     dev: ID3D12Device,
@@ -525,11 +545,9 @@ struct Presenter {
     w: u32,
     h: u32,
     fmt: DXGI_FORMAT,
-    alloc: ID3D12CommandAllocator,
-    list: ID3D12GraphicsCommandList,
+    slots: [PresentSlot; PRESENT_SLOTS],
+    next_slot: usize,
     fence: ID3D12Fence,
-    copy_source: Option<ID3D12Resource>,
-    dumps: Vec<FrameDump>,
     disabled: bool,
     value: u64,
     event: HANDLE,
@@ -563,27 +581,58 @@ unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after:
     }
 }
 
-unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
-    let dev_raw = super::real::device_raw();
-    let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
+unsafe fn make_slot(dev: &ID3D12Device) -> Option<PresentSlot> {
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     list.Close().ok()?;
+    Some(PresentSlot { alloc, list, copy_source: None, dumps: Vec::new(), fence_val: 0 })
+}
+
+unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
+    let dev_raw = super::real::device_raw();
+    let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
+    let slots = [make_slot(dev)?, make_slot(dev)?, make_slot(dev)?];
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        slots, next_slot: 0, fence, disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
 
+unsafe fn drain_queue(p: &mut Presenter, timeout_ms: u32) -> Result<(), FenceError> {
+    let qraw = p.queue as *mut c_void;
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) {
+        p.value += 1;
+        let val = p.value;
+        if let Err(e) = q.Signal(&p.fence, val) {
+            p.disabled = true;
+            return Err(fence::api_error(&p.dev, "Signal", e));
+        }
+        fence::wait(&p.fence, val, &p.dev, Some(p.event), timeout_ms)?;
+    } else if p.value > 0 {
+        fence::wait(&p.fence, p.value, &p.dev, Some(p.event), timeout_ms)?;
+    }
+    for slot in &mut p.slots {
+        slot.copy_source = None;
+        slot.dumps.clear();
+        slot.fence_val = 0;
+    }
+    Ok(())
+}
+
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
+    if let Some(sc) = p.sc.clone() {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        if let Err(e) = drain_queue(p, 2000) {
+            p.disabled = matches!(&e, FenceError::Removed(_));
+            crate::xlog_error!("present: drain before resize: {e}");
+            return false;
+        }
+        if sc.ResizeBuffers(PRESENT_SLOTS as u32, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -601,7 +650,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         Format: fmt,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
+        BufferCount: PRESENT_SLOTS as u32,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -654,8 +703,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
     // a new presenter for the title's present queue, after the old one's copy is done
     if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
-        if let Some(old) = guard.as_ref() {
-            let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
+        if let Some(old) = guard.as_mut() {
+            let _ = drain_queue(old, 1000);
         }
         crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
         *guard = None;
@@ -673,31 +722,53 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
-    // wait for the previous copy so the allocator can be reused
-    if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
-        p.disabled = matches!(&e, FenceError::Removed(_));
-        if !matches!(&e, FenceError::Timeout(_)) {
-            crate::xlog_error!("present: previous copy: {e}");
-        }
+    if !present_frame_on(p, hwnd, src, &desc, fmt) {
         return;
     }
-    p.copy_source = None;
-    p.dumps.clear();
+    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+    }
+}
+
+unsafe fn present_frame_on(p: &mut Presenter, hwnd: HWND, src: ID3D12Resource, desc: &D3D12_RESOURCE_DESC, fmt: DXGI_FORMAT) -> bool {
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
-        return;
+        return false;
     }
-    let Some(sc) = p.sc.clone() else { return };
-    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
-    if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
-        return;
+    let Some(sc) = p.sc.clone() else { return false };
+    // Release finished frames early; only block when rotating back into a still-in-flight slot.
+    let completed = p.fence.GetCompletedValue();
+    for s in &mut p.slots {
+        if slot_is_completed(s.fence_val, completed) {
+            s.copy_source = None;
+            s.dumps.clear();
+            s.fence_val = 0;
+        }
+    }
+    let slot_idx = p.next_slot;
+    if let Some(wait_val) = slot_wait_value(p.slots[slot_idx].fence_val, completed) {
+        if let Err(e) = fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), 1000) {
+            p.disabled = matches!(&e, FenceError::Removed(_));
+            if !matches!(&e, FenceError::Timeout(_)) {
+                crate::xlog_error!("present: previous copy: {e}");
+            }
+            return false;
+        }
+    }
+    p.slots[slot_idx].copy_source = None;
+    p.slots[slot_idx].dumps.clear();
+    p.slots[slot_idx].fence_val = 0;
+    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return false };
+    if p.slots[slot_idx].alloc.Reset().is_err() || p.slots[slot_idx].list.Reset(&p.slots[slot_idx].alloc, None).is_err() {
+        return false;
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
+    p.slots[slot_idx].list.ResourceBarrier(&b1);
+    p.slots[slot_idx].list.CopyResource(&bb, &src);
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
+        if let Some((buffer, footprint)) = readback_copy(&p.slots[slot_idx].list, &src, desc) {
             dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
         }
     }
@@ -716,7 +787,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                 if d.SampleDesc.Count > 1 {
                     return None;
                 }
-                let (buffer, footprint) = readback_copy(&p.list, &res, &d)?;
+                let (buffer, footprint) = readback_copy(&p.slots[slot_idx].list, &res, &d)?;
                 Some((res, buffer, footprint, d.Format))
             });
         for (k, (res, buffer, footprint, format)) in targets.enumerate() {
@@ -725,51 +796,55 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-    p.list.ResourceBarrier(&b2);
-    if p.list.Close().is_err() {
-        return;
+    p.slots[slot_idx].list.ResourceBarrier(&b2);
+    if p.slots[slot_idx].list.Close().is_err() {
+        return false;
     }
-    let qraw = queue as *mut c_void;
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
-    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
+    let qraw = p.queue as *mut c_void;
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
+    let Ok(cl) = p.slots[slot_idx].list.cast::<ID3D12CommandList>() else { return false };
     q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_source = Some(src);
-    p.dumps = dumps;
     p.value += 1;
-    if let Err(e) = q.Signal(&p.fence, p.value) {
-        // The copy is already submitted. Without its signal, keep its resources and allocator.
+    let val = p.value;
+    p.slots[slot_idx].copy_source = Some(src);
+    p.slots[slot_idx].dumps = dumps;
+    // Signal after Present so the copy/slot fence orders behind DXGI's internal Present queue
+    // work; otherwise ResizeBuffers can free a back buffer DXGI is still using (D3D12 error 921).
+    let present_res = sc.Present(0, DXGI_PRESENT(0)).ok();
+    if let Err(e) = q.Signal(&p.fence, val) {
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);
         crate::xlog_error!("present: submit copy: {e}");
-        return;
+        return false;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    p.slots[slot_idx].fence_val = val;
+    p.next_slot = (slot_idx + 1) % PRESENT_SLOTS;
+    if let Err(e) = present_res {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
-        return;
+        return false;
     }
     p.last = Instant::now();
-    if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+    if !p.slots[slot_idx].dumps.is_empty() {
+        match fence::wait(&p.fence, val, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
-                for dump in p.dumps.drain(..) {
+                for dump in p.slots[slot_idx].dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
+                p.slots[slot_idx].copy_source = None;
+                p.slots[slot_idx].fence_val = 0;
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
                 crate::xlog_error!("present: frame dump copy: {e}");
                 if p.disabled {
-                    return;
+                    return false;
                 }
             }
         }
     }
-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
-    }
+    true
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
@@ -1150,6 +1225,182 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    #[test]
+    fn triple_buffer_slot_completion_and_wait_logic() {
+        assert_eq!(PRESENT_SLOTS, 3);
+        // Idle slot (fence_val = 0): never awaited, nothing to reclaim.
+        assert!(!slot_is_completed(0, 0));
+        assert!(!slot_is_completed(0, 5));
+        assert_eq!(slot_wait_value(0, 0), None);
+        assert_eq!(slot_wait_value(0, u64::MAX), None);
+
+        // Completed slot (completed >= fence_val): reclaimed, no wait needed.
+        assert!(slot_is_completed(4, 4));
+        assert!(slot_is_completed(4, 7));
+        assert_eq!(slot_wait_value(4, 4), None);
+        assert_eq!(slot_wait_value(4, 7), None);
+
+        // In-flight slot (completed < fence_val): not completed, wait on its fence value.
+        assert!(!slot_is_completed(5, 4));
+        assert_eq!(slot_wait_value(5, 4), Some(5));
+
+        // D3D12 device-removed sentinel (u64::MAX): must NOT reclaim or skip fence::wait.
+        assert!(!slot_is_completed(5, u64::MAX));
+        assert_eq!(slot_wait_value(5, u64::MAX), Some(5));
+    }
+
+    #[test]
+    fn triple_buffer_present_and_resize_drains_queue_cleanly() {
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe { let _ = DestroyWindow(self.0); }
+            }
+        }
+
+        unsafe {
+            if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+                let mut dbg: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut dbg).is_ok() {
+                    if let Some(d) = dbg {
+                        d.EnableDebugLayer();
+                    }
+                }
+            }
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if let Ok(f6) = factory.cast::<windows::Win32::Graphics::Dxgi::IDXGIFactory6>() {
+                for (adapter, _) in crate::gpu::adapter::candidates(&f6, &crate::gpu::adapter::Selector::Auto) {
+                    if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() && dev.is_some() {
+                        break;
+                    }
+                }
+            }
+            if dev.is_none() && D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let infoq = dev.cast::<ID3D12InfoQueue>().ok();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let win = match CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!("xcl-present-resize-test"),
+                WS_POPUP,
+                0, 0, 640, 360,
+                None, None, None, None,
+            ) {
+                Ok(h) => TestWindow(h),
+                Err(_) => {
+                    crate::gpu::recomp::runner::skip_test("no swap chain");
+                    return;
+                }
+            };
+
+            let slots = [make_slot(&dev).unwrap(), make_slot(&dev).unwrap(), make_slot(&dev).unwrap()];
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let mut p = Presenter {
+                queue: queue.as_raw() as usize,
+                dev: dev.clone(),
+                sc: None,
+                w: 0,
+                h: 0,
+                fmt: DXGI_FORMAT_UNKNOWN,
+                slots,
+                next_slot: 0,
+                fence,
+                disabled: false,
+                value: 0,
+                event,
+                last: Instant::now() - Duration::from_secs(1),
+            };
+
+            let make_rt = |w: u64, h: u32| -> (ID3D12Resource, D3D12_RESOURCE_DESC) {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: w,
+                    Height: h,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let mut res: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut res,
+                ).unwrap();
+                (res.unwrap(), desc)
+            };
+
+            let (rt0, desc0) = make_rt(640, 360);
+            if !ensure_swapchain(&mut p, win.0, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM) {
+                crate::gpu::recomp::runner::skip_test("no swap chain");
+                return;
+            }
+            for _ in 0..4 {
+                assert!(present_frame_on(&mut p, win.0, rt0.clone(), &desc0, DXGI_FORMAT_R8G8B8A8_UNORM));
+            }
+            let (rt1, desc1) = make_rt(768, 432);
+            for _ in 0..4 {
+                assert!(present_frame_on(&mut p, win.0, rt1.clone(), &desc1, DXGI_FORMAT_R8G8B8A8_UNORM));
+            }
+            assert_eq!((p.w, p.h), (768, 432));
+            let (rt2, desc2) = make_rt(512, 288);
+            for _ in 0..4 {
+                assert!(present_frame_on(&mut p, win.0, rt2.clone(), &desc2, DXGI_FORMAT_R8G8B8A8_UNORM));
+            }
+            assert_eq!((p.w, p.h), (512, 288));
+
+            drain_queue(&mut p, 2000).unwrap();
+            assert!(!p.disabled);
+            assert!(p.slots.iter().all(|s| s.fence_val == 0 && s.copy_source.is_none()));
+            dev.GetDeviceRemovedReason().unwrap();
+
+            if let Some(iq) = infoq {
+                let n = iq.GetNumStoredMessagesAllowedByRetrievalFilter();
+                for i in 0..n {
+                    let mut len = 0usize;
+                    let _ = iq.GetMessage(i, None, &mut len);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; len];
+                    let msg = &mut *(buf.as_mut_ptr() as *mut D3D12_MESSAGE);
+                    if iq.GetMessage(i, Some(msg), &mut len).is_ok()
+                        && matches!(msg.Severity, D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR)
+                    {
+                        let text = std::ffi::CStr::from_ptr(msg.pDescription as *const i8).to_string_lossy();
+                        panic!("D3D12 debug layer error {:?} ({}): {text}", msg.ID, msg.ID.0);
+                    }
+                }
+            }
+
+            drop(p);
+            drop(win);
         }
     }
 }
