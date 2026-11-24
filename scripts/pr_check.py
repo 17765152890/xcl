@@ -44,8 +44,16 @@ def number(s):
     return int(m.group(1)) if m else None
 
 
+# outside crates/xcl/src but built into xcl.exe: compiled-in data (stubdb.toml), the build script,
+# dependency versions and the release profile
+RUNTIME_DIRS = ("crates/xcl/src/", "crates/xcl/data/")
+RUNTIME_FILES = ("crates/xcl/build.rs", "crates/xcl/Cargo.toml", "Cargo.toml", "Cargo.lock")
+
+
 def runtime(path):
-    return path.startswith("crates/xcl/src/") and "/tests" not in path and not path.endswith("tests.rs")
+    if path in RUNTIME_FILES:
+        return True
+    return path.startswith(RUNTIME_DIRS) and "/tests" not in path and not path.endswith("tests.rs")
 
 
 def check(body, head, files, is_main_ancestor, *, test_only=False):

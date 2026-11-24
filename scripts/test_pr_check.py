@@ -36,6 +36,20 @@ class TestOnlyApprovalTests(unittest.TestCase):
         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
 
 
+class RuntimeOutsideSrcTests(unittest.TestCase):
+    def test_files_built_into_xcl_need_smoke(self):
+        for path in ("crates/xcl/data/stubdb.toml", "crates/xcl/build.rs", "crates/xcl/Cargo.toml",
+                     "Cargo.toml", "Cargo.lock"):
+            problems = check(BODY, HEAD, [changed(path)], lambda _: False)
+            self.assertEqual(2, len(problems), path)
+            self.assertTrue(all("Regression run" in problem for problem in problems), path)
+
+    def test_other_crates_and_scripts_do_not_need_smoke(self):
+        files = [changed("tests/testtitle/Cargo.toml"), changed("tests/testgamedll/src/lib.rs"),
+                 changed("scripts/smoke.ps1"), changed("README.md")]
+        self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
+
+
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n\n"
