@@ -106,6 +106,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
   can still differ there. Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **Long paths:** Cargo's build-script paths under `target\` add about 80 characters to the checkout
+  path. In a deep folder they pass 260, and `link.exe` fails with
+  `LNK1104: cannot open file '...\build_script_build.exe'`, also with `LongPathsEnabled` set. Clone
+  to a short path or set `CARGO_TARGET_DIR` to one (e.g. `C:\xcl-target`).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
