@@ -209,8 +209,16 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         None => {
             let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
             let mut dev: Option<ID3D12Device> = None;
-            this.GetDevice(&mut dev).ok()?;
-            let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
+            // None lets alloc_reset reset the original allocator, whose recordings are still
+            // held here. A failed replacement must instead fail Reset and keep that backing.
+            if let Err(e) = this.GetDevice(&mut dev) {
+                return Some(e.code().0);
+            }
+            let Some(dev) = dev else { return Some(crate::util::E_FAIL) };
+            let made: ID3D12CommandAllocator = match dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)) {
+                Ok(made) => made,
+                Err(e) => return Some(e.code().0),
+            };
             let raw = made.into_raw();
             // (made through the title's device it is adopted already)
             if !super::real::is_adopted(raw) {
@@ -237,6 +245,86 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Failure to get a replacement must not tell alloc_reset to reset a busy allocator.
+    /// Mock COM objects inject the failures without allocating a GPU resource or exhausting RAM.
+    #[test]
+    fn a_failed_replacement_keeps_the_busy_allocator() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+        use windows::core::GUID;
+
+        #[repr(C)]
+        struct Device {
+            vtable: *const usize,
+            references: Cell<u32>,
+            creates: Cell<u32>,
+        }
+        #[repr(C)]
+        struct Allocator {
+            vtable: *const usize,
+            device: *mut Device,
+            error: HRESULT,
+        }
+        unsafe extern "system" fn get_device(this: *mut c_void, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            let a = &*this.cast::<Allocator>();
+            *out = std::ptr::null_mut();
+            if a.error < 0 { return a.error; }
+            let d = &*a.device;
+            d.references.set(d.references.get() + 1);
+            *out = a.device.cast();
+            0
+        }
+        unsafe extern "system" fn create(this: *mut c_void, _ty: D3D12_COMMAND_LIST_TYPE, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            let d = &*this.cast::<Device>();
+            d.creates.set(d.creates.get() + 1);
+            *out = std::ptr::null_mut();
+            crate::util::E_OUTOFMEMORY
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let d = &*this.cast::<Device>();
+            let n = d.references.get() - 1;
+            d.references.set(n);
+            n
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut device_vtable = [unexpected_call as usize; size_of::<ID3D12Device_Vtbl>() / SLOT];
+        device_vtable[offset_of!(ID3D12Device_Vtbl, base__.base__.Release) / SLOT] = release as usize;
+        device_vtable[offset_of!(ID3D12Device_Vtbl, CreateCommandAllocator) / SLOT] = create as usize;
+        let mut allocator_vtable = [unexpected_call as usize; size_of::<ID3D12CommandAllocator_Vtbl>() / SLOT];
+        allocator_vtable[offset_of!(ID3D12CommandAllocator_Vtbl, base__.base__.GetDevice) / SLOT] = get_device as usize;
+        let mut device = Device { vtable: device_vtable.as_ptr(), references: Cell::new(1), creates: Cell::new(0) };
+        let mut allocator = Allocator { vtable: allocator_vtable.as_ptr(), device: &mut device, error: crate::util::E_FAIL };
+        let raw = std::ptr::from_mut(&mut allocator).cast::<c_void>();
+        let list = std::ptr::from_mut(&mut device) as usize;
+        created_on(list, raw as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let mut results = Vec::new();
+        let mut preserved = Vec::new();
+        unsafe {
+            for error in [crate::util::E_FAIL, 0] {
+                allocator.error = error;
+                // Retry too: a failure must leave enough state to attempt a replacement again.
+                for _ in 0..2 {
+                    results.push(title_reset(raw));
+                    let g = STATE.lock().unwrap();
+                    let s = g.as_ref().unwrap();
+                    preserved.push(
+                        !s.cur.contains_key(&(raw as usize)) && !s.aside.contains_key(&(raw as usize))
+                            && s.of_list.get(&list) == Some(&(raw as usize))
+                            && s.backings.get(&(raw as usize)).is_some_and(|b| b.users.contains(&list))
+                    );
+                }
+            }
+            // Remove the stack-backed COM pointers before asserting (also on the old code).
+            forget(raw as usize);
+        }
+        assert_eq!(results, [Some(crate::util::E_FAIL), Some(crate::util::E_FAIL), Some(crate::util::E_OUTOFMEMORY), Some(crate::util::E_OUTOFMEMORY)]);
+        assert!(preserved.into_iter().all(|p| p), "failed Reset must keep every recording association");
+        assert_eq!(device.creates.get(), 2);
+        assert_eq!(device.references.get(), 1, "temporary device references must be released");
+    }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
     /// recording is still there (the device is not removed), the title's allocator goes on with
